@@ -294,8 +294,8 @@ class GbotVoiceBridge:
             "\nOnly call tools declared in this session. For desktop tasks use native "
             "send_task(request); report acceptance only after relay=accepted. "
             "If send_task is not declared, desktop delegation is unavailable. "
-            "工具结果包含 spoken 时，只向用户读出 spoken；不要读 relay、errorClass、"
-            "错误码、字段名或调试信息。"
+            "When a tool result includes spoken, read only spoken to the user; do not read relay, errorClass, "
+            "error codes, field names or debug info."
         )
 
     def _safe_tool_name(self, name):
@@ -326,13 +326,13 @@ class GbotVoiceBridge:
     @staticmethod
     def _desktop_failure(code, *, refused=False):
         if refused:
-            return {"relay": "refused", "spoken": "桌面助手没有受理这项任务。"}
+            return {"relay": "refused", "spoken": "The desktop assistant did not accept that task."}
         return {
             "relay": "unreachable",
             "spoken": (
-                "桌面助手暂时未连上，请稍后再试。"
+                "The desktop assistant is not connected yet. Please try again shortly."
                 if code == "native_not_ready"
-                else "桌面助手暂时无法受理任务，请稍后再试。"
+                else "The desktop assistant cannot take tasks right now. Please try again shortly."
             ),
             "errorClass": "voice_bridge",
         }
@@ -625,7 +625,7 @@ class GbotVoiceBridge:
             stage = "provider_instructions"
             self.metrics["startup_stage"] = stage
             config = {
-                "instructions": session.get("instructions", "请用中文简短自然地对话。")
+                "instructions": session.get("instructions", "Always speak English. Keep replies short and natural.")
                 + (
                     "\n\n" + self._provider_tool_instructions()
                     if self._executor and self._local_tools_enabled
@@ -957,8 +957,8 @@ class GbotVoiceBridge:
                     if name == "send_task"
                     else {
                         "ok": False,
-                        "error": "桌面助手暂时未连上，请稍后再试。",
-                        "spoken": "桌面助手暂时未连上，请稍后再试。",
+                        "error": "The desktop assistant is not connected yet. Please try again shortly.",
+                        "spoken": "The desktop assistant is not connected yet. Please try again shortly.",
                     }
                 )
             elif name == "send_task":

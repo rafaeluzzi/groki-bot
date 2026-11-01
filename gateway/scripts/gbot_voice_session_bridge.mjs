@@ -26,7 +26,7 @@ export function loadAccount() {
   const active = accounts.accounts[accounts.active];
   if (!active) throw new Error('login_unavailable');
   const password = execFileSync('/usr/bin/security', ['find-generic-password', '-w', '-s', 'Grok Bot Safe Storage'], {
-    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 10000,
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 120000,
   }).trimEnd();
   const key = pbkdf2Sync(password, 'saltysalt', 1003, 16, 'sha1');
   const decrypt = (value) => {
@@ -396,7 +396,13 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       if (nativePresence) {
         if (presenceBusy) return send(409, {ok: false, error: 'presence_busy'});
         if (!activeCall && !body.isOnTheLine) return send(403, {ok: false, error: 'call_not_allowed'});
-        if (activeCall && body.callId !== activeCall.callId) return send(409, {ok: false, error: 'call_conflict'});
+        if (activeCall && body.callId !== activeCall.callId) {
+          // A foreign callId may only hang up its own call; never clear someone else's.
+          if (!body.isOnTheLine) return send(409, {ok: false, error: 'call_conflict'});
+          // New gateway session (new callId) taking over a stale call left by a gateway-only restart.
+          for (const controller of streams) controller.abort();
+          activeCall = null;
+        }
         presenceBusy = true;
         try {
         const authId = await sandbox.callerAuthId();
