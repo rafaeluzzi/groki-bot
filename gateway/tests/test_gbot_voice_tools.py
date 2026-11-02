@@ -635,7 +635,7 @@ async def test_native_not_ready_rejects_desktop_tools_without_post(
     "name,args",
     [("send_task", '{"request":"fixture"}'), ("search_conversations", "{}")],
 )
-async def test_unavailable_desktop_has_readable_chinese_without_diagnostic_code(
+async def test_unavailable_desktop_has_readable_english_without_diagnostic_code(
     monkeypatch, name, args
 ):
     import json
@@ -650,7 +650,9 @@ async def test_unavailable_desktop_has_readable_chinese_without_diagnostic_code(
         if call.args[0]["type"] == "conversation.item.create"
     )
     output = json.loads(raw)
-    assert output["spoken"] == "桌面助手暂时未连上，请稍后再试。"
+    assert output["spoken"] == (
+        "The desktop assistant is not connected yet. Please try again shortly."
+    )
     assert "failureCode" not in output and "native_not_ready" not in raw
     assert b.metrics["tool_outcomes"][name + ":native_not_ready"] == 1
     assert "spoken" in b._provider_tool_instructions()

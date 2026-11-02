@@ -168,3 +168,23 @@ test('HTTP: typed EOF or error reconnects independently and box results still ar
     } finally {await reader?.cancel();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
   }
 });
+
+test('presence with a new callId on the line takes over a stale call; foreign hangup still conflicts', async () => {
+  const port = await freePort(); let presenceCalls=0;
+  const sandbox={callerAuthId:async()=> 'owner', presence:async()=>{presenceCalls++;}};
+  const server=createBridge({port,agentId:'a',desktopEnabled:true,toolsEnabled:false,sandbox,rpc:async()=>({kind:1})});
+  await new Promise(r=>server.listen(port,'127.0.0.1',r));
+  const post=async(path,body)=>fetch(`http://127.0.0.1:${port}`+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
+  const pres=(callId,isOnTheLine)=>post('/native/presence',{agentId:'a',callId,isOnTheLine,acceptsOverheard:false});
+  const tool=callId=>post('/tool',{agentId:'a',callId,name:'send_task',input:{request:'FAKE'},line:{theyJustTalked:false,newsOwed:false,receiptOwed:false,alreadySpokeThisTurn:false}});
+  try {
+    assert.equal((await pres('call-old',true)).status,200);
+    assert.equal((await tool('call-old')).status,200);
+    assert.equal((await pres('call-new',true)).status,200);
+    assert.equal((await tool('call-new')).status,200);
+    const old=await tool('call-old'); assert.equal(old.status,403); assert.equal((await old.json()).error,'call_not_allowed');
+    const foreign=await pres('call-old',false); assert.equal(foreign.status,409); assert.equal((await foreign.json()).error,'call_conflict');
+    assert.equal((await tool('call-new')).status,200);
+    assert.equal(presenceCalls,2);
+  } finally {await new Promise(r=>server.close(r));}
+});

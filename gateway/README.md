@@ -136,6 +136,10 @@ With the explicit bot name and matching IDs, Grok directly uses native `send_tas
 
 If the desktop sandbox is unavailable, audio stays usable while the native channel retries in the background. Task dispatching and conversation search are refused until presence and the event stream are ready. Acceptance means the task was accepted, not that a desktop message was visibly delivered. Typed-message subscriptions can still fail; they reconnect independently and do not replay messages missed during a disconnect. No claims of full feature parity or acoustic barge-in are made. See [validation](GBOT_VOICE_VALIDATION.md) and [latency methods](VOICE_LATENCY_BENCHMARK.md).
 
+On this path the voice model can also update a connected Portal screen. Calls named `core_morph`, `morph`, or `self.core.morph` send `{"type":"core","action":"morph","name":"..."}`. `core_say` / `say` / `self.core.say` send `{"type":"core","action":"say","text":"..."}`. `core_draw` / `draw` / `self.core.draw` send `{"type":"core","action":"draw","what":"..."}`. The gateway waits for `{"type":"core","ok":true,"action":"..."}` on the same device WebSocket. These frames do not use MCP, so they still work while hello says `features.mcp: false`. Opus audio, `STACKCHAN_TOKEN`, and the one-device session are unchanged. Set `STACKCHAN_CORE_FRAMES=0` to leave the tools undeclared. Restart the Python gateway after changing it. The login helper does not forward these frames; restart the helper first only when the helper itself changed (Keychain timeout or stale-call takeover), then restart the gateway.
+
+Portal can set its MCP advertisement only after it answers the gateway's existing `initialize` and `tools/list` handshake. That handshake stays off while `features.mcp` is false. Names returned by `tools/list` are not copied into the Grok session, and `tools/call` is not rewritten into a `type:core` frame. Until that exists, use the thin frames above.
+
 ### Wake word model (optional, about 33 MB)
 
 ```bash
@@ -419,6 +423,8 @@ reconnect the MCP client, after a change).
 | `STACKCHAN_CLAUDE_BIN` | `claude` on PATH | Claude CLI used by `ask_claude` |
 | `STACKCHAN_CLAUDE_MODEL` | `claude-sonnet-5` | Model passed to the Claude CLI by `ask_claude` and Mac tasks |
 | `STACKCHAN_VOICE_BACKEND` | `gemini` | `gbot` uses Grok login voice; `xiaozhi` forwards to XiaoZhi cloud |
+| `STACKCHAN_CORE_FRAMES` | on for `gbot` | `0` does not declare Portal `core_morph` / `core_say` / `core_draw` (and their aliases) or send `type:core` frames |
+| `STACKCHAN_CORE_ACK_TIMEOUT_S` | `3` | How long a `type:core` frame waits for Portal's ack |
 | `STACKCHAN_GBOT_VOICE_BOT_ID` | none | Grok voice agent ID; helper and gateway must agree |
 | `STACKCHAN_GBOT_VOICE_URL` | `http://127.0.0.1:18771` | Loopback HTTP login helper only |
 | `STACKCHAN_GBOT_VOICE_LANGUAGE` | `zh` | Input transcription language, e.g. `en` or `auto` |

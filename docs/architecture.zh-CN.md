@@ -89,6 +89,8 @@ flowchart LR
 
 **握手。** 机器人发送 `{"type": "hello", "features": {"mcp": false}, "audio_params": {"format": "opus", "sample_rate": 16000, "channels": 1, "frame_duration": 60}}`，网关回一条自己的 hello，下行音频格式是 24 kHz。`features.mcp=false` 告诉网关这个固件不接受服务器发来的 MCP 工具调用，所以网关的表情、灯光、头部、拍照这些 MCP 工具到不了 Groki Bot 固件，语音功能完整可用。人脸追踪不走 MCP（见下文）。
 
+Grok 登录态语音路径上，`core_morph` / `core_say` / `core_draw`（以及别名 `morph`、`say`、`draw`、`self.core.morph`、`self.core.say`、`self.core.draw`）会在同一条 WebSocket 上发送瘦帧 `{"type":"core","action":"morph|say|draw",...}`。Portal 回复 `{"type":"core","ok":true,"action":"..."}`。这不需要 `features.mcp`。hello 仍为 `features.mcp: false` 时，网关不会做 MCP `initialize` 和 `tools/list`。设备要对外宣布 MCP，必须先应答这次握手；`tools/list` 得到的工具名不会写进 Grok 会话，`tools/call` 也不会改写成 `type:core` 帧。
+
 **音频。** 上行：Opus，16 kHz 单声道，每帧 60 毫秒，用 WebSocket 二进制消息发送。网关先用本机的唤醒词检测（sherpa-onnx）听，听到「Hi Grok」（设 `STACKCHAN_WAKE_PHRASE=hey groki` 时是「Hey Groki」）之后才把声音转给 Gemini；安静 `STACKCHAN_WAKE_IDLE_S` 秒后结束这一轮聆听。下行：Gemini 回复的声音编码成 Opus（24 kHz，60 毫秒）发回机器人，同时发送 `tts` 状态消息，让机器人知道什么时候开始说、什么时候说完。
 
 **Gemini Live。** 网关保持一个 Gemini Live 会话（`GEMINI_API_KEY`，默认模型 `gemini-3.8-live`，默认音色 `Kore`），并给 Gemini 一小组可调用的工具：`end_conversation`、`get_current_datetime`、装了 `claude` 命令行时才有的 `ask_claude`（`STACKCHAN_ASK_CLAUDE=0` 可关闭），以及开启后才有的 Mac 控制工具和 `ask_grokbot`。设 `STACKCHAN_GEMINI_DEVICE_TOOLS=1` 时，Gemini 还会拿到 `move_head`、`set_avatar`、`set_all_leds` 和 `express_emotion`；因为 Groki Bot 固件没有 MCP，网关把它们改成 XiaoZhi 消息发送：`head`（需要 v0.2.1 之后的固件）、带表情的 `llm` 和 `led`。
