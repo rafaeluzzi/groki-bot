@@ -9,6 +9,7 @@ import pytest
 
 from stackchan_mcp.core_frames import (
     CORE_DECLARED_NAMES,
+    CORE_INSTRUCTIONS,
     build_core_frame,
     core_action_for_tool,
     core_frame_extension,
@@ -40,6 +41,27 @@ def test_core_tool_names_map_to_one_action(name, action):
 @pytest.mark.parametrize("name", ["self.say", "send_task", "core", "self.core.jump", ""])
 def test_unrelated_tool_names_are_not_core_actions(name):
     assert core_action_for_tool(name) is None
+
+
+def test_core_instructions_name_the_body_and_the_screen():
+    text = CORE_INSTRUCTIONS
+    assert "fluid SDF body" in text
+    assert "modes and morphs are your face" in text
+    assert "what you are looking at" in text
+    assert "what is on the screen" in text
+    assert "Idle is a calm orb" in text
+    assert "Listening, Thinking, and Speaking" in text
+    assert "mode motion of the same body" in text
+    assert "Morph makes the silhouette" in text
+    assert "inner glow" in text
+    assert "node-mesh" in text
+    assert "Effects stay inside the body silhouette" in text
+    assert "Do not claim the camera or a photo is on screen" in text
+    assert "core_morph(name)" in text
+    assert "core_say(text)" in text
+    assert "core_draw(what)" in text
+    assert "before the tool returns ok" in text
+    assert "ask_grokbot" not in text
 
 
 def test_thin_frames_match_the_portal_shape():
@@ -132,7 +154,11 @@ async def test_gbot_voice_forwards_core_aliases_and_leaves_unknown_native_tools(
     assert "Self_Core_Draw" in names
     assert "unknown_remote_action" not in bridge._remote_tools
     assert "morph" not in bridge._remote_tools
-    assert "Portal screen" in bridge._provider_tool_instructions()
+    injected = bridge._provider_tool_instructions()
+    assert CORE_INSTRUCTIONS in injected
+    assert "fluid SDF body" in injected
+    assert "Idle is a calm orb" in injected
+    assert "node-mesh" in injected
 
     bridge._send = AsyncMock()
     bridge.running = True
@@ -172,6 +198,10 @@ def test_core_frames_can_be_turned_off(monkeypatch):
     assert "core_morph" not in {item["name"] for item in declarations}
     assert "morph" not in bridge._local_tools
     assert "morph" not in bridge._remote_tools
+    instructions = bridge._provider_tool_instructions()
+    assert "fluid SDF body" not in instructions
+    assert "node-mesh" not in instructions
+    assert "core_morph" not in instructions
 
 
 def test_audio_only_bridge_does_not_declare_core_tools():
