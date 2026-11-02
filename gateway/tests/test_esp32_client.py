@@ -280,6 +280,108 @@ async def test_send_head_works_for_voice_only_device(manager):
 
 
 @pytest.mark.asyncio
+async def test_send_core_on_voice_only_device_waits_for_ack(manager):
+    """Portal answers type:core without advertising MCP."""
+    port = manager._test_port
+
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await ws.send(json.dumps({
+            "type": "hello",
+            "version": 1,
+            "transport": "websocket",
+            "features": {"mcp": False},
+        }))
+        hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert hello["type"] == "hello"
+        await asyncio.sleep(0.1)
+
+        pending = asyncio.create_task(manager.send_core({
+            "type": "core",
+            "action": "say",
+            "text": "Hi",
+        }))
+        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        assert json.loads(raw) == {"type": "core", "action": "say", "text": "Hi"}
+        await ws.send(json.dumps({"type": "core", "ok": True, "action": "say"}))
+        result, error = await asyncio.wait_for(pending, timeout=5.0)
+
+        assert error is None
+        assert result == {"type": "core", "ok": True, "action": "say"}
+        status = manager.get_status()
+        assert status["mcp_supported"] is False
+        assert status["initialized"] is False
+
+
+@pytest.mark.asyncio
+async def test_core_ack_is_not_forwarded_to_the_voice_session():
+    class RecordingProxy:
+        def __init__(self):
+            self.messages = []
+
+        async def start(self, info, hello, send):
+            return True
+
+        async def stop(self):
+            return None
+
+        async def send_device_json(self, message):
+            self.messages.append(message)
+            return True
+
+        async def try_handle_device_mcp(self, message):
+            return False
+
+    proxy = RecordingProxy()
+    mgr = ESP32Manager(cloud_proxy_factory=lambda: proxy)
+    await mgr.start("127.0.0.1", 0)
+    port = mgr._server.sockets[0].getsockname()[1]
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+            await ws.send(json.dumps({
+                "type": "hello",
+                "version": 1,
+                "features": {"mcp": False},
+            }))
+            await asyncio.wait_for(ws.recv(), timeout=5.0)
+            await asyncio.sleep(0.1)
+            await ws.send(json.dumps({"type": "core", "ok": True, "action": "morph"}))
+            await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+            await asyncio.sleep(0.1)
+        assert proxy.messages == [{"type": "listen", "state": "stop"}]
+    finally:
+        await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_core_timeout_and_invalid_frame_do_not_require_mcp(manager):
+    port = manager._test_port
+
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await ws.send(json.dumps({
+            "type": "hello",
+            "version": 1,
+            "features": {"mcp": False},
+        }))
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+        await asyncio.sleep(0.1)
+
+        rejected, error = await manager.send_core({"type": "core", "action": "morph"})
+        assert rejected is None
+        assert error["message"] == "invalid core frame"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(ws.recv(), timeout=0.15)
+
+        result, error = await manager.send_core(
+            {"type": "core", "action": "draw", "what": "Hi"},
+            timeout_s=0.2,
+        )
+        frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert frame == {"type": "core", "action": "draw", "what": "Hi"}
+        assert result is None
+        assert "action=draw" in error["message"]
+
+
+@pytest.mark.asyncio
 async def test_ciniml_client_full_conversation_round_trip():
     """Simulate ciniml/stackchan-idf's XiaoZhiClient (components/conversation/
     xiaozhi_client.cpp) end to end against the real WebSocket handler.

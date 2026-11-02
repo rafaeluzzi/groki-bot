@@ -77,10 +77,15 @@ For native desktop handoff, configure **both** the gateway and helper with
 presence and filtered event streams. Grok does not declare or execute the local
 `ask_grokbot` wrapper and does not use a CLI or the older HTTP Bot bridge.
 `end_the_call` uses the existing end-conversation callback; when present it
-replaces the duplicate local `end_conversation` declaration. Unknown native
-tools stay disabled, including when the legacy `STACKCHAN_GBOT_VOICE_TOOLS`
-setting is present. Audio-only diagnostics use `local_tools=False`, which also
-disables desktop access.
+replaces the duplicate local `end_conversation` declaration. Portal screen
+tools are local, not native harness tools: `core_morph` / `morph` /
+`self.core.morph`, `core_say` / `say` / `self.core.say`, and `core_draw` /
+`draw` / `self.core.draw` send one thin `type:core` frame on the device
+WebSocket and wait for `{"type":"core","ok":true,"action":"..."}`. Other
+unknown native tools stay disabled, including when the legacy
+`STACKCHAN_GBOT_VOICE_TOOLS` setting is present. `STACKCHAN_CORE_FRAMES=0`
+leaves the Portal tools undeclared. Audio-only diagnostics use
+`local_tools=False`, which also disables desktop access and these frames.
 
 The helper filters current-call task outcomes and new owner-authored desktop
 messages. The audio bridge forwards them with the client's native

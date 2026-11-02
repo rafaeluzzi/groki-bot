@@ -21,6 +21,7 @@ from websockets.asyncio.server import ServerConnection
 
 from .audio_stream import SpeakResult, handle_audio_frame, speak_text
 from .cloud_proxy import CloudConnectionInfo, CloudProxy
+from .core_frames import core_ack_timeout_s, is_thin_core_frame
 from .debug_status import DebugStatus, get_debug_status
 from .protocol import HelloResponse, make_mcp_message, parse_jsonrpc_response
 
@@ -49,6 +50,7 @@ class ESP32Connection:
         self.tools: list[dict[str, Any]] = []
         self._request_id = 0
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
+        self._core_waiters: list[tuple[str, asyncio.Future[dict[str, Any]]]] = []
         self._connected = True
         self._initialized = False
         # Device-declared WebSocket protocol version (from the hello
@@ -297,6 +299,43 @@ class ESP32Connection:
         }
         await self._ws_send(json.dumps(message))
 
+    async def send_core(self, frame: dict[str, Any], *, timeout_s: float = 3.0) -> dict[str, Any]:
+        """Send a thin ``type:core`` frame and wait for the matching ack.
+
+        Does not require ``features.mcp``. The payload is the frame as given;
+        callers must already have built ``{"type","action", name|text|what}``.
+        """
+        if not self._connected:
+            raise ConnectionError("ESP32 not connected")
+        if not is_thin_core_frame(frame):
+            raise ValueError("invalid core frame")
+        action = str(frame["action"])
+        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
+        self._core_waiters.append((action, future))
+        try:
+            await self._ws_send(json.dumps(frame, ensure_ascii=False))
+            return await asyncio.wait_for(future, timeout_s)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Timeout waiting for core ack (action={action})") from None
+        finally:
+            self._core_waiters = [
+                (item_action, item)
+                for item_action, item in self._core_waiters
+                if item is not future
+            ]
+
+    def handle_core_ack(self, message: dict[str, Any]) -> bool:
+        """Complete the oldest waiter for this action. Ignores other JSON."""
+        if message.get("type") != "core":
+            return False
+        action = message.get("action")
+        for index, (expected, future) in enumerate(self._core_waiters):
+            if expected == action and not future.done():
+                future.set_result(message)
+                del self._core_waiters[index]
+                return True
+        return False
+
     def disconnect(self) -> None:
         """Mark connection as disconnected."""
         self._connected = False
@@ -306,6 +345,11 @@ class ESP32Connection:
             if not future.done():
                 future.set_exception(ConnectionError("ESP32 disconnected"))
         self._pending.clear()
+        waiters = self._core_waiters
+        self._core_waiters = []
+        for _action, future in waiters:
+            if not future.done():
+                future.set_exception(ConnectionError("ESP32 disconnected"))
 
 
 class ESP32Manager:
@@ -560,6 +604,13 @@ class ESP32Manager:
                     else:
                         logger.info("ESP32 ready (voice-only): device=%s", device_id)
 
+                elif msg_type == "core":
+                    # Portal acks a thin frame on this socket. Never hand the
+                    # text to the voice session; it is not user speech.
+                    if connection is self._connection:
+                        connection.handle_core_ack(data)
+                    continue
+
                 elif msg_type == "mcp":
                     if connection is not self._connection:
                         await self._handle_external_mcp_request(ws, data, session_id)
@@ -801,6 +852,31 @@ class ESP32Manager:
             return await self._connection.send_head(yaw, pitch, speed), None
         except Exception as exc:
             return None, {"code": -32000, "message": str(exc)}
+
+    async def send_core(
+        self,
+        frame: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Send a thin Portal ``type:core`` frame on the current device socket.
+
+        Works while ``features.mcp`` is false. One device at a time: a replaced
+        socket cannot complete this call.
+        """
+        connection = self._connection
+        if connection is None or not connection.connected:
+            return None, {"code": -32000, "message": "No ESP32 device connected"}
+        if not is_thin_core_frame(frame):
+            return None, {"code": -32602, "message": "invalid core frame"}
+        wait_s = core_ack_timeout_s() if timeout_s is None else timeout_s
+        try:
+            ack = await connection.send_core(frame, timeout_s=wait_s)
+        except Exception as exc:
+            return None, {"code": -32000, "message": str(exc)}
+        if self._connection is not connection or not connection.connected:
+            return None, {"code": -32000, "message": "ESP32 disconnected"}
+        return ack, None
 
     async def send_audio_frame(self, opus_frame: bytes) -> None:
         """Push a single Opus frame to the connected device.

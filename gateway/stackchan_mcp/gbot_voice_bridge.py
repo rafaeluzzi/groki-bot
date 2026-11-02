@@ -214,15 +214,68 @@ class GbotVoiceBridge:
             "response_triggers": {},
         }
 
+    def _executor_declares(self, name):
+        if self._executor is None:
+            return False
+        return any(entry.get("name") == name for entry in self._executor.declarations())
+
+    def _bind_portal_core_tool(self, name, used, declarations):
+        """Keep a Portal core alias on the local forwarder.
+
+        Returns True when ``name`` is a core spelling. Those calls must not be
+        posted to the native desktop harness, even if this session did not
+        declare another copy.
+        """
+        from .core_frames import (
+            canonical_core_tool,
+            core_action_for_tool,
+            core_frames_enabled,
+            core_tool_description,
+            core_tool_parameters,
+        )
+
+        if not core_frames_enabled() or core_action_for_tool(name) is None:
+            return False
+        if not isinstance(name, str):
+            return True
+        alias = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+        if not alias or alias in used or name in used:
+            return True
+        canonical = canonical_core_tool(name)
+        if canonical is None or not self._executor_declares(canonical):
+            return True
+        used.add(alias)
+        self._local_tools[alias] = canonical
+        self._tool_schemas[alias] = core_tool_parameters(canonical)
+        declarations.append(
+            {
+                "name": alias,
+                "type": "function",
+                "description": core_tool_description(canonical),
+                "parameters": self._tool_schemas[alias],
+            }
+        )
+        return True
+
     def _configure_tools(self, session):
         # Catalog comes from the shared executor; provider-specific wire aliases
         # preserve dotted names without broadening the enabled tool set.
         if self._local_tools_enabled and self._executor is None:
+            from .core_frames import core_frame_extension, core_frames_enabled
             from .voice_tools import VoiceToolExecutor
 
-            self._executor = (self._executor_factory or VoiceToolExecutor)(
-                **self._executor_options
-            )
+            options = dict(self._executor_options)
+            if core_frames_enabled():
+                extensions = tuple(options.get("extensions") or ())
+                declared = {
+                    entry.get("name")
+                    for ext in extensions
+                    for entry in getattr(ext, "declarations", ())
+                }
+                if "core_morph" not in declared:
+                    extensions = (*extensions, core_frame_extension(options.get("esp32")))
+                options["extensions"] = extensions
+            self._executor = (self._executor_factory or VoiceToolExecutor)(**options)
         target = os.getenv("STACKCHAN_TOOL_BOT_ID", "")
         self._desktop_enabled = bool(
             self._local_tools_enabled
@@ -257,6 +310,8 @@ class GbotVoiceBridge:
                 declarations.append({**declaration, "name": alias, "type": "function"})
         for declaration in session.get("tools", []):
             name = declaration.get("name")
+            if self._bind_portal_core_tool(name, used, declarations):
+                continue
             if name in {"send_task", "search_conversations"}:
                 enabled = self._desktop_enabled
             elif name == "end_the_call":
