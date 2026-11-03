@@ -106,6 +106,8 @@ PYTHONPATH=. python scripts/probe_gbot_voice_recovery.py --agent-id YOUR_AGENT_I
 
 这条路径还可以更新已连接的 Portal 画面，表情只有 morph 和 say。`core_morph` / `morph` / `self.core.morph` 发送 `{"type":"core","action":"morph","name":"..."}`；`core_say` / `say` / `self.core.say` 发送 `{"type":"core","action":"say","text":"..."}`。网关在同一条设备 WebSocket 上等待 `{"type":"core","ok":true,"action":"..."}`。这些帧不走 MCP，因此 hello 里 `features.mcp: false` 时仍然有效。Opus 音频、`STACKCHAN_TOKEN` 和单设备会话不变。`STACKCHAN_CORE_FRAMES=0` 会不声明这些工具。改完后重启 Python 网关。登录桥不转发这些帧；只有登录桥本身有改动（钥匙串超时或过期通话接管）时才需要先重启登录桥，再重启网关。
 
+同一条路径也可以在球体旁边打开一块面板（大约占屏幕三分之二）。`show_panel` 和 `self.panel.show` 发送 `{"type":"panel","panel":{...}}`。文档版本为 1，`kind` 为 `list`、`now_playing` 或 `choice`。带有页面文字的 `webview` 或 `html` 文档也走同一个参数，之后的渲染器可以直接显示，不必新增工具。`dismiss_panel` 和 `self.panel.dismiss` 发送 `{"type":"panel","dismiss":true}`。Portal 不对面板帧发确认；网关校验文档并写入帧之后，工具就返回 ok。这次写入不发送 abort，也不改变 Opus 音频或语音会话。设备发来的面板文本不会交给模型。`STACKCHAN_PANEL_FRAMES=0` 会不声明这些工具。改完后重启 Python 网关。
+
 Portal 要打开 MCP 通告，必须先应答网关现有的 `initialize` 和 `tools/list` 握手。`features.mcp` 为 false 时这次握手不会发生。`tools/list` 返回的名字不会写进 Grok 会话，`tools/call` 也不会改写成 `type:core` 帧。在那之前，使用上面的瘦帧。
 
 ### 唤醒词模型（可选，约 33 MB）
@@ -315,6 +317,7 @@ curl -s -X POST http://127.0.0.1:18770/send \
 | `STACKCHAN_VOICE_BACKEND` | `gemini` | `gbot` 使用 Grok 登录态语音；`xiaozhi` 转发到 XiaoZhi 云服务 |
 | `STACKCHAN_CORE_FRAMES` | `gbot` 时默认开 | `0` 不声明 Portal 的 `core_morph` / `core_say`（及别名），也不发送 `type:core` 帧 |
 | `STACKCHAN_CORE_ACK_TIMEOUT_S` | `3` | `type:core` 帧等待 Portal 确认的秒数 |
+| `STACKCHAN_PANEL_FRAMES` | `gbot` 时默认开 | `0` 不声明 Portal 的 `show_panel` / `dismiss_panel`（及别名），也不发送 `type:panel` 帧。面板帧没有确认 |
 | `STACKCHAN_GBOT_VOICE_BOT_ID` | 无 | Grok 语音智能体 ID，登录桥与网关必须一致 |
 | `STACKCHAN_GBOT_VOICE_URL` | `http://127.0.0.1:18771` | 仅本机 HTTP 登录桥地址 |
 | `STACKCHAN_GBOT_VOICE_LANGUAGE` | `zh` | 输入转写语言，如 `en` 或 `auto` |

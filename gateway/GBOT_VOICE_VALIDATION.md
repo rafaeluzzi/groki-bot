@@ -84,7 +84,15 @@ tools are local, not native harness tools. Expression is morph and say only:
 WebSocket and wait for `{"type":"core","ok":true,"action":"..."}`. Other
 unknown native tools stay disabled, including when the legacy
 `STACKCHAN_GBOT_VOICE_TOOLS` setting is present. `STACKCHAN_CORE_FRAMES=0`
-leaves the Portal tools undeclared. Audio-only diagnostics use
+leaves the Portal expression tools undeclared. `show_panel` /
+`self.panel.show` and `dismiss_panel` / `self.panel.dismiss` send one
+`type:panel` frame on that same socket. The document is version 1 with kind
+`list`, `now_playing`, or `choice`; a `webview` or `html` document is
+forwarded on the same argument when it carries the page text. Portal does
+not ack panel frames, so ok means the document was checked and the frame was
+written. The write does not send abort and does not change the voice
+session. Inbound panel text is not given to the model. `STACKCHAN_PANEL_FRAMES=0`
+leaves the panel tools undeclared. Audio-only diagnostics use
 `local_tools=False`, which also disables desktop access and these frames.
 
 The helper filters current-call task outcomes and new owner-authored desktop

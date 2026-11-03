@@ -390,6 +390,112 @@ async def test_send_core_timeout_and_invalid_frame_do_not_require_mcp(manager):
 
 
 @pytest.mark.asyncio
+async def test_send_panel_on_voice_only_device_does_not_wait_for_ack(manager):
+    """Portal panels are one text frame. No ack is required, and no abort is sent."""
+    port = manager._test_port
+    panel = {
+        "version": 1,
+        "kind": "list",
+        "items": [{"title": "First"}],
+    }
+
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await ws.send(json.dumps({
+            "type": "hello",
+            "version": 1,
+            "transport": "websocket",
+            "features": {"mcp": False},
+        }))
+        hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert hello["type"] == "hello"
+        await asyncio.sleep(0.1)
+
+        result, error = await manager.send_panel({"type": "panel", "panel": panel})
+        raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+        assert json.loads(raw) == {"type": "panel", "panel": panel}
+        dismiss, dismiss_error = await manager.send_panel({"type": "panel", "dismiss": True})
+        dismiss_raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+
+        assert error is None
+        assert result == {"ok": True}
+        assert dismiss_error is None
+        assert dismiss == {"ok": True}
+        assert json.loads(dismiss_raw) == {"type": "panel", "dismiss": True}
+        status = manager.get_status()
+        assert status["mcp_supported"] is False
+        assert status["initialized"] is False
+
+
+@pytest.mark.asyncio
+async def test_panel_frame_is_not_forwarded_to_the_voice_session():
+    class RecordingProxy:
+        def __init__(self):
+            self.messages = []
+
+        async def start(self, info, hello, send):
+            return True
+
+        async def stop(self):
+            return None
+
+        async def send_device_json(self, message):
+            self.messages.append(message)
+            return True
+
+        async def try_handle_device_mcp(self, message):
+            return False
+
+    proxy = RecordingProxy()
+    mgr = ESP32Manager(cloud_proxy_factory=lambda: proxy)
+    await mgr.start("127.0.0.1", 0)
+    port = mgr._server.sockets[0].getsockname()[1]
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+            await ws.send(json.dumps({
+                "type": "hello",
+                "version": 1,
+                "features": {"mcp": False},
+            }))
+            await asyncio.wait_for(ws.recv(), timeout=5.0)
+            await asyncio.sleep(0.1)
+            await ws.send(json.dumps({
+                "type": "panel",
+                "panel_action": {"kind": "choice", "id": "tea"},
+            }))
+            await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+            await asyncio.sleep(0.1)
+        assert proxy.messages == [{"type": "listen", "state": "stop"}]
+    finally:
+        await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_panel_rejects_invalid_frame_without_writing(manager):
+    port = manager._test_port
+
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await ws.send(json.dumps({
+            "type": "hello",
+            "version": 1,
+            "features": {"mcp": False},
+        }))
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+        await asyncio.sleep(0.1)
+
+        rejected, error = await manager.send_panel({"type": "panel", "panel": {"kind": "list"}})
+        assert rejected is None
+        assert error["message"] == "invalid panel frame"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(ws.recv(), timeout=0.15)
+
+        rejected_draw, draw_error = await manager.send_panel(
+            {"type": "panel", "panel": {"version": 1, "kind": "draw", "what": "Hi"}},
+        )
+        assert rejected_draw is None
+        assert draw_error["message"] == "invalid panel frame"
+
+
+@pytest.mark.asyncio
 async def test_ciniml_client_full_conversation_round_trip():
     """Simulate ciniml/stackchan-idf's XiaoZhiClient (components/conversation/
     xiaozhi_client.cpp) end to end against the real WebSocket handler.
