@@ -22,6 +22,7 @@ from websockets.asyncio.server import ServerConnection
 from .audio_stream import SpeakResult, handle_audio_frame, speak_text
 from .cloud_proxy import CloudConnectionInfo, CloudProxy
 from .core_frames import core_ack_timeout_s, is_thin_core_frame
+from .device_commands import is_device_command_frame
 from .panel_frames import is_panel_frame
 from .debug_status import DebugStatus, get_debug_status
 from .protocol import HelloResponse, make_mcp_message, parse_jsonrpc_response
@@ -339,6 +340,22 @@ class ESP32Connection:
         await self._ws_send(json.dumps(frame, ensure_ascii=False))
         return {"ok": True}
 
+    async def send_device_command(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Send one ``type:device_command`` frame. Portal does not ack it.
+
+        The caller must already have built a valid frame. This writes that
+        text frame only: it does not send ``abort`` and it does not wait,
+        so a volume or media command does not stall the voice turn.
+        ``get_volume`` is included; a later ``device_command_result`` is not
+        read here.
+        """
+        if not self._connected:
+            raise ConnectionError("ESP32 not connected")
+        if not is_device_command_frame(frame):
+            raise ValueError("invalid device command frame")
+        await self._ws_send(json.dumps(frame, ensure_ascii=False))
+        return {"ok": True}
+
     def handle_core_ack(self, message: dict[str, Any]) -> bool:
         """Complete the oldest waiter for this action. Ignores other JSON."""
         if message.get("type") != "core":
@@ -632,6 +649,11 @@ class ESP32Manager:
                     # panel_action delivery to the model is not implemented.
                     continue
 
+                elif msg_type in {"device_command", "device_command_result"}:
+                    # Fire-and-forget Portal system commands. A result, including
+                    # get_volume, stays on the device and is not user speech.
+                    continue
+
                 elif msg_type == "mcp":
                     if connection is not self._connection:
                         await self._handle_external_mcp_request(ws, data, session_id)
@@ -916,6 +938,30 @@ class ESP32Manager:
             return None, {"code": -32602, "message": "invalid panel frame"}
         try:
             result = await connection.send_panel(frame)
+        except Exception as exc:
+            return None, {"code": -32000, "message": str(exc)}
+        if self._connection is not connection or not connection.connected:
+            return None, {"code": -32000, "message": "ESP32 disconnected"}
+        return result, None
+
+    async def send_device_command(
+        self,
+        frame: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Send a Portal ``type:device_command`` frame on the current device socket.
+
+        Works while ``features.mcp`` is false. There is no ack: ok means the
+        frame passed validation and was written. One device at a time: a
+        replaced socket cannot complete this call. ``get_volume`` does not
+        wait for ``device_command_result``.
+        """
+        connection = self._connection
+        if connection is None or not connection.connected:
+            return None, {"code": -32000, "message": "No ESP32 device connected"}
+        if not is_device_command_frame(frame):
+            return None, {"code": -32602, "message": "invalid device command frame"}
+        try:
+            result = await connection.send_device_command(frame)
         except Exception as exc:
             return None, {"code": -32000, "message": str(exc)}
         if self._connection is not connection or not connection.connected:

@@ -92,7 +92,15 @@ forwarded on the same argument when it carries the page text. Portal does
 not ack panel frames, so ok means the document was checked and the frame was
 written. The write does not send abort and does not change the voice
 session. Inbound panel text is not given to the model. `STACKCHAN_PANEL_FRAMES=0`
-leaves the panel tools undeclared. Audio-only diagnostics use
+leaves the panel tools undeclared. `device_command` sends one
+`type:device_command` frame on that same socket, with catalog v1 `name` and
+`args` (volume, brightness, media transport, `open_app`, `show_settings`,
+`reconnect_bridge`). The voice instructions tell the model to use that tool
+for Portal system volume, brightness, media, and open-app, and not Mac
+`set_volume`, `media_control`, or `open_app`. Portal does not ack the frame.
+`get_volume` does not return a number; inbound `device_command_result` text
+is not given to the model. The contract is `PORTAL_DEVICE_COMMANDS.md`.
+`STACKCHAN_DEVICE_COMMANDS=0` leaves the tool undeclared. Audio-only diagnostics use
 `local_tools=False`, which also disables desktop access and these frames.
 
 The helper filters current-call task outcomes and new owner-authored desktop
