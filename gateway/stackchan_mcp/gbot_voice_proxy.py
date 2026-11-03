@@ -11,6 +11,7 @@ import time
 
 from .gbot_voice_bridge import GbotVoiceBridge
 from .gemini_voice_proxy import GeminiVoiceProxy
+from .koji_wiki import publish_bridge_presence
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         }
         if connected:
             self._health["last_verified_at"] = time.time()
+        publish_bridge_presence(online=bool(connected))
 
     async def start(self, info, device_hello, send_to_device):
         if self._health_task is not None:
@@ -55,6 +57,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         except asyncio.CancelledError:
             await super().stop()
             self._health["state"] = "stopped"
+            publish_bridge_presence(online=False)
             raise
         self._record_connection(connected, None if connected else self._health["last_error"])
         self._health_task = asyncio.create_task(
@@ -136,6 +139,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         await self._abort_in_flight_tts()
         await super().stop()
         self._health["state"] = "stopped"
+        publish_bridge_presence(online=False)
 
     def _voice_api_key(self):
         return None

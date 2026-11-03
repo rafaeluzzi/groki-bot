@@ -17,6 +17,10 @@ tests/private_wordlist.txt
 # Captures (user photos)
 captures/
 
+# Runtime Koji presence heartbeats. Pages and manifest.json are source.
+wiki/presence/*.json
+wiki/presence/*.tmp
+
 # Local wake word model
 models/kws/
 

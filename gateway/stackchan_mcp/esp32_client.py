@@ -23,6 +23,7 @@ from .audio_stream import SpeakResult, handle_audio_frame, speak_text
 from .cloud_proxy import CloudConnectionInfo, CloudProxy
 from .core_frames import core_ack_timeout_s, is_thin_core_frame
 from .device_commands import is_device_command_frame
+from .koji_wiki import record_portal_presence
 from .panel_frames import is_panel_frame
 from .debug_status import DebugStatus, get_debug_status
 from .protocol import HelloResponse, make_mcp_message, parse_jsonrpc_response
@@ -652,6 +653,12 @@ class ESP32Manager:
                 elif msg_type in {"device_command", "device_command_result"}:
                     # Fire-and-forget Portal system commands. A result, including
                     # get_volume, stays on the device and is not user speech.
+                    continue
+
+                elif msg_type == "koji_presence":
+                    # Portal heartbeats are not user speech. A valid body is
+                    # stored; the frame is never forwarded into the voice turn.
+                    record_portal_presence(data)
                     continue
 
                 elif msg_type == "mcp":

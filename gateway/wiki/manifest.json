@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "pages": [
+    {"id": "roles", "path": "pages/roles.md"},
+    {"id": "handoff", "path": "pages/handoff.md"},
+    {"id": "presence", "path": "pages/presence.md"},
+    {"id": "catalog", "path": "pages/catalog.md"}
+  ]
+}

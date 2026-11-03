@@ -110,6 +110,8 @@ PYTHONPATH=. python scripts/probe_gbot_voice_recovery.py --agent-id YOUR_AGENT_I
 
 同一条 WebSocket 也可以向 Portal 发送一条具名系统命令。`device_command` 发送 `{"type":"device_command","name":"...","args":{...}}`。目录 v1 的名字是 `set_volume_percent`、`set_volume_level`、`volume_up`、`volume_down`、`get_volume`、`media_pause`、`media_resume`、`media_stop`、`media_skip_next`、`media_skip_previous`、`set_brightness_percent`、`brightness_up`、`brightness_down`、`open_app`、`show_settings` 和 `reconnect_bridge`。音量、亮度、媒体播放和打开应用都留在 Portal 上。语音指令要求模型对这些请求调用 `device_command`，不要改 Mac 音量或桌面播放器。`set_volume_percent` 和 `set_brightness_percent` 使用 `args.percent`（0 到 100，50% 即 `{"percent":50}`）。`set_volume_level` 使用 `args.level`（0 到 100）。`open_app` 使用 `args.id`。其余命令的 `args` 为 `{}`。Portal 不必确认该帧；ok 表示网关已校验并写入。这次写入不发送 abort，也不改变 Opus 音频或语音会话。`get_volume` 在这里不返回读数；之后的 `device_command_result` 不会交给模型。约定见 [PORTAL_DEVICE_COMMANDS.md](PORTAL_DEVICE_COMMANDS.md)。`STACKCHAN_DEVICE_COMMANDS=0` 会不声明这个工具。改完后重启 Python 网关。登录桥不转发这些帧。
 
+同一台网关还托管 Koji 角色 wiki：`wiki/` 下可编辑的 Markdown（`roles`、`handoff`、`presence`、`catalog`）。`STACKCHAN_KOJI_WIKI` 默认开启时，Grok 登录态语音会话从磁盘读入 `roles`、`handoff` 和简短的命令目录页，并和其他工具指令一起附加。`STACKCHAN_KOJI_WIKI=0` 会去掉这段文字。Portal 从这台电脑读取 `http://<iMac 局域网 IP>:8766/wiki/manifest` 和 `http://<iMac 局域网 IP>:8766/wiki/pages/<id>`（与 `/debug/voice-health` 同一端口，改过 `CAPTURE_PORT` 时用实际端口）。Portal 也可以在设备 WebSocket 上发送 `{"type":"koji_presence","presence":{...}}`。该帧写入 `wiki/presence/portal.json`，不会当作语音。详见 [KOJI_WIKI.md](KOJI_WIKI.md)。
+
 Portal 要打开 MCP 通告，必须先应答网关现有的 `initialize` 和 `tools/list` 握手。`features.mcp` 为 false 时这次握手不会发生。`tools/list` 返回的名字不会写进 Grok 会话，`tools/call` 也不会改写成 `type:core` 帧。在那之前，使用上面的瘦帧。
 
 ### 唤醒词模型（可选，约 33 MB）
@@ -321,6 +323,8 @@ curl -s -X POST http://127.0.0.1:18770/send \
 | `STACKCHAN_CORE_ACK_TIMEOUT_S` | `3` | `type:core` 帧等待 Portal 确认的秒数 |
 | `STACKCHAN_PANEL_FRAMES` | `gbot` 时默认开 | `0` 不声明 Portal 的 `show_panel` / `dismiss_panel`（及别名），也不发送 `type:panel` 帧。面板帧没有确认 |
 | `STACKCHAN_DEVICE_COMMANDS` | `gbot` 时默认开 | `0` 不声明 Portal 的 `device_command`，也不发送 `type:device_command` 帧。该帧没有确认；`get_volume` 不返回读数 |
+| `STACKCHAN_KOJI_WIKI` | 开 | `0` 不把 `wiki/pages` 里的角色、交接和命令目录附加到 Grok 登录态语音指令。HTTP `/wiki/...` 和 presence 文件仍然可用 |
+| `STACKCHAN_KOJI_WIKI_DIR` | 本目录的 `wiki/` | 另一份同样含有 `manifest.json`、`pages/` 和 `presence/` 的目录 |
 | `STACKCHAN_GBOT_VOICE_BOT_ID` | 无 | Grok 语音智能体 ID，登录桥与网关必须一致 |
 | `STACKCHAN_GBOT_VOICE_URL` | `http://127.0.0.1:18771` | 仅本机 HTTP 登录桥地址 |
 | `STACKCHAN_GBOT_VOICE_LANGUAGE` | `zh` | 输入转写语言，如 `en` 或 `auto` |
