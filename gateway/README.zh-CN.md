@@ -104,7 +104,7 @@ PYTHONPATH=. python scripts/probe_gbot_voice_recovery.py --agent-id YOUR_AGENT_I
 
 桌面沙盒环境不可用时，语音仍可正常使用，原生通道会在后台持续重试。在在线状态（presence）和事件流就绪前，任务分配与会话搜索会明确返回暂不可用。受理仅代表系统已接收任务，不代表桌面端聊天界面已可见送达。桌面文字消息订阅仍可能报错，会自动独立重连，断开期间遗漏的消息不会补发。当前版本并未宣称已实现完全的功能一致，也未验证支持纯声学打断。详见[验证范围](GBOT_VOICE_VALIDATION.md)和[延迟测量方法](VOICE_LATENCY_BENCHMARK.md)。
 
-这条路径还可以更新已连接的 Portal 画面。`core_morph` / `morph` / `self.core.morph` 发送 `{"type":"core","action":"morph","name":"..."}`；`core_say` / `say` / `self.core.say` 发送 `{"type":"core","action":"say","text":"..."}`；`core_draw` / `draw` / `self.core.draw` 发送 `{"type":"core","action":"draw","what":"..."}`。网关在同一条设备 WebSocket 上等待 `{"type":"core","ok":true,"action":"..."}`。这些帧不走 MCP，因此 hello 里 `features.mcp: false` 时仍然有效。Opus 音频、`STACKCHAN_TOKEN` 和单设备会话不变。`STACKCHAN_CORE_FRAMES=0` 会不声明这些工具。改完后重启 Python 网关。登录桥不转发这些帧；只有登录桥本身有改动（钥匙串超时或过期通话接管）时才需要先重启登录桥，再重启网关。
+这条路径还可以更新已连接的 Portal 画面，表情只有 morph 和 say。`core_morph` / `morph` / `self.core.morph` 发送 `{"type":"core","action":"morph","name":"..."}`；`core_say` / `say` / `self.core.say` 发送 `{"type":"core","action":"say","text":"..."}`。网关在同一条设备 WebSocket 上等待 `{"type":"core","ok":true,"action":"..."}`。这些帧不走 MCP，因此 hello 里 `features.mcp: false` 时仍然有效。Opus 音频、`STACKCHAN_TOKEN` 和单设备会话不变。`STACKCHAN_CORE_FRAMES=0` 会不声明这些工具。改完后重启 Python 网关。登录桥不转发这些帧；只有登录桥本身有改动（钥匙串超时或过期通话接管）时才需要先重启登录桥，再重启网关。
 
 Portal 要打开 MCP 通告，必须先应答网关现有的 `initialize` 和 `tools/list` 握手。`features.mcp` 为 false 时这次握手不会发生。`tools/list` 返回的名字不会写进 Grok 会话，`tools/call` 也不会改写成 `type:core` 帧。在那之前，使用上面的瘦帧。
 
@@ -313,7 +313,7 @@ curl -s -X POST http://127.0.0.1:18770/send \
 | `STACKCHAN_CLAUDE_BIN` | PATH 里的 `claude` | `ask_claude` 使用的 Claude CLI |
 | `STACKCHAN_CLAUDE_MODEL` | `claude-sonnet-5` | `ask_claude` 和 Mac 后台任务调用 Claude CLI 时使用的模型 |
 | `STACKCHAN_VOICE_BACKEND` | `gemini` | `gbot` 使用 Grok 登录态语音；`xiaozhi` 转发到 XiaoZhi 云服务 |
-| `STACKCHAN_CORE_FRAMES` | `gbot` 时默认开 | `0` 不声明 Portal 的 `core_morph` / `core_say` / `core_draw`（及别名），也不发送 `type:core` 帧 |
+| `STACKCHAN_CORE_FRAMES` | `gbot` 时默认开 | `0` 不声明 Portal 的 `core_morph` / `core_say`（及别名），也不发送 `type:core` 帧 |
 | `STACKCHAN_CORE_ACK_TIMEOUT_S` | `3` | `type:core` 帧等待 Portal 确认的秒数 |
 | `STACKCHAN_GBOT_VOICE_BOT_ID` | 无 | Grok 语音智能体 ID，登录桥与网关必须一致 |
 | `STACKCHAN_GBOT_VOICE_URL` | `http://127.0.0.1:18771` | 仅本机 HTTP 登录桥地址 |

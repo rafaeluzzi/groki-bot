@@ -303,7 +303,7 @@ class ESP32Connection:
         """Send a thin ``type:core`` frame and wait for the matching ack.
 
         Does not require ``features.mcp``. The payload is the frame as given;
-        callers must already have built ``{"type","action", name|text|what}``.
+        callers must already have built ``{"type","action", name|text}``.
         """
         if not self._connected:
             raise ConnectionError("ESP32 not connected")

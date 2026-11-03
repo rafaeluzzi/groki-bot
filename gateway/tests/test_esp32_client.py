@@ -371,14 +371,22 @@ async def test_send_core_timeout_and_invalid_frame_do_not_require_mcp(manager):
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(ws.recv(), timeout=0.15)
 
-        result, error = await manager.send_core(
+        rejected_draw, draw_error = await manager.send_core(
             {"type": "core", "action": "draw", "what": "Hi"},
+        )
+        assert rejected_draw is None
+        assert draw_error["message"] == "invalid core frame"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(ws.recv(), timeout=0.15)
+
+        result, error = await manager.send_core(
+            {"type": "core", "action": "morph", "name": "heart"},
             timeout_s=0.2,
         )
         frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
-        assert frame == {"type": "core", "action": "draw", "what": "Hi"}
+        assert frame == {"type": "core", "action": "morph", "name": "heart"}
         assert result is None
-        assert "action=draw" in error["message"]
+        assert "action=morph" in error["message"]
 
 
 @pytest.mark.asyncio
