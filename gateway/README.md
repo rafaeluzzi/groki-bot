@@ -138,6 +138,8 @@ If the desktop sandbox is unavailable, audio stays usable while the native chann
 
 On this path the voice model can also update a connected Portal screen. Portal expression here is morph and say only. Calls named `core_morph`, `morph`, or `self.core.morph` send `{"type":"core","action":"morph","name":"..."}`. `core_say` / `say` / `self.core.say` send `{"type":"core","action":"say","text":"..."}`. The gateway waits for `{"type":"core","ok":true,"action":"..."}` on the same device WebSocket. These frames do not use MCP, so they still work while hello says `features.mcp: false`. Opus audio, `STACKCHAN_TOKEN`, and the one-device session are unchanged. Set `STACKCHAN_CORE_FRAMES=0` to leave the tools undeclared. Restart the Python gateway after changing it. The login helper does not forward these frames; restart the helper first only when the helper itself changed (Keychain timeout or stale-call takeover), then restart the gateway.
 
+The same path can open a panel beside the orb (about two thirds of the screen). `show_panel` and `self.panel.show` send `{"type":"panel","panel":{...}}`. The document is version 1 and its kind is `list`, `now_playing`, or `choice`. A `webview` or `html` document is forwarded on that same argument when it carries the page text, so a later renderer can show it without a new tool. `dismiss_panel` and `self.panel.dismiss` send `{"type":"panel","dismiss":true}`. Portal does not ack panel frames; the tool returns ok after the gateway checks the document and writes the frame. The write does not send abort and does not change Opus audio or the voice session. Inbound panel text is not delivered to the model. Set `STACKCHAN_PANEL_FRAMES=0` to leave these tools undeclared. Restart the Python gateway after changing it.
+
 Portal can set its MCP advertisement only after it answers the gateway's existing `initialize` and `tools/list` handshake. That handshake stays off while `features.mcp` is false. Names returned by `tools/list` are not copied into the Grok session, and `tools/call` is not rewritten into a `type:core` frame. Until that exists, use the thin frames above.
 
 ### Wake word model (optional, about 33 MB)
@@ -425,6 +427,7 @@ reconnect the MCP client, after a change).
 | `STACKCHAN_VOICE_BACKEND` | `gemini` | `gbot` uses Grok login voice; `xiaozhi` forwards to XiaoZhi cloud |
 | `STACKCHAN_CORE_FRAMES` | on for `gbot` | `0` does not declare Portal `core_morph` / `core_say` (and their aliases) or send `type:core` frames |
 | `STACKCHAN_CORE_ACK_TIMEOUT_S` | `3` | How long a `type:core` frame waits for Portal's ack |
+| `STACKCHAN_PANEL_FRAMES` | on for `gbot` | `0` does not declare Portal `show_panel` / `dismiss_panel` (and their aliases) or send `type:panel` frames. There is no panel ack |
 | `STACKCHAN_GBOT_VOICE_BOT_ID` | none | Grok voice agent ID; helper and gateway must agree |
 | `STACKCHAN_GBOT_VOICE_URL` | `http://127.0.0.1:18771` | Loopback HTTP login helper only |
 | `STACKCHAN_GBOT_VOICE_LANGUAGE` | `zh` | Input transcription language, e.g. `en` or `auto` |

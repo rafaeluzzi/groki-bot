@@ -257,16 +257,55 @@ class GbotVoiceBridge:
         )
         return True
 
+    def _bind_portal_panel_tool(self, name, used, declarations):
+        """Keep a Portal panel alias on the local forwarder.
+
+        Returns True when ``name`` is a panel spelling. Those calls must not
+        be posted to the native desktop harness, even if this session did not
+        declare another copy.
+        """
+        from .panel_frames import (
+            canonical_panel_tool,
+            panel_action_for_tool,
+            panel_frames_enabled,
+            panel_tool_description,
+            panel_tool_parameters,
+        )
+
+        if not panel_frames_enabled() or panel_action_for_tool(name) is None:
+            return False
+        if not isinstance(name, str):
+            return True
+        alias = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+        if not alias or alias in used or name in used:
+            return True
+        canonical = canonical_panel_tool(name)
+        if canonical is None or not self._executor_declares(canonical):
+            return True
+        used.add(alias)
+        self._local_tools[alias] = canonical
+        self._tool_schemas[alias] = panel_tool_parameters(canonical)
+        declarations.append(
+            {
+                "name": alias,
+                "type": "function",
+                "description": panel_tool_description(canonical),
+                "parameters": self._tool_schemas[alias],
+            }
+        )
+        return True
+
     def _configure_tools(self, session):
         # Catalog comes from the shared executor; provider-specific wire aliases
         # preserve dotted names without broadening the enabled tool set.
         if self._local_tools_enabled and self._executor is None:
             from .core_frames import core_frame_extension, core_frames_enabled
+            from .panel_frames import panel_frame_extension, panel_frames_enabled
             from .voice_tools import VoiceToolExecutor
 
             options = dict(self._executor_options)
+            extensions = tuple(options.get("extensions") or ())
             if core_frames_enabled():
-                extensions = tuple(options.get("extensions") or ())
                 declared = {
                     entry.get("name")
                     for ext in extensions
@@ -274,7 +313,15 @@ class GbotVoiceBridge:
                 }
                 if "core_morph" not in declared:
                     extensions = (*extensions, core_frame_extension(options.get("esp32")))
-                options["extensions"] = extensions
+            if panel_frames_enabled():
+                declared = {
+                    entry.get("name")
+                    for ext in extensions
+                    for entry in getattr(ext, "declarations", ())
+                }
+                if "show_panel" not in declared:
+                    extensions = (*extensions, panel_frame_extension(options.get("esp32")))
+            options["extensions"] = extensions
             self._executor = (self._executor_factory or VoiceToolExecutor)(**options)
         target = os.getenv("STACKCHAN_TOOL_BOT_ID", "")
         self._desktop_enabled = bool(
@@ -311,6 +358,8 @@ class GbotVoiceBridge:
         for declaration in session.get("tools", []):
             name = declaration.get("name")
             if self._bind_portal_core_tool(name, used, declarations):
+                continue
+            if self._bind_portal_panel_tool(name, used, declarations):
                 continue
             if name in {"send_task", "search_conversations"}:
                 enabled = self._desktop_enabled
