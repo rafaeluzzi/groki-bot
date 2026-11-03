@@ -34,7 +34,19 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         result = dict(self._health)
         if result["state"] == "connected" and not self.connected:
             result["state"] = "reconnecting"
+        # Desktop 502s stay on `native` so voice `ok` can remain connected.
+        result["native"] = self._native_health()
         return result
+
+    def _native_health(self):
+        bridge = self._bridge
+        channel = getattr(bridge, "_native", None) if bridge is not None else None
+        report = getattr(channel, "health", None)
+        if callable(report):
+            snapshot = report()
+            if isinstance(snapshot, dict):
+                return snapshot
+        return {"state": "unavailable", "ready": False, "presence_status": None}
 
     def _record_connection(self, connected, error=None):
         self._health["state"] = "connected" if connected else "reconnecting"

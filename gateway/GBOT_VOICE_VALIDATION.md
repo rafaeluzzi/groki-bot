@@ -232,9 +232,13 @@ background at five-second intervals. Desktop readiness requires both successful
 presence registration and a connected event stream. Until then, `send_task` and
 `search_conversations` return an explicit unavailable result without posting a
 task; local audio and hardware tools remain available. Restoring the native
-channel enables these tools automatically. Stopping voice cancels registration,
-retry and event listening, and attempts bounded presence cleanup. No CLI or
-alternate desktop transport is used as a fallback.
+channel enables these tools automatically. `GET /debug/voice-health` reports
+that same condition as `native.state` (`ready` or `unavailable`), `native.ready`,
+and `native.presence_status` (the last on-the-line presence HTTP status, such as
+502, or null). A presence 502 or any other not-ready channel leaves voice `ok`
+unchanged. Stopping voice cancels registration, retry and event listening, and
+attempts bounded presence cleanup. No CLI or alternate desktop transport is
+used as a fallback.
 
 
 ### README update completion
