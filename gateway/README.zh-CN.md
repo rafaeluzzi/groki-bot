@@ -108,6 +108,8 @@ PYTHONPATH=. python scripts/probe_gbot_voice_recovery.py --agent-id YOUR_AGENT_I
 
 同一条路径也可以在球体旁边打开一块面板（大约占屏幕三分之二）。`show_panel` 和 `self.panel.show` 发送 `{"type":"panel","panel":{...}}`。文档版本为 1，`kind` 为 `list`、`now_playing` 或 `choice`。带有页面文字的 `webview` 或 `html` 文档也走同一个参数，之后的渲染器可以直接显示，不必新增工具。`dismiss_panel` 和 `self.panel.dismiss` 发送 `{"type":"panel","dismiss":true}`。Portal 不对面板帧发确认；网关校验文档并写入帧之后，工具就返回 ok。这次写入不发送 abort，也不改变 Opus 音频或语音会话。设备发来的面板文本不会交给模型。`STACKCHAN_PANEL_FRAMES=0` 会不声明这些工具。改完后重启 Python 网关。
 
+同一条 WebSocket 也可以向 Portal 发送一条具名系统命令。`device_command` 发送 `{"type":"device_command","name":"...","args":{...}}`。目录 v1 的名字是 `set_volume_percent`、`set_volume_level`、`volume_up`、`volume_down`、`get_volume`、`media_pause`、`media_resume`、`media_stop`、`media_skip_next`、`media_skip_previous`、`set_brightness_percent`、`brightness_up`、`brightness_down`、`open_app`、`show_settings` 和 `reconnect_bridge`。音量、亮度、媒体播放和打开应用都留在 Portal 上。语音指令要求模型对这些请求调用 `device_command`，不要改 Mac 音量或桌面播放器。`set_volume_percent` 和 `set_brightness_percent` 使用 `args.percent`（0 到 100，50% 即 `{"percent":50}`）。`set_volume_level` 使用 `args.level`（0 到 100）。`open_app` 使用 `args.id`。其余命令的 `args` 为 `{}`。Portal 不必确认该帧；ok 表示网关已校验并写入。这次写入不发送 abort，也不改变 Opus 音频或语音会话。`get_volume` 在这里不返回读数；之后的 `device_command_result` 不会交给模型。约定见 [PORTAL_DEVICE_COMMANDS.md](PORTAL_DEVICE_COMMANDS.md)。`STACKCHAN_DEVICE_COMMANDS=0` 会不声明这个工具。改完后重启 Python 网关。登录桥不转发这些帧。
+
 Portal 要打开 MCP 通告，必须先应答网关现有的 `initialize` 和 `tools/list` 握手。`features.mcp` 为 false 时这次握手不会发生。`tools/list` 返回的名字不会写进 Grok 会话，`tools/call` 也不会改写成 `type:core` 帧。在那之前，使用上面的瘦帧。
 
 ### 唤醒词模型（可选，约 33 MB）
@@ -318,6 +320,7 @@ curl -s -X POST http://127.0.0.1:18770/send \
 | `STACKCHAN_CORE_FRAMES` | `gbot` 时默认开 | `0` 不声明 Portal 的 `core_morph` / `core_say`（及别名），也不发送 `type:core` 帧 |
 | `STACKCHAN_CORE_ACK_TIMEOUT_S` | `3` | `type:core` 帧等待 Portal 确认的秒数 |
 | `STACKCHAN_PANEL_FRAMES` | `gbot` 时默认开 | `0` 不声明 Portal 的 `show_panel` / `dismiss_panel`（及别名），也不发送 `type:panel` 帧。面板帧没有确认 |
+| `STACKCHAN_DEVICE_COMMANDS` | `gbot` 时默认开 | `0` 不声明 Portal 的 `device_command`，也不发送 `type:device_command` 帧。该帧没有确认；`get_volume` 不返回读数 |
 | `STACKCHAN_GBOT_VOICE_BOT_ID` | 无 | Grok 语音智能体 ID，登录桥与网关必须一致 |
 | `STACKCHAN_GBOT_VOICE_URL` | `http://127.0.0.1:18771` | 仅本机 HTTP 登录桥地址 |
 | `STACKCHAN_GBOT_VOICE_LANGUAGE` | `zh` | 输入转写语言，如 `en` 或 `auto` |
