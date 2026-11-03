@@ -29,16 +29,29 @@ from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
         ("core_say", "say"),
         ("say", "say"),
         ("self.core.say", "say"),
-        ("core_draw", "draw"),
-        ("draw", "draw"),
-        ("self.core.draw", "draw"),
     ],
 )
 def test_core_tool_names_map_to_one_action(name, action):
     assert core_action_for_tool(name) == action
 
 
-@pytest.mark.parametrize("name", ["self.say", "send_task", "core", "self.core.jump", ""])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "self.say",
+        "send_task",
+        "core",
+        "self.core.jump",
+        "",
+        "core_draw",
+        "draw",
+        "DRAW",
+        "self.core.draw",
+        "self_core_draw",
+        "core.draw",
+        "Self.Core.Draw",
+    ],
+)
 def test_unrelated_tool_names_are_not_core_actions(name):
     assert core_action_for_tool(name) is None
 
@@ -54,12 +67,16 @@ def test_core_instructions_name_the_body_and_the_screen():
     assert "mode motion of the same body" in text
     assert "Morph makes the silhouette" in text
     assert "inner glow" in text
-    assert "node-mesh" in text
+    assert "morph and say only" in text
+    assert "the same two actions" in text
+    assert "node-mesh" not in text
+    assert "dots" not in text
+    assert "points" not in text
+    assert "draw" not in text.lower()
     assert "Effects stay inside the body silhouette" in text
     assert "Do not claim the camera or a photo is on screen" in text
     assert "core_morph(name)" in text
     assert "core_say(text)" in text
-    assert "core_draw(what)" in text
     assert "before the tool returns ok" in text
     assert "ask_grokbot" not in text
 
@@ -75,18 +92,16 @@ def test_thin_frames_match_the_portal_shape():
         "action": "say",
         "text": "Hi",
     }
-    assert build_core_frame("self.core.draw", {"what": "Hi"}) == {
-        "type": "core",
-        "action": "draw",
-        "what": "Hi",
-    }
     assert build_core_frame("morph", {"face": "star"})["name"] == "star"
     assert build_core_frame("core_say", {"text": "你好"})["text"] == "你好"
     assert build_core_frame("core_morph", {"name": "  "}) is None
-    assert build_core_frame("core_draw", {"what": "x" * 501}) is None
-    frame = build_core_frame("draw", {"what": "Hi"})
+    assert build_core_frame("core_say", {"text": "x" * 501}) is None
+    for draw_name in ("core_draw", "draw", "self.core.draw", "core.draw"):
+        assert build_core_frame(draw_name, {"what": "Hi"}) is None
+    frame = build_core_frame("say", {"text": "Hi"})
     assert is_thin_core_frame(frame)
     assert not is_thin_core_frame({**frame, "session_id": "extra"})
+    assert not is_thin_core_frame({"type": "core", "action": "draw", "what": "Hi"})
 
 
 @pytest.mark.asyncio
@@ -105,6 +120,9 @@ async def test_extension_sends_one_frame_and_reads_the_ack():
     assert sent == [({"type": "core", "action": "morph", "name": "heart"}, 3.0)]
     rejected = await extension.dispatch("core_say", {})
     assert rejected == {"ok": False, "error": "invalid core arguments"}
+    for draw_name in ("core_draw", "draw", "self.core.draw", "Self.Core.Draw"):
+        missed = await extension.dispatch(draw_name, {"what": "Hi"})
+        assert missed == {"ok": False, "error": "invalid core arguments"}
     assert len(sent) == 1
 
 
@@ -149,16 +167,28 @@ async def test_gbot_voice_forwards_core_aliases_and_leaves_unknown_native_tools(
         }
     )
     names = {item["name"] for item in declarations}
-    assert {"core_morph", "morph", "self_core_morph", "core_say", "say", "core_draw", "draw"} <= names
-    assert "self_core_draw" in names
-    assert "Self_Core_Draw" in names
+    assert {
+        "core_morph",
+        "morph",
+        "self_core_morph",
+        "core_say",
+        "say",
+        "self_core_say",
+    } <= names
+    for banned in ("core_draw", "draw", "self_core_draw", "Self_Core_Draw", "self.core.draw"):
+        assert banned not in names
     assert "unknown_remote_action" not in bridge._remote_tools
     assert "morph" not in bridge._remote_tools
+    assert "draw" not in bridge._local_tools
+    assert "Self_Core_Draw" not in bridge._local_tools
+    assert "core_draw" not in bridge._local_tools
     injected = bridge._provider_tool_instructions()
     assert CORE_INSTRUCTIONS in injected
     assert "fluid SDF body" in injected
     assert "Idle is a calm orb" in injected
-    assert "node-mesh" in injected
+    assert "morph and say only" in injected
+    assert "node-mesh" not in injected
+    assert "core_draw" not in injected
 
     bridge._send = AsyncMock()
     bridge.running = True
@@ -166,12 +196,11 @@ async def test_gbot_voice_forwards_core_aliases_and_leaves_unknown_native_tools(
     await bridge._tool({"name": "self_core_say", "call_id": "s", "arguments": '{"text":"Hi"}'})
     await bridge._tool({"name": "draw", "call_id": "d", "arguments": '{"what":"Hi"}'})
     await bridge._tool({"name": "Self_Core_Draw", "call_id": "alias", "arguments": '{"what":"Later"}'})
+    await bridge._tool({"name": "core_draw", "call_id": "cd", "arguments": '{"what":"Nope"}'})
     await bridge._tool({"name": "core_morph", "call_id": "bad", "arguments": "{}"})
     assert frames == [
         {"type": "core", "action": "morph", "name": "heart"},
         {"type": "core", "action": "say", "text": "Hi"},
-        {"type": "core", "action": "draw", "what": "Hi"},
-        {"type": "core", "action": "draw", "what": "Later"},
     ]
     outputs = [
         json.loads(call.args[0]["item"]["output"])

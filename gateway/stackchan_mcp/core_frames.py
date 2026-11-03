@@ -13,11 +13,13 @@ Tool names (any of these, case-insensitive; dots become underscores):
 |---|---|---|
 | ``core_morph``, ``morph``, ``self.core.morph`` | morph | ``{"type":"core","action":"morph","name":"..."}`` |
 | ``core_say``, ``say``, ``self.core.say`` | say | ``{"type":"core","action":"say","text":"..."}`` |
-| ``core_draw``, ``draw``, ``self.core.draw`` | draw | ``{"type":"core","action":"draw","what":"..."}`` |
+
+Portal expression on this path is morph and say only. ``core_draw``, ``draw``,
+``self.core.draw``, and dotted twins such as ``core.draw`` are not tools and
+do not build a frame.
 
 Argument keys ``face`` / ``emotion`` fill ``name`` when ``name`` is empty.
-``message`` fills ``text``. ``text`` / ``content`` fill ``what`` when ``what``
-is empty. The frame itself only carries the canonical field.
+``message`` fills ``text``. The frame itself only carries the canonical field.
 
 MCP gap (why Portal cannot set ADVERTISE_MCP from this change alone):
 
@@ -46,31 +48,27 @@ import os
 import re
 from typing import Any
 
-CORE_ACTIONS = ("morph", "say", "draw")
+CORE_ACTIONS = ("morph", "say")
 
 _ACTION_FIELDS = {
     "morph": "name",
     "say": "text",
-    "draw": "what",
 }
 
 _ARG_FALLBACKS = {
     "morph": ("name", "face", "emotion"),
     "say": ("text", "message"),
-    "draw": ("what", "text", "content"),
 }
 
 # Normalized spellings the voice model or a session catalog might use.
+# Draw names are absent on purpose: a leftover alias must not send a frame.
 _NORMALIZED_ACTIONS = {
     "morph": "morph",
     "say": "say",
-    "draw": "draw",
     "core_morph": "morph",
     "core_say": "say",
-    "core_draw": "draw",
     "self_core_morph": "morph",
     "self_core_say": "say",
-    "self_core_draw": "draw",
 }
 
 # Declared on the gbot session. Dotted names are sanitized to underscores on
@@ -84,9 +82,6 @@ CORE_DECLARED_NAMES = (
     "core_say",
     "say",
     "self.core.say",
-    "core_draw",
-    "draw",
-    "self.core.draw",
 )
 
 _MAX_CHARS = 500
@@ -100,10 +95,6 @@ _DESCRIPTIONS = {
         "Show a short line of text on the connected Portal screen as speech text. "
         "text is the line to show. This does not play audio."
     ),
-    "draw": (
-        "Draw text on the connected Portal screen. "
-        "what is the text to draw. This does not speak audio."
-    ),
 }
 
 CORE_INSTRUCTIONS = (
@@ -111,12 +102,12 @@ CORE_INSTRUCTIONS = (
     "When asked what you are looking at or what is on the screen, answer in spoken English: "
     "Idle is a calm orb. Listening, Thinking, and Speaking are mode motion of the same body. "
     "Morph makes the silhouette a named shape like a heart, then it melts back. "
-    "Say is inner glow words. Draw is node-mesh dots inside the body. "
+    "Say is inner glow words. "
     "Effects stay inside the body silhouette. Do not claim the camera or a photo is on screen. "
-    "Portal screen: when the user asks to change the face, show words, or draw "
-    "on the screen, call core_morph(name), core_say(text), or core_draw(what). "
-    "morph, say, draw, self.core.morph, self.core.say, and self.core.draw are "
-    "the same three actions. These update the screen and do not replace your "
+    "Portal screen expression is morph and say only. When the user asks to change the face "
+    "or show words on the screen, call core_morph(name) or core_say(text). "
+    "morph, say, self.core.morph, and self.core.say are the same two actions. "
+    "These update the screen and do not replace your "
     "spoken reply. Do not claim the screen changed before the tool returns ok."
 )
 

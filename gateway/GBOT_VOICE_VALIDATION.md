@@ -78,9 +78,9 @@ presence and filtered event streams. Grok does not declare or execute the local
 `ask_grokbot` wrapper and does not use a CLI or the older HTTP Bot bridge.
 `end_the_call` uses the existing end-conversation callback; when present it
 replaces the duplicate local `end_conversation` declaration. Portal screen
-tools are local, not native harness tools: `core_morph` / `morph` /
-`self.core.morph`, `core_say` / `say` / `self.core.say`, and `core_draw` /
-`draw` / `self.core.draw` send one thin `type:core` frame on the device
+tools are local, not native harness tools. Expression is morph and say only:
+`core_morph` / `morph` / `self.core.morph` and `core_say` / `say` /
+`self.core.say` send one thin `type:core` frame on the device
 WebSocket and wait for `{"type":"core","ok":true,"action":"..."}`. Other
 unknown native tools stay disabled, including when the legacy
 `STACKCHAN_GBOT_VOICE_TOOLS` setting is present. `STACKCHAN_CORE_FRAMES=0`
