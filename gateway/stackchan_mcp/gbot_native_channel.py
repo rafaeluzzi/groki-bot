@@ -75,6 +75,7 @@ class NativeVoiceChannel:
         self._presence_owned = False
         self._retry_delay = 5.0
         self._typed_seen = set()
+        self._presence_status = None
         self.connected = asyncio.Event()
 
     async def _presence(self, on):
@@ -88,6 +89,9 @@ class NativeVoiceChannel:
             },
             allow_redirects=False,
         ) as response:
+            # Hangup must not erase the registration status the portal watches.
+            if on:
+                self._presence_status = response.status
             logger.info("Grok native presence on=%s status=%d", on, response.status)
             if response.status != 200:
                 raise RuntimeError("native_presence_unavailable")
@@ -98,6 +102,15 @@ class NativeVoiceChannel:
     @property
     def ready(self):
         return not self._closed and self._registered and self.connected.is_set()
+
+    def health(self):
+        """Desktop readiness for voice-health. Same condition as native_not_ready."""
+        ready = self.ready
+        return {
+            "state": "ready" if ready else "unavailable",
+            "ready": ready,
+            "presence_status": self._presence_status,
+        }
 
     async def start(self):
         # Native sandbox availability must not hold the independent audio socket.

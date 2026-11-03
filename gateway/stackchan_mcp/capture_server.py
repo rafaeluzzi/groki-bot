@@ -140,11 +140,33 @@ async def handle_debug_panel(request: web.Request) -> web.Response:
     return web.Response(text=PANEL_HTML, content_type="text/html")
 
 
+def _native_health(health: dict) -> dict:
+    """Desktop channel snapshot the portal router already polls.
+
+    ``ready`` is true only when the channel itself reports ready. Anything else,
+    including a missing snapshot, is ``unavailable`` so a desktop 502 cannot
+    hide behind a connected voice session.
+    """
+    native = health.get("native")
+    if not isinstance(native, dict):
+        native = {}
+    status = native.get("presence_status")
+    if type(status) is not int:
+        status = None
+    ready = native.get("ready") is True and native.get("state") == "ready"
+    return {
+        "state": "ready" if ready else "unavailable",
+        "ready": ready,
+        "presence_status": status,
+    }
+
+
 async def handle_voice_health(request: web.Request) -> web.Response:
     """Report the supervised voice session, rather than HTTP-server liveness."""
     health = request.app[DEBUG_STATUS_KEY].snapshot().get("voice")
-    health = health or {"state": "unavailable"}
-    ready = health["state"] == "connected"
+    health = dict(health or {"state": "unavailable"})
+    ready = health.get("state") == "connected"
+    health["native"] = _native_health(health)
     return web.json_response({"ok": ready, **health}, status=200 if ready else 503)
 
 

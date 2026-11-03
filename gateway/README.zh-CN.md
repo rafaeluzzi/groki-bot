@@ -92,7 +92,7 @@ python3 scripts/install_gbot_voice_launchd.py --agent-id YOUR_AGENT_ID --enable-
 
 网关会每 30 秒在当前语音连接上确认服务端仍能响应，不播放测试声音。初次连接失败、连接断开、服务端不回应或回复停滞时，网关会清理旧音频并自动重连；重试间隔从 1 秒逐步延长，最长 30 秒。不会重新发送之前的提问或桌面任务。登录失效或接口不兼容仍需处理账户或更新程序。
 
-`http://127.0.0.1:8766/debug/voice-health` 返回真实语音连接状态：可用时 HTTP 200，正在连接、恢复或不可用时 HTTP 503。`action_required` 表示需要处理登录或账户，`last_error` 仅包含固定错误分类。端口以网关实际配置为准。
+`http://127.0.0.1:8766/debug/voice-health` 返回真实语音连接状态：可用时 HTTP 200，正在连接、恢复或不可用时 HTTP 503。`action_required` 表示需要处理登录或账户，`last_error` 仅包含固定错误分类。同一份 JSON 含桌面原生通道 `native`：`state` 为 `ready` 或 `unavailable`，`ready` 仅在 presence 注册和事件流都接通时为 true，`presence_status` 是最近一次上线 presence 的 HTTP 状态（例如 `502`），尚未请求时为 `null`。顶层 `ok` 和 HTTP 状态仍只表示语音会话，因此桌面 502 时语音仍可能显示已连接。端口以网关实际配置为准。
 
 可以在 `gateway/` 运行独立恢复检查，使用真实 Grok 连接，模拟登录桥暂时不可用并断开测试连接。它不会中断机器人当前通话：
 
