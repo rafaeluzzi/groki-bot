@@ -21,6 +21,7 @@ from aiohttp import web
 
 from .debug_panel import PANEL_HTML
 from .debug_status import DebugStatus, get_debug_status
+from .koji_wiki import handle_wiki_manifest, handle_wiki_page
 
 logger = logging.getLogger(__name__)
 
@@ -163,4 +164,6 @@ def create_capture_app(
     app.router.add_get("/debug/status", handle_debug_status)
     app.router.add_get("/debug/voice-health", handle_voice_health)
     app.router.add_get("/debug/panel", handle_debug_panel)
+    app.router.add_get("/wiki/manifest", handle_wiki_manifest)
+    app.router.add_get("/wiki/pages/{page_id}", handle_wiki_page)
     return app

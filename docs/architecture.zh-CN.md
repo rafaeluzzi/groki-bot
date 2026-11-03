@@ -95,6 +95,8 @@ Grok 登录态语音路径上，Portal 表情只有 morph 和 say。`core_morph`
 
 这条路径也可以发送一条具名的 Portal 系统命令。`device_command` 在同一条 WebSocket 上发送 `{"type":"device_command","name":"...","args":{...}}`。目录 v1 包括音量（`set_volume_percent`、`set_volume_level`、`volume_up`、`volume_down`、`get_volume`）、媒体播放（`media_pause`、`media_resume`、`media_stop`、`media_skip_next`、`media_skip_previous`）、亮度（`set_brightness_percent`、`brightness_up`、`brightness_down`），以及 `open_app`、`show_settings`、`reconnect_bridge`。这些都留在 Portal 上：语音指令要求调用 `device_command`，不要调用 Mac 的音量、媒体或打开应用工具。Portal 不确认该帧；ok 表示网关已校验并写入。`get_volume` 不返回读数，设备发来的 `device_command_result` 也不会交给模型。参数约定见 [gateway/PORTAL_DEVICE_COMMANDS.md](../gateway/PORTAL_DEVICE_COMMANDS.md)。`STACKCHAN_DEVICE_COMMANDS=0` 会不声明这个工具。
 
+这条路径也会加载 Koji wiki。配置 Grok 登录态语音会话时，会把 `gateway/wiki/pages/roles.md`、`handoff.md` 和 `catalog.md` 附加到指令里。`STACKCHAN_KOJI_WIKI=0` 会去掉这段文字。Portal 在下面的 HTTP 端口上拉取 `GET /wiki/manifest` 和 `GET /wiki/pages/{id}`。它在同一条 WebSocket 上发布 `{"type":"koji_presence","presence":{...}}`；网关把最后一次内容写入 `gateway/wiki/presence/portal.json`，并且不把该帧交给模型。约定见 [gateway/KOJI_WIKI.md](../gateway/KOJI_WIKI.md)。
+
 **音频。** 上行：Opus，16 kHz 单声道，每帧 60 毫秒，用 WebSocket 二进制消息发送。网关先用本机的唤醒词检测（sherpa-onnx）听，听到「Hi Grok」（设 `STACKCHAN_WAKE_PHRASE=hey groki` 时是「Hey Groki」）之后才把声音转给 Gemini；安静 `STACKCHAN_WAKE_IDLE_S` 秒后结束这一轮聆听。下行：Gemini 回复的声音编码成 Opus（24 kHz，60 毫秒）发回机器人，同时发送 `tts` 状态消息，让机器人知道什么时候开始说、什么时候说完。
 
 **Gemini Live。** 网关保持一个 Gemini Live 会话（`GEMINI_API_KEY`，默认模型 `gemini-3.8-live`，默认音色 `Kore`），并给 Gemini 一小组可调用的工具：`end_conversation`、`get_current_datetime`、装了 `claude` 命令行时才有的 `ask_claude`（`STACKCHAN_ASK_CLAUDE=0` 可关闭），以及开启后才有的 Mac 控制工具和 `ask_grokbot`。设 `STACKCHAN_GEMINI_DEVICE_TOOLS=1` 时，Gemini 还会拿到 `move_head`、`set_avatar`、`set_all_leds` 和 `express_emotion`；因为 Groki Bot 固件没有 MCP，网关把它们改成 XiaoZhi 消息发送：`head`（需要 v0.2.1 之后的固件）、带表情的 `llm` 和 `led`。
@@ -107,6 +109,8 @@ Grok 登录态语音路径上，Portal 表情只有 morph 和 say。`core_morph`
 | `GET /debug/panel` | 同样的状态，网页形式 |
 | `POST /capture` | 带摄像头工具的固件上传照片（需要 `Authorization: Bearer`，值为 `VISION_TOKEN` 或 `STACKCHAN_TOKEN`）。Groki Bot 固件不使用。 |
 | `POST /debug/inject-text` | 往当前会话里插入一段文字，受令牌保护 |
+| `GET /wiki/manifest` | Koji wiki 清单，带计算出的 etag。不需要令牌。见 [gateway/KOJI_WIKI.md](../gateway/KOJI_WIKI.md) |
+| `GET /wiki/pages/{id}` | 一页 Markdown（`roles`、`handoff`、`presence`、`catalog`） |
 | `POST /track` | Mac 人脸追踪程序发来的人脸位置（见下面的人脸追踪） |
 
 **人脸追踪。** 在带摄像头的 Mac 上，网关启动 [tools/vision-tracker](../tools/vision-tracker/README.md)（`groki-vision-tracker --endpoint http://127.0.0.1:8766/track --fps 8`），程序退出后自动重启。追踪程序用 Apple Vision 找出每帧里置信度最高的人脸，每秒最多 8 次发送 `{"x", "y", "width", "height", "confidence", "timestamp"}`（0 到 1 的画面坐标）。`TrackingBridge` 把位置换算成头部角度并做平滑，最高每秒 50 次发给机器人。因为 Groki Bot 固件没有 MCP，转头用的是 XiaoZhi 控制消息 `{"type": "head", "yaw": <-90..90>, "pitch": <0..60>, "speed": <100..1000>}`。固件把角度限制在舵机限位之内；机器人说话时只保留最后一条指令，等这段回复说完再执行。机器人说话时和唤醒后听你说话时，网关不发转头指令；「看着我」「别看了」（`self.tracking.start` / `self.tracking.stop`）打开和关闭跟随。`/debug/status` 的 `face_tracking` 一节显示状态。设置方法见[网关 README 的人脸追踪一节](../gateway/README.zh-CN.md#人脸追踪)。
@@ -200,6 +204,7 @@ curl -sN -X POST http://127.0.0.1:18770/send \
 | 网关里的 Grok Bot 客户端 | `gateway/stackchan_mcp/gbot_brain.py` |
 | 转发服务和 `gbot` 封装 | `gateway/stackchan_mcp/gbot_http_proxy.py`、`gbot_client.py` |
 | 8766 端口 HTTP | `gateway/stackchan_mcp/capture_server.py` |
+| Koji wiki 页面和 presence | `gateway/wiki/`、`gateway/stackchan_mcp/koji_wiki.py` |
 | 人脸追踪：追踪程序进程、头部角度换算 | `gateway/stackchan_mcp/face_tracker.py`、`tracking_bridge.py`；`tools/vision-tracker/` |
 | 固件的 `head` 消息 | `components/conversation/include/conversation/control_dispatch.hpp`、`main/conversation_task.cpp` |
 | stdio MCP 服务 | `gateway/stackchan_mcp/stdio_server.py`、`cli.py` |

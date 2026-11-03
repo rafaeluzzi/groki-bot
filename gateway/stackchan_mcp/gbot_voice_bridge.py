@@ -367,6 +367,12 @@ class GbotVoiceBridge:
                 }
                 if "device_command" not in declared:
                     extensions = (*extensions, device_command_extension(options.get("esp32")))
+            from .koji_wiki import koji_wiki_enabled, koji_wiki_extension
+
+            if koji_wiki_enabled():
+                wiki = koji_wiki_extension()
+                if wiki is not None:
+                    extensions = (*extensions, wiki)
             options["extensions"] = extensions
             self._executor = (self._executor_factory or VoiceToolExecutor)(**options)
         target = os.getenv("STACKCHAN_TOOL_BOT_ID", "")
