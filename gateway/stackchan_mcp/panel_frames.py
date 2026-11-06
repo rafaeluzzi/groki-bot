@@ -14,11 +14,25 @@ Tool names (any of these, case-insensitive; dots become underscores):
 | ``dismiss_panel``, ``panel_dismiss``, ``self.panel.dismiss`` | dismiss | ``{"type":"panel","dismiss":true}`` |
 
 ``show_panel`` takes the panel document as a JSON object or as a JSON string
-of that object. Version 1 kinds ``list``, ``now_playing``, and ``choice`` are
-checked before the frame is sent. A ``webview`` or ``html`` document is
-forwarded the same way when it carries the page text, so a later device
-renderer can show it without a new tool argument. Extra fields on a valid
-document are kept.
+of that object. The gateway rebuilds it into the Koji version 1 schema
+(``android/docs/compose-panel-kit.md`` in grok-portal) before the frame is
+sent, because Koji drops a document it cannot parse and never says so:
+
+- ``version`` may be omitted; any other value than ``1`` is rejected.
+- ``id`` and row/action ids are filled in from the titles when missing.
+- ``list`` takes ``rows`` or ``items``; an item may be a string or an object
+  with ``label``, ``title``, ``text``, or ``name``. At most 12 rows are sent.
+- ``now_playing`` takes ``title`` (or ``track``/``name``/``song``) and
+  ``show`` (or ``artist``/``podcast``/``album``); ``primary`` defaults to
+  Pause, or Play when ``paused`` is true.
+- ``choice`` takes ``prompt`` (or ``title``/``text``) and 1 to 4 ``actions``
+  (or ``options``/``choices``).
+- ``webview`` (``html`` is an alias) needs an ``html`` fragment. Koji does not
+  load URLs.
+
+Text over Koji's length caps is cut with an ellipsis, and ``<`` in plain text
+becomes ``‹``. Unknown fields are dropped. A rejected document returns a
+reason the model can act on.
 
 Portal does not ack ``type:panel`` today (unlike ``type:core``). The tool
 returns ok after the document is validated and the frame is written. That
@@ -38,9 +52,8 @@ import os
 import re
 from typing import Any
 
-PANEL_KINDS = ("list", "now_playing", "choice")
-PASSTHROUGH_KINDS = ("webview", "html")
-_ALL_KINDS = PANEL_KINDS + PASSTHROUGH_KINDS
+PANEL_KINDS = ("list", "now_playing", "choice", "webview")
+_KIND_ALIASES = {"html": "webview"}
 
 # Normalized spellings the voice model or a session catalog might use.
 _NORMALIZED_ACTIONS = {
@@ -68,28 +81,51 @@ _CANONICAL = {
     "dismiss": "dismiss_panel",
 }
 
-MAX_PANEL_BYTES = 32768
+MAX_PANEL_BYTES = 65536
 _MAX_DEPTH = 8
-_MAX_ITEMS = 40
-_MAX_OPTIONS = 12
+_MAX_INPUT_ITEMS = 40
 _MAX_KEYS = 48
-_MAX_LABEL = 240
-_LABEL_KEYS = ("title", "label", "text", "name")
-_NOW_PLAYING_KEYS = ("title", "track", "name", "song")
-_CHOICE_PROMPT_KEYS = ("prompt", "title", "text")
 _KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+
+# Koji limits, from PanelJson.kt / compose-panel-kit.md.
+_TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
+_MAX_ROWS = 12
+_MAX_ACTIONS = 4
+_MAX_TITLE = 80
+_MAX_SUBTITLE = 120
+_MAX_PROMPT = 160
+_MAX_ACTION_LABEL = 40
+_MAX_URL = 500
+_MAX_HTML = 48000
+_MAX_SECONDS = 172_800
+
+_ROW_LABEL_KEYS = ("title", "label", "text", "name")
+_ROW_SUBTITLE_KEYS = ("subtitle", "description", "detail")
+_NOW_PLAYING_TITLE_KEYS = ("title", "track", "name", "song", "episode")
+_NOW_PLAYING_SHOW_KEYS = ("show", "artist", "podcast", "album", "subtitle")
+_CHOICE_PROMPT_KEYS = ("prompt", "title", "text", "question")
+_ACTION_LABEL_KEYS = ("label", "title", "text", "name")
+_ART_KEYS = ("artUrl", "art_url", "image", "imageUrl", "image_url")
+_HTML_KEYS = ("html", "document", "markup", "content")
+_URL_KEYS = ("url", "src", "href")
+
+PANEL_EXAMPLE = (
+    '{"version":1,"kind":"list","title":"Podcasts I follow",'
+    '"items":[{"title":"Planet Money"},{"title":"All-In"}]}'
+)
 
 _SHOW_DESCRIPTION = (
     "Show a panel beside the orb on the connected Portal. "
-    "panel is a version 1 document, as an object or a JSON string. "
-    "kind list needs items with a title, label, or text. "
-    "kind now_playing needs a title, track, or name. "
-    "kind choice needs a prompt or title and options with a label. "
-    "kind webview or html is forwarded when it includes the page text, "
-    "for example html, document, url, or src. "
+    "panel is a JSON object (or JSON string) with version 1 and a kind. Example: "
+    + PANEL_EXAMPLE
+    + ". kind list: title and items, each a string or an object with title, label, or text "
+    "(optional subtitle); at most 12 are shown. "
+    "kind now_playing: title and show (or artist). "
+    "kind choice: prompt and 1 to 4 options, each with a label. "
+    "kind webview: an html fragment (no scripts, styles, or remote images; urls are not loaded). "
     "Use list, now_playing, or choice when they fit. "
     "This does not speak audio and does not replace the spoken reply. "
-    "ok means the frame was accepted and sent."
+    "ok means the frame was accepted and sent. On an error, fix what the error names."
 )
 
 _DISMISS_DESCRIPTION = (
@@ -100,10 +136,11 @@ _DISMISS_DESCRIPTION = (
 PANEL_INSTRUCTIONS = (
     "A panel sits beside the orb and takes about two thirds of the screen. "
     "When a list, what is playing, or a short choice fits, call show_panel with a "
-    "version 1 panel document of kind list, now_playing, or choice. "
-    "self.panel.show is the same action. "
+    "version 1 panel document of kind list, now_playing, or choice, for example "
+    + PANEL_EXAMPLE
+    + ". self.panel.show is the same action. "
     "dismiss_panel and self.panel.dismiss close it. "
-    "A webview or html document can be sent the same way when that page is what should appear. "
+    "A webview or html document with an html fragment can be sent the same way when that page is what should appear. "
     "Panels do not replace your spoken reply. "
     "Do not claim the panel showed before the tool returns ok. "
     "Do not end every reply with an open-ended follow-up."
@@ -137,18 +174,12 @@ def canonical_panel_tool(name: object) -> str | None:
     return _CANONICAL[action]
 
 
-def _text(value: object, limit: int) -> bool:
-    if not isinstance(value, str) or len(value) > limit:
-        return False
-    if not value.strip() or len(value.strip()) > limit:
-        return False
-    return not any(ord(ch) < 32 and ch not in "\n\t\r" for ch in value)
+class PanelError(ValueError):
+    """A show_panel document Koji would not render. The message names the fix.
 
-
-def _identifier(value: object) -> bool:
-    if type(value) is int:
-        return 0 <= value <= 1_000_000
-    return _text(value, 64)
+    Messages never echo document text, so a rejected panel does not leak its
+    contents into logs or the tool result.
+    """
 
 
 def _key_ok(key: object) -> bool:
@@ -165,9 +196,9 @@ def _walk(value: object, depth: int) -> bool:
     if isinstance(value, float):
         return math.isfinite(value)
     if isinstance(value, str):
-        return "\x00" not in value and not any(ord(ch) < 32 and ch not in "\n\t\r" for ch in value)
+        return "\x00" not in value
     if isinstance(value, list):
-        return len(value) <= _MAX_ITEMS and all(_walk(item, depth + 1) for item in value)
+        return len(value) <= _MAX_INPUT_ITEMS and all(_walk(item, depth + 1) for item in value)
     if isinstance(value, dict):
         if len(value) > _MAX_KEYS:
             return False
@@ -175,157 +206,304 @@ def _walk(value: object, depth: int) -> bool:
     return False
 
 
-def _labeled(item: object, keys: tuple[str, ...]) -> bool:
-    if not isinstance(item, dict):
-        return False
-    present = [key for key in keys if key in item]
-    if not present:
-        return False
-    return all(_text(item[key], _MAX_LABEL) for key in present)
+def _token(raw: str, fallback: str) -> str:
+    """Same rewrite as Koji ``panelToken``: ``ep 1`` becomes ``ep-1``."""
+    out: list[str] = []
+    dash = False
+    for ch in raw.strip():
+        if ch.isascii() and (ch.isalnum() or ch in "._:"):
+            if len(out) < 60:
+                out.append(ch)
+            dash = False
+        elif not dash and out and len(out) < 60:
+            out.append("-")
+            dash = True
+    text = "".join(out).rstrip("-")
+    if not text or not text[0].isalnum():
+        return fallback
+    return text
 
 
-def _option_list(value: object, *, limit: int) -> bool:
-    if not isinstance(value, list) or not 1 <= len(value) <= limit:
-        return False
-    for option in value:
-        if not _labeled(option, ("label", "title", "text")):
-            return False
-        if "id" in option and not _identifier(option["id"]):
-            return False
-    return True
+def _id(value: object, fallback: str) -> str:
+    if type(value) is int and value >= 0:
+        value = str(value)
+    if not isinstance(value, str):
+        return fallback
+    text = value.strip()
+    if _TOKEN_RE.fullmatch(text):
+        return text
+    return _token(text, fallback)
 
 
-def _accept_list(document: dict[str, Any]) -> bool:
-    if "title" in document and not _text(document["title"], _MAX_LABEL):
-        return False
-    items = document.get("items")
-    if not isinstance(items, list) or not 1 <= len(items) <= _MAX_ITEMS:
-        return False
-    for item in items:
-        if not _labeled(item, _LABEL_KEYS):
-            return False
-        if "id" in item and not _identifier(item["id"]):
-            return False
-        if "subtitle" in item and not _text(item["subtitle"], _MAX_LABEL):
-            return False
-    return True
+def _unique(ident: str, seen: set[str], index: int) -> str:
+    candidate = ident
+    if candidate in seen:
+        candidate = f"{ident[:70]}-{index}"
+    while candidate in seen:
+        index += 1000
+        candidate = f"{ident[:70]}-{index}"
+    seen.add(candidate)
+    return candidate
 
 
-def _accept_now_playing(document: dict[str, Any]) -> bool:
-    present = [key for key in _NOW_PLAYING_KEYS if key in document]
-    if not present or any(not _text(document[key], _MAX_LABEL) for key in present):
-        return False
-    for key in ("artist", "album", "subtitle"):
-        if key in document and not _text(document[key], _MAX_LABEL):
-            return False
-    if "progress" in document:
-        progress = document["progress"]
-        if isinstance(progress, bool) or not isinstance(progress, (int, float)):
-            return False
-        if not 0 <= float(progress) <= 1:
-            return False
-    for key in ("position_ms", "duration_ms"):
-        if key not in document:
+def _plain(value: object, limit: int) -> str | None:
+    """Plain text Koji accepts: no markup, no control characters, under the cap."""
+    if not isinstance(value, str):
+        return None
+    text = "".join(" " if ord(ch) < 32 else ch for ch in value).strip()
+    text = text.replace("<", "\u2039")
+    if not text:
+        return None
+    if len(text) > limit:
+        text = text[: limit - 1].rstrip() + "\u2026"
+    return text
+
+
+def _first(source: dict[str, Any], keys: tuple[str, ...], limit: int) -> tuple[str | None, str | None]:
+    """First usable text among ``keys`` and the key it came from."""
+    for key in keys:
+        text = _plain(source.get(key), limit)
+        if text is not None:
+            return text, key
+    return None, None
+
+
+def _art(source: dict[str, Any]) -> str | None:
+    for key in _ART_KEYS:
+        value = source.get(key)
+        if not isinstance(value, str):
             continue
-        value = document[key]
-        if type(value) is not int or value < 0 or value > 24 * 60 * 60 * 1000:
-            return False
-    if "paused" in document and not isinstance(document["paused"], bool):
-        return False
-    return True
+        text = value.strip()
+        if (
+            text.startswith(("https://", "http://"))
+            and len(text) <= _MAX_URL
+            and not any(ch.isspace() for ch in text)
+            and "<" not in text
+        ):
+            return text
+    return None
 
 
-def _accept_choice(document: dict[str, Any]) -> bool:
-    prompts = [key for key in _CHOICE_PROMPT_KEYS if key in document]
-    if not prompts or any(not _text(document[key], _MAX_LABEL) for key in prompts):
-        return False
-    lists = [key for key in ("options", "choices") if key in document]
-    if not lists:
-        return False
-    return all(_option_list(document[key], limit=_MAX_OPTIONS) for key in lists)
-
-
-def _has_page_text(value: object, *, key: str | None = None) -> bool:
-    """True when a webview or html document carries some page text.
-
-    The field name is not fixed, so a later renderer can use html, url, or
-    another string without a new tool argument. ``kind`` itself does not count.
-    """
+def _action(value: object, fallback: str, *, where: str) -> dict[str, str]:
     if isinstance(value, str):
-        return key not in {None, "kind"} and bool(value.strip())
-    if isinstance(value, dict):
-        return any(_has_page_text(item, key=name) for name, item in value.items())
-    if isinstance(value, list):
-        return any(_has_page_text(item) for item in value)
-    return False
+        value = {"label": value}
+    if not isinstance(value, dict):
+        raise PanelError(f"{where} must be an object with a label")
+    label, _ = _first(value, _ACTION_LABEL_KEYS, _MAX_ACTION_LABEL)
+    if label is None:
+        raise PanelError(f"{where} needs a label")
+    ident = _id(value.get("id"), _token(label, fallback))
+    return {"id": ident, "label": label}
 
 
-def _accept_passthrough(document: dict[str, Any]) -> bool:
-    return _has_page_text(document)
+def _seconds(value: object, key: str, *, scale: int = 1) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise PanelError(f"{key} must be a number")
+    seconds = int(value // scale) if scale > 1 else value
+    if seconds != int(seconds) or not 0 <= seconds <= _MAX_SECONDS:
+        raise PanelError(f"{key} must be whole seconds from 0 to {_MAX_SECONDS}")
+    return int(seconds)
 
 
-_KIND_CHECKS = {
-    "list": _accept_list,
-    "now_playing": _accept_now_playing,
-    "choice": _accept_choice,
-    "webview": _accept_passthrough,
-    "html": _accept_passthrough,
+def _list(source: dict[str, Any], doc: dict[str, Any]) -> int:
+    rows_in = source.get("rows", source.get("items"))
+    if not isinstance(rows_in, list) or not rows_in:
+        raise PanelError("kind list needs items: a non-empty array of strings or objects with a title")
+    title, _ = _first(source, ("title", "heading", "name"), _MAX_TITLE)
+    doc["title"] = title or "List"
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(rows_in[:_MAX_ROWS], start=1):
+        if isinstance(item, str):
+            item = {"label": item}
+        if not isinstance(item, dict):
+            raise PanelError(f"list item {index} must be a string or an object with a title")
+        label, used = _first(item, _ROW_LABEL_KEYS, _MAX_TITLE)
+        if label is None:
+            raise PanelError(f"list item {index} needs a title, label, or text")
+        row: dict[str, Any] = {
+            "id": _unique(_id(item.get("id"), f"row-{index}"), seen, index),
+            "label": label,
+        }
+        subtitle, _ = _first(item, _ROW_SUBTITLE_KEYS, _MAX_SUBTITLE)
+        if subtitle is None:
+            rest = tuple(key for key in _ROW_LABEL_KEYS if key != used)
+            other, _ = _first(item, rest, _MAX_SUBTITLE)
+            if other is not None and other != label:
+                subtitle = other
+        if subtitle is not None:
+            row["subtitle"] = subtitle
+        if item.get("action") is not None:
+            row["action"] = _action(item["action"], f"action-{index}", where=f"list item {index} action")
+        art = _art(item)
+        if art is not None:
+            row["artUrl"] = art
+        rows.append(row)
+    doc["rows"] = rows
+    return max(0, len(rows_in) - _MAX_ROWS)
+
+
+def _now_playing(source: dict[str, Any], doc: dict[str, Any]) -> int:
+    title, _ = _first(source, _NOW_PLAYING_TITLE_KEYS, _MAX_TITLE)
+    if title is None:
+        raise PanelError("kind now_playing needs a title")
+    show, _ = _first(source, _NOW_PLAYING_SHOW_KEYS, _MAX_TITLE)
+    doc["title"] = title
+    doc["show"] = show or "Now playing"
+    art = _art(source)
+    if art is not None:
+        doc["artUrl"] = art
+    progress = source.get("progress")
+    if progress is not None:
+        if isinstance(progress, bool) or not isinstance(progress, (int, float)) or not 0 <= progress <= 1:
+            raise PanelError("progress must be a number from 0 to 1")
+        doc["progress"] = progress
+    elapsed = _seconds(source.get("elapsed"), "elapsed")
+    if elapsed is None:
+        elapsed = _seconds(source.get("position_ms"), "position_ms", scale=1000)
+    duration = _seconds(source.get("duration"), "duration")
+    if duration is None:
+        duration = _seconds(source.get("duration_ms"), "duration_ms", scale=1000)
+    if elapsed is not None:
+        doc["elapsed"] = elapsed
+    if duration is not None:
+        if duration < 1:
+            raise PanelError("duration must be at least 1 second")
+        doc["duration"] = duration
+    if source.get("primary") is not None:
+        doc["primary"] = _action(source["primary"], "primary", where="primary")
+    elif source.get("paused") is True:
+        doc["primary"] = {"id": "local:resume", "label": "Play"}
+    else:
+        doc["primary"] = {"id": "local:pause", "label": "Pause"}
+    if source.get("secondary") is not None:
+        doc["secondary"] = _action(source["secondary"], "secondary", where="secondary")
+    return 0
+
+
+def _choice(source: dict[str, Any], doc: dict[str, Any]) -> int:
+    prompt, _ = _first(source, _CHOICE_PROMPT_KEYS, _MAX_PROMPT)
+    if prompt is None:
+        raise PanelError("kind choice needs a prompt")
+    options = next(
+        (source[key] for key in ("actions", "options", "choices") if source.get(key) is not None),
+        None,
+    )
+    if not isinstance(options, list) or not 1 <= len(options) <= _MAX_ACTIONS:
+        raise PanelError(f"kind choice needs 1 to {_MAX_ACTIONS} options, each with a label")
+    actions: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, option in enumerate(options, start=1):
+        action = _action(option, f"option-{index}", where=f"option {index}")
+        action["id"] = _unique(action["id"], seen, index)
+        actions.append(action)
+    doc["prompt"] = prompt
+    doc["actions"] = actions
+    return 0
+
+
+def _webview(source: dict[str, Any], doc: dict[str, Any]) -> int:
+    html = next((source[key] for key in _HTML_KEYS if isinstance(source.get(key), str)), None)
+    if html is None or not html.strip():
+        if any(isinstance(source.get(key), str) for key in _URL_KEYS):
+            raise PanelError("kind webview cannot load a url; send an html fragment in html")
+        raise PanelError("kind webview needs an html fragment in html")
+    if len(html) > _MAX_HTML:
+        raise PanelError(f"html is longer than {_MAX_HTML} characters")
+    title, _ = _first(source, ("title",), _MAX_TITLE)
+    if title is not None:
+        doc["title"] = title
+    doc["html"] = html
+    return 0
+
+
+_KIND_BUILDERS = {
+    "list": _list,
+    "now_playing": _now_playing,
+    "choice": _choice,
+    "webview": _webview,
 }
 
 
-def _coerce_document(value: object) -> dict[str, Any] | None:
+def _coerce_document(value: object) -> dict[str, Any]:
     if isinstance(value, str):
         text = value.strip()
-        if not text or len(text.encode("utf-8")) > MAX_PANEL_BYTES:
-            return None
+        if not text:
+            raise PanelError("panel is empty")
+        if len(text.encode("utf-8")) > MAX_PANEL_BYTES:
+            raise PanelError("panel is too large")
         try:
             value = json.loads(text)
         except json.JSONDecodeError:
-            return None
+            raise PanelError("panel string is not valid JSON") from None
     if not isinstance(value, dict):
-        return None
+        raise PanelError("panel must be a JSON object")
     try:
         encoded = json.dumps(value, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError):
-        return None
+        raise PanelError("panel must be plain JSON") from None
     if len(encoded.encode("utf-8")) > MAX_PANEL_BYTES:
-        return None
+        raise PanelError("panel is too large")
     parsed = json.loads(encoded)
-    if not isinstance(parsed, dict):
-        return None
+    if not _walk(parsed, 1):
+        raise PanelError("panel has an unsupported key, is nested too deep, or has over 40 items")
     return parsed
 
 
+def normalize_panel_document(value: object) -> tuple[dict[str, Any], int]:
+    """Rebuild a panel into the Koji version 1 schema.
+
+    Returns the document and how many list rows were left off. Raises
+    ``PanelError`` with a short fix when Koji could not show it.
+    """
+    source = _coerce_document(value)
+    version = source.get("version", 1)
+    if type(version) is not int or version != 1:
+        raise PanelError("version must be the number 1")
+    kind = source.get("kind")
+    kind = _KIND_ALIASES.get(kind, kind) if isinstance(kind, str) else kind
+    if kind not in _KIND_BUILDERS:
+        raise PanelError("kind must be list, now_playing, choice, or webview")
+    doc: dict[str, Any] = {"version": 1, "kind": kind, "id": ""}
+    dropped = _KIND_BUILDERS[kind](source, doc)
+    label = doc.get("title") or doc.get("prompt") or kind
+    doc["id"] = _id(source.get("id"), _token(label, kind.replace("_", "-")))
+    return doc, dropped
+
+
 def validate_panel_document(value: object) -> dict[str, Any] | None:
-    """Return a JSON copy of a version-1 panel document, or None."""
-    document = _coerce_document(value)
-    if document is None or not _walk(document, 1):
+    """Return the Koji version 1 copy of a panel document, or None."""
+    try:
+        return normalize_panel_document(value)[0]
+    except PanelError:
         return None
-    if type(document.get("version")) is not int or document.get("version") != 1:
-        return None
-    kind = document.get("kind")
-    if kind not in _ALL_KINDS:
-        return None
-    if not _KIND_CHECKS[kind](document):
-        return None
-    return document
+
+
+def panel_frame_or_error(tool_name: object, arguments: object) -> tuple[dict[str, Any] | None, str | None, int]:
+    """Return ``(frame, None, dropped)`` or ``(None, reason, 0)``."""
+    action = panel_action_for_tool(tool_name)
+    if action is None:
+        return None, "not a panel tool", 0
+    if not isinstance(arguments, dict):
+        return None, "arguments must be an object", 0
+    if action == "dismiss":
+        if arguments:
+            return None, "dismiss_panel takes no arguments", 0
+        return {"type": "panel", "dismiss": True}, None, 0
+    if set(arguments) != {"panel"}:
+        return None, "pass exactly one argument, panel", 0
+    try:
+        document, dropped = normalize_panel_document(arguments.get("panel"))
+    except PanelError as exc:
+        return None, str(exc), 0
+    return {"type": "panel", "panel": document}, None, dropped
 
 
 def build_panel_frame(tool_name: object, arguments: object) -> dict[str, Any] | None:
     """Return the device frame, or None when the call cannot be sent."""
-    action = panel_action_for_tool(tool_name)
-    if action is None or not isinstance(arguments, dict):
-        return None
-    if action == "dismiss":
-        if arguments:
-            return None
-        return {"type": "panel", "dismiss": True}
-    if set(arguments) != {"panel"}:
-        return None
-    document = validate_panel_document(arguments.get("panel"))
-    if document is None:
-        return None
-    return {"type": "panel", "panel": document}
+    return panel_frame_or_error(tool_name, arguments)[0]
 
 
 def is_panel_frame(frame: object) -> bool:
@@ -395,9 +573,9 @@ def panel_frame_extension(esp32: Any) -> Any:
     declarations = tuple(panel_tool_declarations())
 
     async def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
-        frame = build_panel_frame(name, args)
+        frame, reason, dropped = panel_frame_or_error(name, args)
         if frame is None:
-            return {"ok": False, "error": "invalid panel arguments"}
+            return {"ok": False, "error": f"invalid panel arguments: {reason}", "example": PANEL_EXAMPLE}
         send = getattr(esp32, "send_panel", None)
         if not callable(send):
             return {"ok": False, "error": "panel channel unavailable"}
@@ -413,7 +591,10 @@ def panel_frame_extension(esp32: Any) -> Any:
         if isinstance(result, dict) and result.get("ok") is True:
             if frame.get("dismiss") is True:
                 return {"ok": True, "dismiss": True}
-            return {"ok": True, "kind": frame["panel"]["kind"]}
+            shown: dict[str, Any] = {"ok": True, "kind": frame["panel"]["kind"]}
+            if dropped:
+                shown["not_shown"] = dropped
+            return shown
         return {"ok": False, "error": "panel frame rejected"}
 
     return ToolExtension(

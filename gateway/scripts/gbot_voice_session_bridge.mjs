@@ -19,6 +19,7 @@ export const RPC_ROUTES = Object.freeze({
   'POST /session': 'VoiceCallHarnessSession',
   'POST /tool': 'VoiceCallHarnessTool',
 });
+const STALE_SANDBOX_STATUS = new Set([401, 403, 404, 410, 502, 503, 504]);
 
 export function loadAccount() {
   const data = JSON.parse(readFileSync(join(homedir(), 'Library/Application Support/Grok Bot/sand-secrets.json'), 'utf8'));
@@ -115,9 +116,30 @@ export class NativeSandboxClient {
     })().finally(() => { this.#loading = undefined; });
     return this.#loading;
   }
-  async #fetch(path, options = {}) {
+  // The cached sandbox URL and token go stale (box asleep or token rotated) while this process lives on,
+  // and every later call then fails until a fresh EnsureSandBox. Drop the cache and retry once.
+  async #fetch(path, options = {}, retry = true) {
     const connection = await this.#connect();
-    return this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}});
+    let response;
+    try {
+      response = await this.fetcher(connection.baseUrl + path, {...options, redirect: 'error', headers: {...connection.headers, ...options.headers}});
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      this.#drop(connection);
+      if (!retry) throw error;
+      return this.#fetch(path, options, false);
+    }
+    if (STALE_SANDBOX_STATUS.has(response.status)) {
+      this.#drop(connection);
+      if (retry && !options.signal?.aborted) {
+        await response.body?.cancel();
+        return this.#fetch(path, options, false);
+      }
+    }
+    return response;
+  }
+  #drop(connection) {
+    if (this.#connection === connection) this.#connection = undefined;
   }
   async openEvents(signal) {
     const deadline = new AbortController();

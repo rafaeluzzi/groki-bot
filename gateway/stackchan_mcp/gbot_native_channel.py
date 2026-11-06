@@ -125,8 +125,11 @@ class NativeVoiceChannel:
                 await self._listen()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.warning("Grok native channel state=unavailable retry=pending")
+            except Exception as exc:
+                logger.warning(
+                    "Grok native channel state=unavailable retry=pending reason=%s",
+                    str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__,
+                )
             finally:
                 self._registered = False
                 self.connected.clear()

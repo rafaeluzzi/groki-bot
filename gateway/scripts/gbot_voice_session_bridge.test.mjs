@@ -59,6 +59,35 @@ test('native bootstrap uses fixed read-only request and cancels bodies without r
   assert.equal(JSON.stringify(result).includes('FAKE'),false);
 });
 
+test('a stale sandbox connection is dropped and re-ensured once instead of failing forever', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  let ensures = 0; const seen = [];
+  const outcomes = [
+    () => { throw new TypeError('fetch failed'); },
+    () => ({ok:true,status:200,body:{cancel:async()=>{}}}),
+    () => ({ok:false,status:502,body:{cancel:async()=>{}}}),
+    () => ({ok:true,status:200,body:{cancel:async()=>{}}}),
+    () => ({ok:false,status:401,body:{cancel:async()=>{}}}),
+    () => ({ok:false,status:401,body:{cancel:async()=>{}}}),
+    () => ({ok:false,status:400,body:{cancel:async()=>{}}}),
+  ];
+  const client = new NativeSandboxClient({accountLoader:()=>({authId:'owner'}), rpc:async()=>{
+    ensures++;
+    return {gatewayUrl:`https://pod${ensures}.cursorvm.com`,gatewayToken:'FAKE'};
+  },fetcher:async(url)=>{ seen.push(new URL(url).host); return outcomes.shift()(); }});
+  const call = {agentId:'a',callId:'c',isOnTheLine:true,acceptsOverheard:false};
+  await client.presence(call);
+  assert.deepEqual(seen, ['pod1.cursorvm.com','pod2.cursorvm.com']);
+  await client.presence(call);
+  assert.equal(ensures, 3);
+  await assert.rejects(client.presence(call), /upstream_http_401/);
+  assert.equal(ensures, 4);
+  // A 400 is the request, not the sandbox: no re-ensure.
+  await assert.rejects(client.presence(call), /upstream_http_400/);
+  assert.equal(ensures, 5);
+  assert.equal(seen.length, 7);
+});
+
 test('native event filtering excludes history, other callers, sessions and duplicate entries', async () => {
   const {filterNativeEvent} = await import('./gbot_voice_session_bridge.mjs');
   const context = {agentId:'a',callId:'call-c',sessionId:'',authId:'owner',sinceMs:100,seen:new Set()};

@@ -396,7 +396,9 @@ async def test_send_panel_on_voice_only_device_does_not_wait_for_ack(manager):
     panel = {
         "version": 1,
         "kind": "list",
-        "items": [{"title": "First"}],
+        "id": "queue",
+        "title": "Queue",
+        "rows": [{"id": "a", "label": "First"}],
     }
 
     async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:

@@ -10,43 +10,55 @@ import pytest
 from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
 from stackchan_mcp.panel_frames import (
     PANEL_DECLARED_NAMES,
+    PANEL_EXAMPLE,
     PANEL_INSTRUCTIONS,
     build_panel_frame,
     is_panel_frame,
+    normalize_panel_document,
     panel_action_for_tool,
     panel_frame_extension,
     panel_frames_enabled,
+    panel_tool_description,
 )
 
+# Already in the Koji schema (android/docs/compose-panel-kit.md), so they pass through unchanged.
 LIST_DOC = {
     "version": 1,
     "kind": "list",
+    "id": "queue",
     "title": "Queue",
-    "items": [
-        {"id": "a", "title": "First", "subtitle": "Ada"},
-        {"label": "Second"},
+    "rows": [
+        {"id": "a", "label": "First", "subtitle": "Ada"},
+        {"id": "b", "label": "Second"},
     ],
 }
 PLAYING_DOC = {
     "version": 1,
     "kind": "now_playing",
+    "id": "night",
     "title": "Night",
-    "artist": "Ada",
+    "show": "Ada",
     "progress": 0.25,
-    "paused": False,
+    "primary": {"id": "local:pause", "label": "Pause"},
 }
 CHOICE_DOC = {
     "version": 1,
     "kind": "choice",
+    "id": "drink",
     "prompt": "Tea or coffee?",
-    "options": [{"id": "tea", "label": "Tea"}, {"title": "Coffee"}],
+    "actions": [{"id": "tea", "label": "Tea"}, {"id": "dismiss", "label": "No"}],
 }
 WEBVIEW_DOC = {
     "version": 1,
     "kind": "webview",
-    "html": "<p>Hello</p>",
+    "id": "note",
     "title": "Note",
+    "html": "<p>Hello</p>",
 }
+
+
+def show(panel):
+    return build_panel_frame("show_panel", {"panel": panel})["panel"]
 
 
 @pytest.mark.parametrize(
@@ -90,68 +102,163 @@ def test_panel_instructions_name_the_screen_rules():
     assert "draw" not in text.lower()
 
 
-def test_panel_frames_match_the_portal_shape():
-    assert build_panel_frame("show_panel", {"panel": LIST_DOC}) == {
-        "type": "panel",
-        "panel": LIST_DOC,
-    }
+def test_tool_description_and_instructions_carry_a_version_1_example():
+    example = json.loads(PANEL_EXAMPLE)
+    assert example["version"] == 1
+    assert PANEL_EXAMPLE in panel_tool_description("show_panel")
+    assert PANEL_EXAMPLE in PANEL_INSTRUCTIONS
+    assert show(example)["rows"][0]["label"] == "Planet Money"
+
+
+def test_koji_shaped_documents_pass_through_unchanged():
+    assert build_panel_frame("show_panel", {"panel": LIST_DOC}) == {"type": "panel", "panel": LIST_DOC}
     assert build_panel_frame("self.panel.show", {"panel": json.dumps(PLAYING_DOC)}) == {
         "type": "panel",
         "panel": PLAYING_DOC,
     }
-    choice = build_panel_frame("panel_show", {"panel": CHOICE_DOC})
-    assert choice["panel"]["kind"] == "choice"
-    assert choice["panel"]["options"][1] == {"title": "Coffee"}
-    webview = build_panel_frame("show_panel", {"panel": WEBVIEW_DOC})
-    assert webview["panel"]["html"] == "<p>Hello</p>"
-    assert webview["panel"]["title"] == "Note"
-    html = build_panel_frame(
-        "show_panel",
-        {"panel": {"version": 1, "kind": "html", "url": "https://example.com/card"}},
-    )
-    assert html == {
-        "type": "panel",
-        "panel": {"version": 1, "kind": "html", "url": "https://example.com/card"},
-    }
-    markup = {"version": 1, "kind": "webview", "page": {"markup": "<p>Later</p>"}}
-    assert build_panel_frame("show_panel", {"panel": markup})["panel"] == markup
+    assert show(CHOICE_DOC) == CHOICE_DOC
+    assert show(WEBVIEW_DOC) == WEBVIEW_DOC
     assert build_panel_frame("dismiss_panel", {}) == {"type": "panel", "dismiss": True}
     assert build_panel_frame("self.panel.dismiss", {})["dismiss"] is True
-    assert is_panel_frame(build_panel_frame("show_panel", {"panel": LIST_DOC}))
+    for doc in (LIST_DOC, PLAYING_DOC, CHOICE_DOC, WEBVIEW_DOC):
+        assert is_panel_frame({"type": "panel", "panel": doc})
     assert is_panel_frame({"type": "panel", "dismiss": True})
-    assert not is_panel_frame({**webview, "session_id": "extra"})
+    assert not is_panel_frame({"type": "panel", "panel": WEBVIEW_DOC, "session_id": "extra"})
 
 
 @pytest.mark.parametrize(
     "panel",
     [
-        {"version": 1, "kind": "banner"},
-        {"version": 1, "kind": "draw", "items": [{"title": "Hi"}]},
-        {"version": 2, "kind": "list", "items": [{"title": "Hi"}]},
-        {"version": "1", "kind": "list", "items": [{"title": "Hi"}]},
-        {"kind": "list", "items": [{"title": "Hi"}]},
-        {"version": 1, "kind": "list"},
-        {"version": 1, "kind": "list", "items": []},
-        {"version": 1, "kind": "list", "items": ["Hi"]},
-        {"version": 1, "kind": "list", "items": [{"title": "  "}]},
-        {"version": 1, "kind": "list", "items": [{"title": "bad\x00"}]},
-        {"version": 1, "kind": "list", "items": [{"title": "bad\x01"}]},
-        {"version": 1, "kind": "now_playing"},
-        {"version": 1, "kind": "now_playing", "title": "Song", "progress": 2},
-        {"version": 1, "kind": "choice", "prompt": "Pick"},
-        {"version": 1, "kind": "choice", "options": [{"label": "Yes"}]},
-        {"version": 1, "kind": "webview"},
-        {"version": 1, "kind": "webview", "count": 1},
-        {"version": 1, "kind": "html", "html": ""},
-        {"version": 1, "kind": "html", "html": "x" * 40000},
-        [],
-        "not json",
-        "",
+        # The four show_panel calls from the Nov 6 08:55 gateway log, none with a version.
+        {
+            "items": [
+                {"label": "Following on Portal Spotify", "title": "Planet Money"},
+                {"label": "Following on Portal Spotify", "title": "All-In"},
+            ],
+            "kind": "list",
+            "title": "Podcasts I follow",
+        },
+        {"items": [{"text": "Following", "title": "Planet Money"}, {"text": "Following", "title": "All-In"}], "kind": "list"},
+        {"items": [{"label": "Planet Money"}, {"label": "All-In"}], "kind": "list"},
+        {"items": [{"title": "Planet Money"}, {"title": "All-In"}], "kind": "list"},
     ],
 )
-def test_bad_panel_documents_are_rejected(panel):
+def test_logged_podcast_lists_now_reach_the_portal(panel):
+    frame = build_panel_frame("show_panel", {"panel": panel})
+    assert frame is not None
+    doc = frame["panel"]
+    assert doc["version"] == 1
+    assert [row["label"] for row in doc["rows"]] == ["Planet Money", "All-In"]
+    assert len({row["id"] for row in doc["rows"]}) == 2
+    assert is_panel_frame(frame)
+
+
+def test_loose_list_is_rebuilt_for_koji():
+    doc = show(
+        {
+            "kind": "list",
+            "title": "Podcasts I follow",
+            "items": [
+                {"label": "Following on Portal Spotify", "title": "Planet Money", "art_url": "https://x.test/a.jpg"},
+                "All-In",
+                {"id": "ep 1", "name": "Tea <time>", "action": {"label": "Play"}},
+            ],
+        }
+    )
+    assert doc == {
+        "version": 1,
+        "kind": "list",
+        "id": "Podcasts-I-follow",
+        "title": "Podcasts I follow",
+        "rows": [
+            {
+                "id": "row-1",
+                "label": "Planet Money",
+                "subtitle": "Following on Portal Spotify",
+                "artUrl": "https://x.test/a.jpg",
+            },
+            {"id": "row-2", "label": "All-In"},
+            {"id": "ep-1", "label": "Tea \u2039time>", "action": {"id": "Play", "label": "Play"}},
+        ],
+    }
+    assert show({"kind": "list", "items": ["One"]})["title"] == "List"
+
+
+def test_long_lists_and_text_are_cut_to_koji_limits():
+    items = [{"title": f"Show {n}"} for n in range(20)]
+    doc, dropped = normalize_panel_document({"version": 1, "kind": "list", "title": "T" * 200, "items": items})
+    assert len(doc["rows"]) == 12
+    assert dropped == 8
+    assert len(doc["title"]) == 80
+    assert doc["title"].endswith("\u2026")
+    assert show(doc) == doc
+
+
+def test_loose_now_playing_and_choice_are_rebuilt_for_koji():
+    playing = show({"kind": "now_playing", "track": "Night", "artist": "Ada", "position_ms": 12500, "duration_ms": 60000, "paused": True})
+    assert playing == {
+        "version": 1,
+        "kind": "now_playing",
+        "id": "Night",
+        "title": "Night",
+        "show": "Ada",
+        "elapsed": 12,
+        "duration": 60,
+        "primary": {"id": "local:resume", "label": "Play"},
+    }
+    choice = show({"kind": "choice", "title": "Tea or coffee?", "options": [{"label": "Tea"}, {"title": "Coffee"}, "Tea"]})
+    assert choice["prompt"] == "Tea or coffee?"
+    assert [action["label"] for action in choice["actions"]] == ["Tea", "Coffee", "Tea"]
+    assert len({action["id"] for action in choice["actions"]}) == 3
+    html = show({"version": 1, "kind": "html", "html": "<p>Hi</p>"})
+    assert html["kind"] == "webview"
+    assert html["html"] == "<p>Hi</p>"
+
+
+@pytest.mark.parametrize(
+    "panel,reason",
+    [
+        ({"version": 2, "kind": "list", "items": [{"title": "Hi"}]}, "version must be the number 1"),
+        ({"version": "1", "kind": "list", "items": [{"title": "Hi"}]}, "version must be the number 1"),
+        ({"version": 1, "kind": "banner"}, "kind must be list, now_playing, choice, or webview"),
+        ({"version": 1, "kind": "draw", "items": [{"title": "Hi"}]}, "kind must be"),
+        ({"items": [{"title": "Hi"}]}, "kind must be"),
+        ({"version": 1, "kind": "list"}, "kind list needs items"),
+        ({"version": 1, "kind": "list", "items": []}, "kind list needs items"),
+        ({"version": 1, "kind": "list", "items": [{"title": "  "}]}, "list item 1 needs a title"),
+        ({"version": 1, "kind": "list", "items": [7]}, "list item 1 must be"),
+        ({"version": 1, "kind": "list", "items": [{"title": "bad\x00"}]}, "unsupported key"),
+        ({"version": 1, "kind": "now_playing"}, "kind now_playing needs a title"),
+        ({"version": 1, "kind": "now_playing", "title": "Song", "progress": 2}, "progress must be"),
+        ({"version": 1, "kind": "now_playing", "title": "Song", "elapsed": 1.5}, "elapsed must be whole seconds"),
+        ({"version": 1, "kind": "choice", "prompt": "Pick"}, "kind choice needs 1 to 4 options"),
+        ({"version": 1, "kind": "choice", "prompt": "Pick", "options": ["a", "b", "c", "d", "e"]}, "1 to 4 options"),
+        ({"version": 1, "kind": "choice", "options": [{"label": "Yes"}]}, "kind choice needs a prompt"),
+        ({"version": 1, "kind": "webview"}, "kind webview needs an html fragment"),
+        ({"version": 1, "kind": "webview", "count": 1}, "kind webview needs an html fragment"),
+        ({"version": 1, "kind": "html", "html": ""}, "kind webview needs an html fragment"),
+        ({"version": 1, "kind": "html", "url": "https://example.com/card"}, "cannot load a url"),
+        ({"version": 1, "kind": "html", "html": "x" * 50000}, "html is longer than 48000"),
+        ([], "panel must be a JSON object"),
+        ("not json", "panel string is not valid JSON"),
+        ("", "panel is empty"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_bad_panel_documents_say_what_to_fix(panel, reason):
     assert build_panel_frame("show_panel", {"panel": panel}) is None
-    assert build_panel_frame("show_panel", {"panel": json.dumps(panel)}) is None
+    if not isinstance(panel, str):
+        assert build_panel_frame("show_panel", {"panel": json.dumps(panel)}) is None
+
+    class Device:
+        async def send_panel(self, frame):
+            raise AssertionError("a rejected panel must not be sent")
+
+    result = await panel_frame_extension(Device()).dispatch("show_panel", {"panel": panel})
+    assert result["ok"] is False
+    assert result["error"].startswith("invalid panel arguments: ")
+    assert reason in result["error"]
+    assert result["example"] == PANEL_EXAMPLE
 
 
 def test_dismiss_rejects_a_document_and_show_rejects_extra_arguments():
@@ -188,10 +295,13 @@ async def test_extension_sends_one_frame_and_does_not_wait_for_an_ack():
         {"type": "panel", "dismiss": True},
     ]
     rejected = await extension.dispatch("show_panel", {"panel": {"version": 1, "kind": "list"}})
-    assert rejected == {"ok": False, "error": "invalid panel arguments"}
+    assert rejected["ok"] is False
+    assert "kind list needs items" in rejected["error"]
     assert len(sent) == 2
     missed = await extension.dispatch("core_draw", {"what": "Hi"})
-    assert missed == {"ok": False, "error": "invalid panel arguments"}
+    assert missed["ok"] is False
+    long = await extension.dispatch("show_panel", {"panel": {"kind": "list", "items": [str(n) for n in range(15)]}})
+    assert long == {"ok": True, "kind": "list", "not_shown": 3}
 
 
 @pytest.mark.asyncio
