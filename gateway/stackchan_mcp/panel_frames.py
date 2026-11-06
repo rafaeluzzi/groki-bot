@@ -141,8 +141,9 @@ PANEL_INSTRUCTIONS = (
     + ". self.panel.show is the same action. "
     "dismiss_panel and self.panel.dismiss close it. "
     "A webview or html document with an html fragment can be sent the same way when that page is what should appear. "
-    "A list titled Podcasts I follow is shown A-to-Z by title, the same order as the followed podcasts. "
-    "number N counts from the top of that list. "
+    "A list titled Podcasts I follow is shown A-to-Z by title, the same order as the numbered followed shows. "
+    "Skip a blank title. If the podcast tool replaced it with a feed title, use that title in this order. "
+    "number N counts from the top of the titled rows. "
     "Panels do not replace your spoken reply. "
     "Do not claim the panel showed before the tool returns ok. "
     "Do not end every reply with an open-ended follow-up."
@@ -344,7 +345,7 @@ def _list(source: dict[str, Any], doc: dict[str, Any]) -> int:
             row["artUrl"] = art
         rows.append(row)
     if _followed_panel(str(doc.get("title") or "")):
-        rows.sort(key=lambda row: row["label"].lower())
+        rows.sort(key=lambda row: (not row["label"].strip(), row["label"].lower()))
     doc["rows"] = rows
     return max(0, len(rows_in) - _MAX_ROWS)
 

@@ -5,7 +5,14 @@ import json
 
 import pytest
 
-from stackchan_mcp.podcast_open import followed_order, open_show, ordinal_index, plan_open
+from stackchan_mcp.podcast_open import (
+    channel_title,
+    fill_blank_titles,
+    followed_order,
+    open_show,
+    ordinal_index,
+    plan_open,
+)
 
 
 LEX = {"id": "lex", "title": "Lex Fridman Podcast", "spotifyShowUri": "spotify:show:2MAi0BvDc6GTFvKFPXnkCL"}
@@ -43,6 +50,10 @@ async def test_legs_freeman_misses_and_lists_the_panel_order():
     result, frame = await open_show("legs freeman podcasts", SHOWS, post_open)
     assert frame is None
     assert result["ok"] is False
+    assert result["matched"] is False
+    assert result["call_again"] == "Lex Fridman Podcast"
+    assert "once more" in result["instruction"]
+    assert "not for you" in result["instruction"]
     assert [row["n"] for row in result["shows"]] == [1, 2, 3]
     assert result["shows"][0]["title"] == "Lex Fridman Podcast"
 
@@ -85,3 +96,55 @@ async def test_number_one_opens_the_first_panel_row():
     assert seen["title"] == "Lex Fridman Podcast"
     assert frame["type"] == "podcast"
     assert result["openSpotifyUri"] == LEX["spotifyShowUri"]
+
+
+def test_a_blank_title_is_last_and_has_no_number():
+    shows = [{"title": ""}, {"title": "Planet Money"}, {"title": "All-In"}]
+    assert [show["title"] for show in followed_order(shows)] == ["All-In", "Planet Money", ""]
+    rows = plan_open("number 2", shows)
+    assert rows == {"kind": "open", "title": "Planet Money"}
+    missed = plan_open("number 3", shows)
+    assert missed["kind"] == "range"
+    assert missed["result"]["shows"] == [
+        {"n": 1, "title": "All-In"},
+        {"n": 2, "title": "Planet Money"},
+        {"title": ""},
+    ]
+
+
+def test_channel_title_reads_the_first_channel_title():
+    payload = b"<rss><channel><atom:link title=\"MP3 Audio\"/><title>The Daily</title><item><title>Ep</title></item></channel></rss>"
+    assert channel_title(payload) == "The Daily"
+    assert channel_title(b"<rss></rss>") == ""
+
+
+@pytest.mark.asyncio
+async def test_a_blank_title_uses_the_feed_name_before_numbering():
+    shows = [
+        {"title": "", "feedUrl": "https://feeds.example/daily"},
+        {"title": "Planet Money"},
+        {"title": "Lex Fridman Podcast"},
+    ]
+
+    async def read(url):
+        assert url.endswith("/daily")
+        return "The Daily"
+
+    filled = await fill_blank_titles(shows, read)
+    assert [show["title"] for show in followed_order(filled)] == [
+        "Lex Fridman Podcast",
+        "Planet Money",
+        "The Daily",
+    ]
+    assert plan_open("number 2", filled)["title"] == "Planet Money"
+    assert plan_open("number 3", filled)["title"] == "The Daily"
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_blank_title_stays_unnumbered():
+    async def read(_url):
+        return ""
+
+    filled = await fill_blank_titles([{"title": "", "feedUrl": "https://feeds.example/x"}, {"title": "Hard Fork"}], read)
+    assert plan_open("number 1", filled)["title"] == "Hard Fork"
+    assert plan_open("number 2", filled)["kind"] == "range"

@@ -30,7 +30,11 @@ _DESCRIPTION = (
     "N counts from the top of the Podcasts I follow panel. "
     "That panel and the followed list are both A-to-Z by title, so number 1 is the first title in that order. "
     "Pass the words the user said when the title is unclear, including a misheard name. "
-    "On a miss the result lists the followed shows in that same order; call again with the title they meant. "
+    "On a miss the result lists the numbered titles and tells you to call this tool once more "
+    "with the closest-sounding title, or to ask which show and name 2 or 3 of them. "
+    "Do that before you speak. Do not say the request was not for you. "
+    "A blank stored title is replaced by its feed title when that title can be read. "
+    "A title that is still blank is last and has no number. "
     "A hit sends one type:podcast frame. The Portal says the announce line and opens Spotify. "
     "If the result says the Portal already said it, do not repeat it. "
     "Do not open Spotify on the Mac, and do not call Mac media_control or open_app for this."
@@ -43,7 +47,11 @@ PODCAST_INSTRUCTIONS = (
     "the same order as the followed list. "
     "When you show that panel, list the titles in that order from the top. "
     "Do not open Spotify on the Mac for a Portal podcast. "
-    "If the tool says the Portal already said the announce line, do not repeat it."
+    "If the tool says the Portal already said the announce line, do not repeat it. "
+    "If matched is false, call podcast_open_spotify once more with the closest-sounding title "
+    "in call_again before you speak. If there is no single closest title, ask which show and "
+    "name the 2 or 3 candidates. Do not say the request was not for you. "
+    "A blank stored title is not a numbered row. Use the feed title from shows when one is given."
 )
 
 _CARDINALS = {
@@ -99,9 +107,18 @@ def router_origin() -> str:
 
 
 def followed_order(shows: list) -> list[dict]:
-    """Same key as the router's ``followed()`` sort and the panel row sort."""
+    """Titled shows A-to-Z, then a still-blank title with no number.
+
+    The same key as the router's ``followed()`` sort. A blank title sorts last
+    so it does not become number 1.
+    """
     rows = [show for show in shows if isinstance(show, dict)]
-    return sorted(rows, key=lambda show: str(show.get("title") or "").lower())
+
+    def key(show: dict) -> tuple[bool, str]:
+        title = str(show.get("title") or "").strip().lower()
+        return (title == "", title)
+
+    return sorted(rows, key=key)
 
 
 def title_key(value: str) -> str:
@@ -151,7 +168,23 @@ def ordinal_index(query: str) -> int | None:
 
 
 def catalog(shows: list[dict]) -> list[dict[str, Any]]:
-    return [{"n": index, "title": str(show.get("title") or "")} for index, show in enumerate(shows, start=1)]
+    """Number titled rows only. A blank title is last and has no ``n``."""
+    rows: list[dict[str, Any]] = []
+    blank = 0
+    number = 0
+    for show in shows:
+        title = str(show.get("title") or "").strip()
+        if not title:
+            blank += 1
+            continue
+        number += 1
+        rows.append({"n": number, "title": title})
+    rows.extend({"title": ""} for _ in range(blank))
+    return rows
+
+
+def _titled(shows: list[dict]) -> list[dict]:
+    return [show for show in shows if str(show.get("title") or "").strip()]
 
 
 def plan_open(query: str, shows: list) -> dict[str, Any]:
@@ -161,11 +194,12 @@ def plan_open(query: str, shows: list) -> dict[str, Any]:
     ``number N`` uses [followed_order], which is the panel order.
     """
     ordered = followed_order(shows)
+    titled = _titled(ordered)
     listed = catalog(ordered)
     text = " ".join((query or "").split())
     if not text:
         return {"kind": "miss", "result": _miss("Which show?", listed)}
-    matches = match_followed(text, ordered)
+    matches = match_followed(text, titled)
     if len(matches) == 1:
         return {"kind": "open", "title": str(matches[0].get("title") or text)}
     if len(matches) > 1:
@@ -173,10 +207,10 @@ def plan_open(query: str, shows: list) -> dict[str, Any]:
         return {"kind": "ask", "result": _miss(f"Which show? {names}.", listed)}
     number = ordinal_index(text)
     if number is None:
-        return {"kind": "miss", "result": _miss("No followed show matched.", listed)}
-    if number > len(ordered):
+        return {"kind": "miss", "result": _miss("No followed title matched.", listed, query=text, retry=True)}
+    if number > len(titled):
         return {"kind": "range", "result": _miss(f"There is no show number {number}.", listed)}
-    return {"kind": "open", "title": str(ordered[number - 1].get("title") or "")}
+    return {"kind": "open", "title": str(titled[number - 1].get("title") or "")}
 
 
 def podcast_frame(body: dict) -> dict[str, Any] | None:
@@ -233,13 +267,115 @@ def podcast_declarations() -> list[dict[str, Any]]:
     ]
 
 
-def _miss(error: str, shows: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+_STOP_WORDS = {"a", "and", "podcast", "podcasts", "the", "with"}
+_CLEAR_SCORE = 0.5
+
+
+def _skeleton(value: str) -> str:
+    """Consonants only, so a mishearing can sit next to the stored title."""
+    out: list[str] = []
+    previous = ""
+    for ch in title_key(value).replace(" ", ""):
+        if ch in "aeiouy":
+            continue
+        if ch in "ckq":
+            ch = "k"
+        if ch == previous:
+            continue
+        out.append(ch)
+        previous = ch
+    return "".join(out)
+
+
+def _edit_distance(left: str, right: str) -> int:
+    if left == right:
+        return 0
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    for index, ch in enumerate(left, start=1):
+        current = [index]
+        for other_index, other in enumerate(right, start=1):
+            current.append(
+                min(
+                    previous[other_index] + 1,
+                    current[other_index - 1] + 1,
+                    previous[other_index - 1] + (ch != other),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
+def _ratio(left: str, right: str) -> float:
+    if not left and not right:
+        return 1.0
+    return 1.0 - _edit_distance(left, right) / max(len(left), len(right))
+
+
+def sound_score(query: str, title: str) -> float:
+    """How much [query] sounds like [title]. 1 is the same words."""
+    query_words = [word for word in title_key(query).split() if word not in _STOP_WORDS]
+    title_words = [word for word in title_key(title).split() if word not in _STOP_WORDS]
+    if not query_words or not title_words:
+        return 0.0
+
+    def best(word: str, key) -> float:
+        return max(_ratio(key(word), key(other)) for other in title_words)
+
+    raw = sum(best(word, lambda text: text) for word in query_words) / len(query_words)
+    sounded = sum(best(word, _skeleton) for word in query_words) / len(query_words)
+    return 0.35 * raw + 0.65 * sounded
+
+
+def closest_titles(query: str, shows: list[dict[str, Any]]) -> list[str]:
+    """Up to three titles the miss should name. One when a single show is clearly closest."""
+    titled = [str(row.get("title") or "").strip() for row in shows]
+    titled = [title for title in titled if title]
+    scored = sorted(
+        ((sound_score(query, title), title) for title in titled),
+        key=lambda item: (-item[0], item[1].lower()),
+    )
+    if not scored or scored[0][0] < 0.45:
+        return titled[:3]
+    top = scored[0][0]
+    if top >= _CLEAR_SCORE and (len(scored) == 1 or top - scored[1][0] >= 0.12):
+        return [scored[0][1]]
+    return [title for score, title in scored if score >= max(0.45, top - 0.15)][:3]
+
+
+def _miss(error: str, shows: list[dict[str, Any]], *, query: str = "", retry: bool = False) -> dict[str, Any]:
+    """A miss the model can correct. [shows] is the numbered panel order."""
+    candidates = closest_titles(query, shows) if retry and query.strip() else []
+    call_again = candidates[0] if len(candidates) == 1 and retry else ""
+    if call_again:
+        instruction = (
+            f"No followed title matched. The closest-sounding show is {call_again}. "
+            "Call podcast_open_spotify once more with show set to that exact title. "
+            "Do not speak before that call returns, and do not say the request was not for you."
+        )
+    elif retry:
+        names = ", ".join(candidates[:3]) or "the titles in shows"
+        instruction = (
+            "No followed title matched. Ask which show, and name these: "
+            f"{names}. Do not say the request was not for you."
+        )
+    else:
+        instruction = error
+    body: dict[str, Any] = {
         "ok": False,
-        "error": error,
+        "matched": False,
+        "error": instruction,
         "shows": shows,
-        "note": "shows is the Podcasts I follow order, top to bottom. Call again with a title from that list.",
+        "instruction": instruction,
     }
+    if candidates:
+        body["candidates"] = candidates
+    if call_again:
+        body["call_again"] = call_again
+    return body
 
 
 def _spoken_hit(frame: dict[str, Any]) -> dict[str, Any]:
@@ -285,7 +421,7 @@ def podcast_open_extension(esp32: Any) -> Any:
         if not isinstance(show, str) or not show.strip():
             return {"ok": False, "error": "show is required"}
         try:
-            shows = await _get_followed()
+            shows = await fill_blank_titles(await _get_followed())
         except Exception:
             logger.warning("podcast followed list failed")
             return {"ok": False, "error": "I couldn't reach the podcast list."}
@@ -314,9 +450,74 @@ def podcast_open_extension(esp32: Any) -> Any:
     return ToolExtension(
         declarations=declarations,
         dispatch=dispatch,
-        metadata={PODCAST_TOOL_NAME: ToolMetadata(True, "portal_podcast", 15.0)},
+        metadata={PODCAST_TOOL_NAME: ToolMetadata(True, "portal_podcast", 30.0)},
         instructions=PODCAST_INSTRUCTIONS,
     )
+
+
+_CHANNEL_TITLE = re.compile(rb"<channel\b[^>]*>.*?<title>([^<]{1,200})</title>", re.IGNORECASE | re.DOTALL)
+_FEED_TITLE_CACHE: dict[str, str] = {}
+
+
+def channel_title(payload: bytes) -> str:
+    """The channel ``<title>`` in the first part of a feed. Empty when it is not there.
+
+    Same read as the router's oversized-feed fallback: the title is near the top,
+    even when the rest of the feed is too large to store.
+    """
+    if not payload:
+        return ""
+    match = _CHANNEL_TITLE.search(payload[:65536])
+    if match is None:
+        return ""
+    text = match.group(1).decode("utf-8", "replace")
+    return " ".join(text.replace("\x00", " ").split())
+
+
+async def fill_blank_titles(shows: list, read_title=None) -> list:
+    """Copy [shows], replacing a blank title with the feed's channel title."""
+    reader = read_title or _feed_channel_title
+    filled = []
+    for show in shows:
+        if not isinstance(show, dict):
+            continue
+        if str(show.get("title") or "").strip():
+            filled.append(show)
+            continue
+        url = str(show.get("feedUrl") or "").strip()
+        title = ""
+        if url:
+            try:
+                title = str(await reader(url) or "").strip()
+            except Exception:
+                logger.warning("podcast feed title failed")
+                title = ""
+        if not title:
+            filled.append(show)
+            continue
+        copied = dict(show)
+        copied["title"] = title
+        filled.append(copied)
+    return filled
+
+
+async def _feed_channel_title(url: str) -> str:
+    cached = _FEED_TITLE_CACHE.get(url)
+    if cached is not None:
+        return cached
+    import aiohttp
+
+    timeout = aiohttp.ClientTimeout(total=8)
+    title = ""
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, headers={"User-Agent": "KojiPortal/0.1 (podcasts; public RSS)"}) as response:
+                if response.status < 400:
+                    title = channel_title(await response.content.read(65536))
+    except Exception:
+        title = ""
+    _FEED_TITLE_CACHE[url] = title
+    return title
 
 
 async def _get_followed() -> list:
