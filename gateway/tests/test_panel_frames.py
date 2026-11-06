@@ -107,7 +107,7 @@ def test_tool_description_and_instructions_carry_a_version_1_example():
     assert example["version"] == 1
     assert PANEL_EXAMPLE in panel_tool_description("show_panel")
     assert PANEL_EXAMPLE in PANEL_INSTRUCTIONS
-    assert show(example)["rows"][0]["label"] == "Planet Money"
+    assert show(example)["rows"][0]["label"] == "All-In"
 
 
 def test_koji_shaped_documents_pass_through_unchanged():
@@ -148,7 +148,8 @@ def test_logged_podcast_lists_now_reach_the_portal(panel):
     assert frame is not None
     doc = frame["panel"]
     assert doc["version"] == 1
-    assert [row["label"] for row in doc["rows"]] == ["Planet Money", "All-In"]
+    expected = ["All-In", "Planet Money"] if doc["title"] == "Podcasts I follow" else ["Planet Money", "All-In"]
+    assert [row["label"] for row in doc["rows"]] == expected
     assert len({row["id"] for row in doc["rows"]}) == 2
     assert is_panel_frame(frame)
 
@@ -171,13 +172,13 @@ def test_loose_list_is_rebuilt_for_koji():
         "id": "Podcasts-I-follow",
         "title": "Podcasts I follow",
         "rows": [
+            {"id": "row-2", "label": "All-In"},
             {
                 "id": "row-1",
                 "label": "Planet Money",
                 "subtitle": "Following on Portal Spotify",
                 "artUrl": "https://x.test/a.jpg",
             },
-            {"id": "row-2", "label": "All-In"},
             {"id": "ep-1", "label": "Tea \u2039time>", "action": {"id": "Play", "label": "Play"}},
         ],
     }

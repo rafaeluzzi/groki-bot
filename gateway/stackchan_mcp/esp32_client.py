@@ -341,6 +341,20 @@ class ESP32Connection:
         await self._ws_send(json.dumps(frame, ensure_ascii=False))
         return {"ok": True}
 
+    async def send_podcast(self, frame: dict[str, Any]) -> dict[str, Any]:
+        """Send one ``type:podcast`` frame. Portal speaks it and opens Spotify.
+
+        There is no ack. The write does not send ``abort`` and does not wait.
+        """
+        if not self._connected:
+            raise ConnectionError("ESP32 not connected")
+        from .podcast_open import is_podcast_frame
+
+        if not is_podcast_frame(frame):
+            raise ValueError("invalid podcast frame")
+        await self._ws_send(json.dumps(frame, ensure_ascii=False))
+        return {"ok": True}
+
     async def send_device_command(self, frame: dict[str, Any]) -> dict[str, Any]:
         """Send one ``type:device_command`` frame. Portal does not ack it.
 
@@ -945,6 +959,30 @@ class ESP32Manager:
             return None, {"code": -32602, "message": "invalid panel frame"}
         try:
             result = await connection.send_panel(frame)
+        except Exception as exc:
+            return None, {"code": -32000, "message": str(exc)}
+        if self._connection is not connection or not connection.connected:
+            return None, {"code": -32000, "message": "ESP32 disconnected"}
+        return result, None
+
+    async def send_podcast(
+        self,
+        frame: dict[str, Any],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Send a Portal ``type:podcast`` frame on the current device socket.
+
+        There is no ack: ok means the frame was written. The Portal says the
+        announce line and opens Spotify when a link is set.
+        """
+        connection = self._connection
+        if connection is None or not connection.connected:
+            return None, {"code": -32000, "message": "No ESP32 device connected"}
+        from .podcast_open import is_podcast_frame
+
+        if not is_podcast_frame(frame):
+            return None, {"code": -32602, "message": "invalid podcast frame"}
+        try:
+            result = await connection.send_podcast(frame)
         except Exception as exc:
             return None, {"code": -32000, "message": str(exc)}
         if self._connection is not connection or not connection.connected:

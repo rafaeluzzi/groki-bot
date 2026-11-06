@@ -97,6 +97,20 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             self._stopped = False
         return connected
 
+    async def send_device_json(self, message):
+        """A typed hand-off arrives as ``listen`` / ``detect`` text. Grok hears that sentence."""
+        if (
+            isinstance(message, dict)
+            and message.get("type") == "listen"
+            and message.get("state") == "detect"
+        ):
+            text = str(message.get("text") or "").strip()
+            send = getattr(self._bridge, "send_text", None)
+            if text and callable(send):
+                await send(text)
+                return True
+        return await super().send_device_json(message)
+
     async def _supervise(self, info, device_hello, send_to_device):
         delay = self.reconnect_initial_delay_s
         checked_at = asyncio.get_running_loop().time()

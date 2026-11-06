@@ -8,7 +8,7 @@ Owns Portal system controls and local media:
 
 - STREAM_MUSIC volume: percent, level, up, down, get
 - Media transport: pause, resume, stop, skip next/previous (Portal Spotify first, else ExoPlayer/RSS)
-- Podcast spoken intercepts: play / follow / offer-to-follow (stay on Portal; never Mac)
+- Podcast: a play or open that matches one followed show stays on the Portal. "follow <show>" is the only on-device follow offer. A play, open, or what's-new with no match goes to the bridge
 - Duck STREAM_MUSIC during a voice turn; restore when idle/Listening
 - Compose now_playing while Spotify plays; hide only after pause/stop past hold
 - Brightness (needs Write settings grant)
@@ -21,6 +21,7 @@ Owns conversation and relay:
 
 - Open talk and multi-step reasoning
 - After reasoning, call `device_command` with a catalog name for Portal systems — never Mac volume, Mac media, or desktop Spotify for those asks
+- A podcast play that did not match on the Portal: `podcast_open_spotify`. That opens Portal Spotify. It is not a Mac player
 - `show_panel` / `dismiss_panel`
 - Future Home Assistant / MQTT home control
 - Mac tools only when the user names the Mac

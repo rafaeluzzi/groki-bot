@@ -367,6 +367,16 @@ class GbotVoiceBridge:
                 }
                 if "device_command" not in declared:
                     extensions = (*extensions, device_command_extension(options.get("esp32")))
+            from .podcast_open import podcast_open_enabled, podcast_open_extension
+
+            if podcast_open_enabled():
+                declared = {
+                    entry.get("name")
+                    for ext in extensions
+                    for entry in getattr(ext, "declarations", ())
+                }
+                if "podcast_open_spotify" not in declared:
+                    extensions = (*extensions, podcast_open_extension(options.get("esp32")))
             from .koji_wiki import koji_wiki_enabled, koji_wiki_extension
 
             if koji_wiki_enabled():

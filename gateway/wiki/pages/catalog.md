@@ -10,3 +10,9 @@ Connectivity: `reconnect_bridge`
 
 Wire: `{"type":"device_command","name":"...","args":{...}}` → on-device execute → optional `device_command_result`.
 See `android/docs/device-commands.md` and gateway `PORTAL_DEVICE_COMMANDS.md`.
+
+## Podcast open
+
+`podcast_open_spotify` takes `show`: a followed title, or `number N`.
+
+N counts from the top of the "Podcasts I follow" panel. That panel and `GET /api/podcasts/followed` are both A-to-Z by title. A hit is one `{"type":"podcast","announce","openSpotifyUri","openSpotifyUrl"}` frame. The Portal speaks and opens Spotify. Do not also open Spotify on the Mac.
