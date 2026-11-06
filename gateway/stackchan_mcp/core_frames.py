@@ -108,7 +108,7 @@ CORE_INSTRUCTIONS = (
     "or show words on the screen, call core_morph(name) or core_say(text). "
     "morph, say, self.core.morph, and self.core.say are the same two actions. "
     "These update the screen and do not replace your "
-    "spoken reply. Do not claim the screen changed before the tool returns ok."
+    "spoken reply. Do not claim the screen changed before the tool returns ok. Do not end every reply with an open-ended follow-up question; only ask when you actually have a real question."
 )
 
 
