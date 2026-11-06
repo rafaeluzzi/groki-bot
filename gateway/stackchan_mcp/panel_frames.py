@@ -111,7 +111,7 @@ _URL_KEYS = ("url", "src", "href")
 
 PANEL_EXAMPLE = (
     '{"version":1,"kind":"list","title":"Podcasts I follow",'
-    '"items":[{"title":"Planet Money"},{"title":"All-In"}]}'
+    '"items":[{"title":"All-In"},{"title":"Planet Money"}]}'
 )
 
 _SHOW_DESCRIPTION = (
@@ -141,6 +141,9 @@ PANEL_INSTRUCTIONS = (
     + ". self.panel.show is the same action. "
     "dismiss_panel and self.panel.dismiss close it. "
     "A webview or html document with an html fragment can be sent the same way when that page is what should appear. "
+    "A list titled Podcasts I follow is shown A-to-Z by title, the same order as the numbered followed shows. "
+    "Skip a blank title. If the podcast tool replaced it with a feed title, use that title in this order. "
+    "number N counts from the top of the titled rows. "
     "Panels do not replace your spoken reply. "
     "Do not claim the panel showed before the tool returns ok. "
     "Do not end every reply with an open-ended follow-up."
@@ -341,8 +344,15 @@ def _list(source: dict[str, Any], doc: dict[str, Any]) -> int:
         if art is not None:
             row["artUrl"] = art
         rows.append(row)
+    if _followed_panel(str(doc.get("title") or "")):
+        rows.sort(key=lambda row: (not row["label"].strip(), row["label"].lower()))
     doc["rows"] = rows
     return max(0, len(rows_in) - _MAX_ROWS)
+
+
+def _followed_panel(title: str) -> bool:
+    """The followed-podcast list. Row order matches ``GET /api/podcasts/followed``."""
+    return " ".join(title.lower().split()) == "podcasts i follow"
 
 
 def _now_playing(source: dict[str, Any], doc: dict[str, Any]) -> int:

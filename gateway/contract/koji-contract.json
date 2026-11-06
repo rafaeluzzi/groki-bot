@@ -38,7 +38,7 @@
       {
         "name": "logged podcast list with label and title",
         "input": {"kind": "list", "title": "Podcasts I follow", "items": [{"label": "Following on Portal Spotify", "title": "Planet Money"}, {"label": "Following on Portal Spotify", "title": "All-In"}]},
-        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify"}, {"id": "row-2", "label": "All-In", "subtitle": "Following on Portal Spotify"}]}
+        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-2", "label": "All-In", "subtitle": "Following on Portal Spotify"}, {"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify"}]}
       },
       {
         "name": "logged podcast list with no title",
@@ -48,7 +48,7 @@
       {
         "name": "string items, markup and art",
         "input": {"kind": "list", "title": "Podcasts I follow", "items": [{"label": "Following on Portal Spotify", "title": "Planet Money", "art_url": "https://x.test/a.jpg"}, "All-In", {"id": "ep 1", "name": "Tea <time>", "action": {"label": "Play"}}]},
-        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify", "artUrl": "https://x.test/a.jpg"}, {"id": "row-2", "label": "All-In"}, {"id": "ep-1", "label": "Tea \u2039time>", "action": {"id": "Play", "label": "Play"}}]}
+        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-2", "label": "All-In"}, {"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify", "artUrl": "https://x.test/a.jpg"}, {"id": "ep-1", "label": "Tea \u2039time>", "action": {"id": "Play", "label": "Play"}}]}
       },
       {
         "name": "now playing from loose fields",
