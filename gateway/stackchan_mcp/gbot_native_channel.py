@@ -11,6 +11,7 @@ import math
 import re
 import time
 import uuid
+import weakref
 from urllib.parse import urlencode
 
 import aiohttp
@@ -19,6 +20,19 @@ logger = logging.getLogger(__name__)
 
 # The helper already reduces its errors to fixed words such as upstream_http_429.
 NATIVE_ERROR_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+_open_channels = weakref.WeakSet()
+
+
+async def close_native_channels(timeout=5.0):
+    """Hang up every started channel. Grok answers 417 to the next call while one is left on the line."""
+    channels = list(_open_channels)
+    if not channels:
+        return
+    try:
+        await asyncio.wait_for(asyncio.gather(*(c.close() for c in channels), return_exceptions=True), timeout)
+    except asyncio.TimeoutError:
+        logger.warning("Grok native hangup on shutdown timed out channels=%d", len(channels))
 
 
 async def helper_error(response):
@@ -136,6 +150,7 @@ class NativeVoiceChannel:
 
     async def start(self):
         # Native sandbox availability must not hold the independent audio socket.
+        _open_channels.add(self)
         self._task = asyncio.create_task(self._run(), name="gbot-native-events")
 
     async def _run(self):
@@ -201,6 +216,7 @@ class NativeVoiceChannel:
                     data.append(line[5:].lstrip())
 
     async def close(self):
+        _open_channels.discard(self)
         self._closed = True
         self.connected.clear()
         if self._task and self._task is not asyncio.current_task():

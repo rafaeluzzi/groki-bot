@@ -18,6 +18,7 @@ import logging
 import os
 import platform
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -548,9 +549,14 @@ def _run_preflight() -> int:
 async def _run() -> None:
     """Start both the ESP32 WebSocket server and the stdio MCP server."""
     from .gateway import get_gateway
+    from .gbot_native_channel import close_native_channels
     from .stdio_server import run_stdio_server
 
     gateway = get_gateway()
+
+    # launchd and the wrapper script stop the gateway with SIGTERM. Python's default
+    # handler exits without running the finally below, which leaves the Grok call on the line.
+    asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
 
     await gateway.start()
     logger.info("Gateway started, waiting for ESP32 connections...")
@@ -559,6 +565,7 @@ async def _run() -> None:
         # Run stdio MCP server (blocks until MCP client disconnects)
         await run_stdio_server()
     finally:
+        await close_native_channels()
         await gateway.stop()
 
 
@@ -588,7 +595,11 @@ def main(argv: list[str] | None = None) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    asyncio.run(_run())
+    try:
+        asyncio.run(_run())
+    except asyncio.CancelledError:
+        # SIGTERM cancelled the run after the gateway stopped cleanly.
+        logger.info("Gateway exited on SIGTERM")
 
 
 if __name__ == "__main__":

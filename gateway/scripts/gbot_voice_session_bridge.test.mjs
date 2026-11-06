@@ -199,9 +199,9 @@ test('HTTP: typed EOF or error reconnects independently and box results still ar
 });
 
 test('presence with a new callId on the line takes over a stale call; foreign hangup still conflicts', async () => {
-  const port = await freePort(); let presenceCalls=0;
-  const sandbox={callerAuthId:async()=> 'owner', presence:async()=>{presenceCalls++;}};
-  const server=createBridge({port,agentId:'a',desktopEnabled:true,toolsEnabled:false,sandbox,rpc:async()=>({kind:1})});
+  const port = await freePort(); const presence=[]; const logs=[];
+  const sandbox={callerAuthId:async()=> 'owner', presence:async body=>{presence.push(`${body.callId}:${body.isOnTheLine}`);}};
+  const server=createBridge({port,agentId:'a',desktopEnabled:true,toolsEnabled:false,sandbox,rpc:async()=>({kind:1}),nativeLog:event=>logs.push(event)});
   await new Promise(r=>server.listen(port,'127.0.0.1',r));
   const post=async(path,body)=>fetch(`http://127.0.0.1:${port}`+path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
   const pres=(callId,isOnTheLine)=>post('/native/presence',{agentId:'a',callId,isOnTheLine,acceptsOverheard:false});
@@ -214,6 +214,24 @@ test('presence with a new callId on the line takes over a stale call; foreign ha
     const old=await tool('call-old'); assert.equal(old.status,403); assert.equal((await old.json()).error,'call_not_allowed');
     const foreign=await pres('call-old',false); assert.equal(foreign.status,409); assert.equal((await foreign.json()).error,'call_conflict');
     assert.equal((await tool('call-new')).status,200);
-    assert.equal(presenceCalls,2);
+    assert.deepEqual(presence,['call-old:true','call-old:false','call-new:true']);
+    assert.deepEqual(logs.filter(e=>e.state==='stale_hangup').map(e=>e.http_status),[200]);
+  } finally {await new Promise(r=>server.close(r));}
+});
+
+test('a failed stale hangup is logged and the new call still registers', async () => {
+  const port = await freePort(); const presence=[]; const logs=[];
+  const sandbox={callerAuthId:async()=> 'owner', presence:async body=>{
+    presence.push(`${body.callId}:${body.isOnTheLine}`);
+    if (!body.isOnTheLine) throw new Error('upstream_http_502');
+  }};
+  const server=createBridge({port,agentId:'a',desktopEnabled:true,toolsEnabled:false,sandbox,rpc:async()=>({kind:1}),nativeLog:event=>logs.push(event)});
+  await new Promise(r=>server.listen(port,'127.0.0.1',r));
+  const pres=(callId,isOnTheLine)=>fetch(`http://127.0.0.1:${port}/native/presence`,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agentId:'a',callId,isOnTheLine,acceptsOverheard:false})});
+  try {
+    assert.equal((await pres('call-old',true)).status,200);
+    assert.equal((await pres('call-new',true)).status,200);
+    assert.deepEqual(presence,['call-old:true','call-old:false','call-new:true']);
+    assert.deepEqual(logs.filter(e=>e.state==='stale_hangup').map(e=>e.error_class),['upstream_http_502']);
   } finally {await new Promise(r=>server.close(r));}
 });

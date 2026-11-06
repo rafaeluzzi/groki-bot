@@ -418,15 +418,27 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       if (nativePresence) {
         if (presenceBusy) return send(409, {ok: false, error: 'presence_busy'});
         if (!activeCall && !body.isOnTheLine) return send(403, {ok: false, error: 'call_not_allowed'});
+        let stale = null;
         if (activeCall && body.callId !== activeCall.callId) {
           // A foreign callId may only hang up its own call; never clear someone else's.
           if (!body.isOnTheLine) return send(409, {ok: false, error: 'call_conflict'});
           // New gateway session (new callId) taking over a stale call left by a gateway-only restart.
           for (const controller of streams) controller.abort();
+          stale = activeCall;
           activeCall = null;
         }
         presenceBusy = true;
         try {
+        // Grok keeps one call on the line per desktop and answers 417 to a new one until the old
+        // call hangs up, which otherwise only a Grok Bot relaunch does.
+        if (stale) {
+          try {
+            await sandbox.presence({agentId: stale.agentId, callId: stale.callId, isOnTheLine: false, acceptsOverheard: stale.acceptsOverheard});
+            logStream('presence', 'stale_hangup', {http_status: 200, error_class: null});
+          } catch (error) {
+            logStream('presence', 'stale_hangup', {http_status: null, error_class: String(error?.message).match(/^upstream_http_\d{3}$/)?.[0] ?? 'failed'});
+          }
+        }
         const authId = await sandbox.callerAuthId();
         await sandbox.presence(body);
         if (body.isOnTheLine) {

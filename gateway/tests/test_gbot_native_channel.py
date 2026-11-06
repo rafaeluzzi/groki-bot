@@ -194,6 +194,32 @@ async def test_presence_retry_recovers_readiness_without_restarting_voice():
 
 
 @pytest.mark.asyncio
+async def test_shutdown_hangs_up_every_started_channel():
+    from stackchan_mcp.gbot_native_channel import _open_channels, close_native_channels
+
+    calls = []
+    channel = NativeVoiceChannel(None, "http://127.0.0.1:18771", "agent", "call", AsyncMock())
+
+    async def presence(on):
+        calls.append(on)
+
+    async def listen():
+        channel.connected.set()
+        await asyncio.Event().wait()
+
+    channel._presence = presence
+    channel._listen = listen
+    await channel.start()
+    await asyncio.wait_for(channel.connected.wait(), 0.2)
+    assert channel in _open_channels
+    await close_native_channels()
+    assert calls == [True, False]
+    assert channel not in _open_channels and not channel.ready
+    await close_native_channels()
+    assert calls == [True, False]
+
+
+@pytest.mark.asyncio
 async def test_stop_cancels_inflight_registration_before_any_late_ready():
     channel = NativeVoiceChannel(
         None, "http://127.0.0.1:18771", "agent", "call", AsyncMock()
