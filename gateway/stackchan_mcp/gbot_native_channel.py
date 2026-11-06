@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from urllib.parse import urlencode
@@ -15,6 +16,21 @@ from urllib.parse import urlencode
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# The helper already reduces its errors to fixed words such as upstream_http_429.
+NATIVE_ERROR_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
+
+
+async def helper_error(response):
+    """The helper's ``error`` word (``upstream_http_429`` is Grok's own status), else ``http_<status>``."""
+    try:
+        body = await response.json(content_type=None)
+    except Exception:
+        body = None
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, str) and NATIVE_ERROR_RE.fullmatch(error):
+        return error
+    return f"http_{response.status}"
 
 
 def update_event(message, agent_id, call_id):
@@ -76,6 +92,7 @@ class NativeVoiceChannel:
         self._retry_delay = 5.0
         self._typed_seen = set()
         self._presence_status = None
+        self._error = None
         self.connected = asyncio.Event()
 
     async def _presence(self, on):
@@ -92,9 +109,13 @@ class NativeVoiceChannel:
             # Hangup must not erase the registration status the portal watches.
             if on:
                 self._presence_status = response.status
-            logger.info("Grok native presence on=%s status=%d", on, response.status)
             if response.status != 200:
+                error = await helper_error(response)
+                if on:
+                    self._error = error
+                logger.info("Grok native presence on=%s status=%d error=%s", on, response.status, error)
                 raise RuntimeError("native_presence_unavailable")
+            logger.info("Grok native presence on=%s status=%d", on, response.status)
             result = await response.json()
             if result.get("ok") is False:
                 raise RuntimeError("native_presence_rejected")
@@ -110,6 +131,7 @@ class NativeVoiceChannel:
             "state": "ready" if ready else "unavailable",
             "ready": ready,
             "presence_status": self._presence_status,
+            "error": None if ready else self._error,
         }
 
     async def start(self):
@@ -126,9 +148,12 @@ class NativeVoiceChannel:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if not isinstance(exc, RuntimeError):
+                    self._error = type(exc).__name__
                 logger.warning(
-                    "Grok native channel state=unavailable retry=pending reason=%s",
+                    "Grok native channel state=unavailable retry=pending reason=%s error=%s",
                     str(exc) if isinstance(exc, RuntimeError) else type(exc).__name__,
+                    self._error,
                 )
             finally:
                 self._registered = False
@@ -155,7 +180,9 @@ class NativeVoiceChannel:
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=60),
         ) as response:
             if response.status != 200:
+                self._error = await helper_error(response)
                 raise RuntimeError("native_events_unavailable")
+            self._error = None
             self.connected.set()
             logger.info("Grok native channel state=ready")
             data, length = [], 0

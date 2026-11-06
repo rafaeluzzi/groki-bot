@@ -21,6 +21,7 @@ from aiohttp import web
 
 from .debug_panel import PANEL_HTML
 from .debug_status import DebugStatus, get_debug_status
+from .gbot_native_channel import NATIVE_ERROR_RE
 from .koji_wiki import handle_wiki_manifest, handle_wiki_page
 
 logger = logging.getLogger(__name__)
@@ -154,10 +155,14 @@ def _native_health(health: dict) -> dict:
     if type(status) is not int:
         status = None
     ready = native.get("ready") is True and native.get("state") == "ready"
+    error = native.get("error")
+    if ready or not isinstance(error, str) or not NATIVE_ERROR_RE.fullmatch(error):
+        error = None
     return {
         "state": "ready" if ready else "unavailable",
         "ready": ready,
         "presence_status": status,
+        "error": error,
     }
 
 

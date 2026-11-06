@@ -136,6 +136,7 @@ async def test_native_presence_and_sse_lifecycle():
                 "state": "ready",
                 "ready": True,
                 "presence_status": 200,
+                "error": None,
             }
             await channel.close()
         assert [item["isOnTheLine"] for item in presence] == [True, False]
@@ -232,7 +233,10 @@ class _NativeHelper:
         if not body.get("isOnTheLine"):
             return web.json_response({"ok": True})
         status = self.on_status
-        return web.json_response({"ok": status == 200}, status=status)
+        if status != 200:
+            # Same body the real helper sends when Grok's sandbox answers 429.
+            return web.json_response({"ok": False, "error": "upstream_http_429"}, status=status)
+        return web.json_response({"ok": True}, status=status)
 
     async def events(self, request):
         self.event_calls += 1
@@ -299,6 +303,7 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "state": "unavailable",
                     "ready": False,
                     "presence_status": 502,
+                    "error": "upstream_http_429",
                 }
                 assert not channel.ready
                 http_status, body = await read_health()
@@ -315,6 +320,7 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                         "state": "unavailable",
                         "ready": False,
                         "presence_status": 200,
+                        "error": "http_502",
                     }
                 )
                 http_status, body = await read_health()
@@ -328,6 +334,7 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "state": "ready",
                     "ready": True,
                     "presence_status": 200,
+                    "error": None,
                 }
                 http_status, body = await read_health()
                 assert http_status == 200 and body["ok"] is True
@@ -336,6 +343,7 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "state": "ready",
                     "ready": True,
                     "presence_status": 200,
+                    "error": None,
                 }
             finally:
                 helper.release.set()

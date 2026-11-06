@@ -46,7 +46,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             snapshot = report()
             if isinstance(snapshot, dict):
                 return snapshot
-        return {"state": "unavailable", "ready": False, "presence_status": None}
+        return {"state": "unavailable", "ready": False, "presence_status": None, "error": None}
 
     def _record_connection(self, connected, error=None):
         self._health["state"] = "connected" if connected else "reconnecting"
