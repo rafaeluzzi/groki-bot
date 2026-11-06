@@ -22,12 +22,14 @@ The Portal handlers that accept this frame were not in this repository when the 
 
 ## Catalog v1
 
+The machine-readable list is `gateway/contract/koji-contract.json`, a copy of grok-portal `contract/koji-contract.json`. `tests/test_koji_contract.py` here and `ContractTest.kt` in Koji both read it. Change it in grok-portal and run `python3 tools/sync-contract.py` there.
+
 | `name` | `args` | Example |
 |---|---|---|
 | `set_volume_percent` | `{"percent": <int 0..100>}` | "50%" → `{"percent":50}` |
 | `set_volume_level` | `{"level": <int 0..100>}` | a step the device maps onto its scale |
-| `volume_up` | `{}` | one step louder |
-| `volume_down` | `{}` | one step quieter |
+| `volume_up` | `{"steps"?: <int 1..100>}` | one step louder by default |
+| `volume_down` | `{"steps"?: <int 1..100>}` | one step quieter by default |
 | `get_volume` | `{}` | on-device only; no number comes back |
 | `media_pause` | `{}` | |
 | `media_resume` | `{}` | |
@@ -35,13 +37,13 @@ The Portal handlers that accept this frame were not in this repository when the 
 | `media_skip_next` | `{}` | |
 | `media_skip_previous` | `{}` | |
 | `set_brightness_percent` | `{"percent": <int 0..100>}` | |
-| `brightness_up` | `{}` | |
-| `brightness_down` | `{}` | |
-| `open_app` | `{"id": "<app id>"}` | `spotify` |
-| `show_settings` | `{}` | |
+| `brightness_up` | `{"steps"?: <int 1..100>}` | percent points, 10 by default |
+| `brightness_down` | `{"steps"?: <int 1..100>}` | percent points, 10 by default |
+| `open_app` | `{"id": "spotify" \| "koji_settings"}` | `spotify` |
+| `show_settings` | `{"page"?: "device_commands"}` | settings root without `page` |
 | `reconnect_bridge` | `{}` | |
 
-`open_app` `id` is 1 to 64 characters: a letter or digit, then letters, digits, `.`, `_`, or `-`. The gateway forwards it unchanged and does not launch a Mac app.
+`open_app` only accepts the app ids the Portal knows. Any other id is not sent, and the gateway never launches a Mac app for it.
 
 Unknown names, extra keys, and values outside those ranges are not sent.
 

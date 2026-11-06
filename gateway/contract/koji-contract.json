@@ -1,0 +1,70 @@
+{
+  "about": "Portal <-> bridge contract. Edit this copy in grok-portal, then run `python3 tools/sync-contract.py` to copy it to groki-bot gateway/contract/. Koji tests (ContractTest.kt) and gateway tests (test_koji_contract.py) both read it.",
+  "version": 1,
+  "device_commands": [
+    {"name": "set_volume_percent", "args": {"percent": {"type": "int", "min": 0, "max": 100, "required": true}}},
+    {"name": "set_volume_level", "args": {"level": {"type": "int", "min": 0, "max": 100, "required": true}}},
+    {"name": "volume_up", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
+    {"name": "volume_down", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
+    {"name": "get_volume", "args": {}},
+    {"name": "media_pause", "args": {}},
+    {"name": "media_resume", "args": {}},
+    {"name": "media_stop", "args": {}},
+    {"name": "media_skip_next", "args": {}},
+    {"name": "media_skip_previous", "args": {}},
+    {"name": "set_brightness_percent", "args": {"percent": {"type": "int", "min": 0, "max": 100, "required": true}}},
+    {"name": "brightness_up", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
+    {"name": "brightness_down", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
+    {"name": "open_app", "args": {"id": {"type": "enum", "values": ["spotify", "koji_settings"], "required": true}}},
+    {"name": "show_settings", "args": {"page": {"type": "enum", "values": ["device_commands"]}}},
+    {"name": "reconnect_bridge", "args": {}}
+  ],
+  "panel": {
+    "version": 1,
+    "kinds": ["list", "now_playing", "choice", "webview"],
+    "id_pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$",
+    "limits": {
+      "rows": 12,
+      "actions": 4,
+      "title": 80,
+      "row_label": 80,
+      "subtitle": 120,
+      "prompt": 160,
+      "action_label": 40,
+      "url": 500,
+      "seconds": 172800
+    },
+    "rebuilds": [
+      {
+        "name": "logged podcast list with label and title",
+        "input": {"kind": "list", "title": "Podcasts I follow", "items": [{"label": "Following on Portal Spotify", "title": "Planet Money"}, {"label": "Following on Portal Spotify", "title": "All-In"}]},
+        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify"}, {"id": "row-2", "label": "All-In", "subtitle": "Following on Portal Spotify"}]}
+      },
+      {
+        "name": "logged podcast list with no title",
+        "input": {"kind": "list", "items": [{"text": "Following", "title": "Planet Money"}, {"text": "Following", "title": "All-In"}]},
+        "output": {"version": 1, "kind": "list", "id": "List", "title": "List", "rows": [{"id": "row-1", "label": "Planet Money", "subtitle": "Following"}, {"id": "row-2", "label": "All-In", "subtitle": "Following"}]}
+      },
+      {
+        "name": "string items, markup and art",
+        "input": {"kind": "list", "title": "Podcasts I follow", "items": [{"label": "Following on Portal Spotify", "title": "Planet Money", "art_url": "https://x.test/a.jpg"}, "All-In", {"id": "ep 1", "name": "Tea <time>", "action": {"label": "Play"}}]},
+        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify", "artUrl": "https://x.test/a.jpg"}, {"id": "row-2", "label": "All-In"}, {"id": "ep-1", "label": "Tea \u2039time>", "action": {"id": "Play", "label": "Play"}}]}
+      },
+      {
+        "name": "now playing from loose fields",
+        "input": {"kind": "now_playing", "title": "Episode 12", "show": "Planet Money", "paused": true, "position_ms": 65000, "duration_ms": 1800000},
+        "output": {"version": 1, "kind": "now_playing", "id": "Episode-12", "title": "Episode 12", "show": "Planet Money", "elapsed": 65, "duration": 1800, "primary": {"id": "local:resume", "label": "Play"}}
+      },
+      {
+        "name": "choice from plain options",
+        "input": {"kind": "choice", "prompt": "Tea or coffee?", "options": ["Tea", "Coffee"]},
+        "output": {"version": 1, "kind": "choice", "id": "Tea-or-coffee", "prompt": "Tea or coffee?", "actions": [{"id": "Tea", "label": "Tea"}, {"id": "Coffee", "label": "Coffee"}]}
+      },
+      {
+        "name": "html alias",
+        "input": {"kind": "html", "title": "Note", "html": "<p>Hi</p>"},
+        "output": {"version": 1, "kind": "webview", "id": "Note", "title": "Note", "html": "<p>Hi</p>"}
+      }
+    ]
+  }
+}

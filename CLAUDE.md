@@ -26,6 +26,8 @@ uv sync --all-extras
 NO_PROXY="*" uv run pytest -q
 ```
 
+Koji Portal work (device commands, panels, wiki): follow `AGENTS.md`.
+
 Never let the gateway take the robot's serial port in tests or local runs: set `STACKCHAN_USB_DISABLE=1` and leave `STACKCHAN_USB_TRANSPORT` unset. New gateway files use `SPDX-License-Identifier: MIT`. Optional features (Mac control, device tools, Grok Bot hand-off via `STACKCHAN_TOOL_BOT`) stay off by default. How the parts talk to each other: `docs/architecture.md`.
 
 ## License headers
