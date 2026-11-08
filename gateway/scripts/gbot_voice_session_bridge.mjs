@@ -554,9 +554,12 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         // End downstream first: the gateway reconnects (and replays the gap) on EOF,
         // and must not sit on its 60s read timeout while the transcript loop stops.
         res.end();
-        const slow = setTimeout(() => logStream('typed', 'slow_stop', {http_status: null, error_class: null}), 5000);
+        const stopping = Date.now();
+        let slowLogged = false;
+        const slow = setTimeout(() => { slowLogged = true; logStream('typed', 'slow_stop', {http_status: null, error_class: null}); }, 5000);
         await typedTask;
         clearTimeout(slow);
+        if (slowLogged) logStream('typed', 'stopped', {ms: Date.now() - stopping});
       }
       return;
     }
