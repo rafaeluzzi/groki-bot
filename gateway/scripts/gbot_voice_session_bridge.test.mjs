@@ -149,6 +149,28 @@ test('server transcript stream drops replay and pre-connection entries and requi
   assert.equal(fetched,false);
 });
 
+test('transcript stream stops on abort even when the fetch and its body ignore it', async () => {
+  const {NativeTranscriptClient} = await import('./gbot_voice_session_bridge.mjs');
+  const hello = Buffer.from(JSON.stringify({connected:{serverTimeMs:1}}));
+  const prefix = Buffer.alloc(5); prefix.writeUInt32BE(hello.length, 1);
+  let sent = false;
+  // Neither the fetch nor the body source honours abort or cancel: the read only ends if we cancel it.
+  const body = new ReadableStream({
+    pull(controller) { if (!sent) { sent = true; controller.enqueue(Buffer.concat([prefix, hello])); return; } return new Promise(() => {}); },
+    cancel() { return new Promise(() => {}); },
+  });
+  const client = new NativeTranscriptClient({accountLoader: () => ({token:'t', machineId:'m'}),
+    fetcher: async () => new Response(body, {headers:{'content-type':'application/connect+json'}})});
+  const controller = new AbortController();
+  const started = Date.now();
+  const done = (async () => { for await (const ignored of client.events({agentId:'a', callId:'c', sessionId:'', sinceMs:0}, controller.signal)) {} })();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  controller.abort();
+  const result = await Promise.race([done.then(() => 'ended'), new Promise(resolve => setTimeout(() => resolve('hung'), 1000))]);
+  assert.equal(result, 'ended');
+  assert.ok(Date.now() - started < 1000);
+});
+
 test('a nudge is a signal with no answer text, even when the text matches', async () => {
   const {filterNativeEvent} = await import('./gbot_voice_session_bridge.mjs');
   const context = {agentId:'a',callId:'call-c',seen:new Set()};
@@ -387,13 +409,77 @@ test('a replayed transcript send-message is backfilled once and a user replay is
   const body = (entry) => Buffer.from(JSON.stringify(entry)).toString('base64');
   const reply = {id:'gap-1', kind:'send-message', timestampMs:50, message:{type:'text', channel:'voice:call-c', content:'From the gap'}};
   const user = {id:'old-user', kind:'message', role:'user', content:'earlier', timestampMs:200, author:{kind:'cursor_user', id:'owner'}};
-  const rows = {agentId:'a', sessionId:'', generation:1, replay:true, entries:[{body: body(reply)}, {body: body(user)}]};
+  // Live replay rows carry only agentId, entries and replay (no sessionId, no generation).
+  const rows = {agentId:'a', replay:true, entries:[{body: body(reply)}, {body: body(user)}]};
   const first = filterTranscriptFrame({rows}, context, state);
   assert.equal(first.length, 1);
   assert.equal(first[0].channel, 'box-reply');
   assert.equal(first[0].payload.text, 'From the gap');
   assert.equal(first[0].payload.entryId, 'gap-1');
   assert.deepEqual(filterTranscriptFrame({rows}, context, state), []);
+});
+
+test('the 16:52 replay frames as received backfill both gap replies, in order, and no request', async () => {
+  const {filterTranscriptFrame} = await import('./gbot_voice_session_bridge.mjs');
+  const context = {agentId:'a', callId:'40907d56', sessionId:'', authId:'owner', sinceMs:1794174777000, seen: new Set()};
+  const state = {connected:false, sinceMs:context.sinceMs, generation:null};
+  const body = (entry) => Buffer.from(JSON.stringify(entry)).toString('base64');
+  const chan = 'voice:40907d56';
+  const frames = [
+    {connected:{streamId:'s', serverTimeMs:'1794174785984', absoluteLifetimeMs:'1182927'}},
+    {agentState:{snapshot:true, client:[]}},
+    {boxState:{state:{runState:'SAND_BOX_RUN_STATE_RUNNING'}}},
+    {rows:{agentId:'a', replay:true, entries:[
+      {body: body({id:'t43u', kind:'message', role:'user', channel:chan, content:'Find indoor events in Cary', timestampMs:1794174726958, author:{kind:'cursor_user', id:'owner'}})},
+      {body: body({id:'t43s0', kind:'send-message', timestampMs:1794174734042, message:{type:'text', channel:chan, content:"I'm looking up indoor events in Cary now."}})},
+      {body: body({id:'t43s1', kind:'send-message', timestampMs:1794174750739, message:{type:'text', channel:chan, content:'I found eight indoor options in Cary.'}})},
+      {body: body({id:'t44s0', kind:'send-message', timestampMs:1794174761368, message:{type:'text', channel:'voice:other-call', content:'Not this call.'}})},
+      {body: body({id:'t44s1', kind:'send-message', timestampMs:1794174761368, message:{type:'text', channel:chan, content:'Durham has a busy weekend.'}})},
+    ]}},
+  ];
+  const out = frames.flatMap(frame => filterTranscriptFrame(frame, context, state));
+  assert.deepEqual(out.map(event => event.channel), ['box-reply', 'box-reply', 'box-reply']);
+  assert.deepEqual(out.map(event => event.payload.entryId), ['t43s0', 't43s1', 't44s1']);
+  assert.equal(frames.flatMap(frame => filterTranscriptFrame(frame, context, state)).length, 0);
+});
+
+test('unversioned live rows pass box replies but never a typed user message', async () => {
+  const {filterTranscriptFrame} = await import('./gbot_voice_session_bridge.mjs');
+  const context = {agentId:'a', callId:'call-c', sessionId:'', authId:'owner', sinceMs:100, seen: new Set()};
+  const state = {};
+  filterTranscriptFrame({connected:{serverTimeMs:'110'}}, context, state);
+  const body = (entry) => Buffer.from(JSON.stringify(entry)).toString('base64');
+  const user = {id:'u1', kind:'message', role:'user', content:'typed', timestampMs:200, author:{kind:'cursor_user', id:'owner'}};
+  const reply = {id:'r1', kind:'send-message', timestampMs:200, message:{type:'text', channel:'voice:call-c', content:'Answer'}};
+  const out = filterTranscriptFrame({rows:{agentId:'a', entries:[{body: body(user)}, {body: body(reply)}]}}, context, state);
+  assert.deepEqual(out.map(event => event.channel), ['box-reply']);
+  assert.equal(filterTranscriptFrame({rows:{agentId:'a', generation:1, entries:[{body: body({...user, id:'u2'})}]}}, context, state).length, 1);
+});
+
+test('HTTP: a box error ends downstream at once even when the transcript loop is slow to stop', async () => {
+  const port = await freePort();
+  let box, release;
+  const logs = [];
+  const stuck = new Promise(resolve => { release = resolve; });
+  const sandbox = {
+    presence: async () => {}, callerAuthId: async () => 'owner', invalidate() {},
+    openEvents: async () => new Response(new ReadableStream({start(controller) { box = controller; }}), {headers:{'content-type':'text/event-stream'}}),
+  };
+  // Ignores abort: models the 21:51:57 hold, where the gateway saw no EOF for 60s.
+  const transcript = {async *events(_context, _signal, onOpen) { onOpen(200); await stuck; }};
+  const server = createBridge({port, agentId:'a', desktopEnabled:true, toolsEnabled:false, sandbox, transcript, nativeRetryDelayMs:10, nativeLog:event=>logs.push(event)});
+  await new Promise(resolve=>server.listen(port,'127.0.0.1',resolve));
+  try {
+    await fetch(`http://127.0.0.1:${port}/native/presence`, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({agentId:'a',callId:'call-c',isOnTheLine:true,acceptsOverheard:false})});
+    const response = await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=call-c`);
+    const reader = response.body.getReader(); await reader.read();
+    const started = Date.now();
+    box.error(Object.assign(new TypeError('terminated'), {cause:{code:'UND_ERR_SOCKET'}}));
+    let done = false;
+    while (!done) ({done} = await reader.read());
+    assert.ok(Date.now() - started < 1000);
+    assert.ok(logs.some(event => event.source === 'box' && event.state === 'error'));
+  } finally { release(); server.closeAllConnections(); await new Promise(resolve=>server.close(resolve)); }
 });
 
 test('warm runs once while another warm is in flight, and the call record answer is returned', async () => {

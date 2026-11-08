@@ -206,6 +206,7 @@ class GbotVoiceBridge:
         self._desktop_tasks = DesktopTasks(
             announce=self._announce_desktop,
             channel_ready=self._desktop_channel_ready,
+            resend=self._resend_desktop_request,
         )
         self._async_sent: list = []
         self._desktop_live: dict = {}
@@ -746,25 +747,63 @@ class GbotVoiceBridge:
         if task is not None:
             log_desktop_hop(task.id, "signal")
 
-    async def _wait_for_native(self) -> int:
-        """Wait out a short reconnect. Returns how long the wait lasted, in ms.
+    def _warm_in_flight(self) -> bool:
+        return self._warm_task is not None and not self._warm_task.done()
 
-        A channel that has been down for a while, or has never been ready, returns
-        at once. Nothing is spoken during the wait.
+    async def _wait_for_native(self) -> tuple[int, bool]:
+        """Wait out a short reconnect. Returns (ms, try_anyway).
+
+        try_anyway is true when the box may still accept a task while the event
+        stream is down: a reconnect blip, or a desktop that is waking. The 16:52
+        Cary task was accepted in 350ms during a 20s warm. A long outage
+        returns at once and try_anyway is false.
         """
         native = self._native
-        if native is None or native.ready:
-            return 0
+        if native is None:
+            return 0, False
+        if native.ready:
+            return 0, False
+        warming = self._warm_in_flight()
         grace = getattr(native, "within_reconnect_grace", None)
-        if not callable(grace) or not grace():
-            return 0
+        recent = bool(callable(grace) and grace())
+        if not recent and not warming:
+            return 0, False
+        if not recent:
+            # Waking, stream never looked up. Send now; the box accepted Cary that way.
+            return 0, True
         started = time.monotonic()
         deadline = started + RECONNECT_GRACE_S
         while time.monotonic() < deadline:
             if native.ready or self._stopped:
                 break
             await asyncio.sleep(0.05)
-        return int((time.monotonic() - started) * 1000)
+        return int((time.monotonic() - started) * 1000), True
+
+    async def _resend_desktop_request(self, request: str) -> bool:
+        """Same request, once, on the open task. Does not open a second tracker."""
+        if self._stopped or not self.running:
+            return False
+        try:
+            result = await self._local(
+                "/tool",
+                {
+                    "agentId": self.agent_id,
+                    "callId": self.call_id,
+                    "name": "send_task",
+                    "input": {"request": request},
+                    "line": {
+                        "theyJustTalked": True,
+                        "newsOwed": False,
+                        "receiptOwed": False,
+                        "alreadySpokeThisTurn": False,
+                    },
+                },
+            )
+        except Exception:
+            logger.warning("desktop task resend request failed")
+            return False
+        parsed = self._native_tool_result("send_task", result)
+        return parsed.get("relay") == "accepted"
 
     async def _native_from_channel(self, event, is_user):
         await self._native_update(event, is_user, track=True)
@@ -1377,11 +1416,14 @@ class GbotVoiceBridge:
                 outcome = "invalid_arguments"
                 raise ValueError("invalid tool arguments")
             waited_ms = 0
+            try_anyway = False
             if name == "send_task" and not (self._native and self._native.ready):
-                waited_ms = await self._wait_for_native()
-            if name in {"send_task", "search_conversations"} and not (
-                self._native and self._native.ready
-            ):
+                waited_ms, try_anyway = await self._wait_for_native()
+            stream_down = not (self._native and self._native.ready)
+            blocked = name in {"send_task", "search_conversations"} and stream_down and not (
+                name == "send_task" and try_anyway
+            )
+            if blocked:
                 outcome = "native_not_ready"
                 if name == "send_task":
                     self._desktop_tasks.refuse(waited_ms)
@@ -1427,10 +1469,16 @@ class GbotVoiceBridge:
                         },
                     )
                     result = self._native_tool_result("send_task", result)
-                    outcome = "native_" + result["relay"]
                     if result.get("relay") == "accepted":
+                        outcome = "native_accepted"
                         self._used_mono = time.monotonic()
                         self._desktop_tasks.start(request, waited_ms=waited_ms)
+                    elif stream_down:
+                        outcome = "native_not_ready"
+                        self._desktop_tasks.refuse(waited_ms)
+                        result = self._desktop_failure("native_not_ready")
+                    else:
+                        outcome = "native_" + result["relay"]
             elif name == "end_the_call":
                 result = {"ok": True}
                 if self._on_end_conversation:

@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 # One place to change. A desktop lookup that has not landed by then is spoken as a failure.
 DESKTOP_TASK_TIMEOUT_S = 90.0
+# No transcript reply by then: one silent resend of the same request. Never a second.
+DESKTOP_TASK_RETRY_S = 45.0
 # Quiet after a non-holding reply before the task is finished.
 # Holding lines do not start this clock: the Durham trace's real answer arrived
 # 19s after "Looking up…", and that gap has to stay inside the open task.
@@ -33,7 +35,9 @@ DESKTOP_TASK_TIMEOUT_S = 90.0
 # the 90s failure clock. Anything later is spoken once as a late result.
 DESKTOP_TASK_QUIET_S = 12.0
 # A reply stamped just before we logged the task start still belongs to it.
-REPLY_SKEW_MS = 3000
+# Transcript request stamps land within ~40 ms of our start log, and a reply takes
+# seconds. 3s credited the Cary list (21:52:30.7) to Durham, sent at 21:52:32.1.
+REPLY_SKEW_MS = 1000
 # The channel was up, and no reply had arrived.
 TIMEOUT_UP_PHRASE = "That one didn't come back in time."
 # The channel was down when the wait ended.
@@ -119,7 +123,9 @@ class _OpenTask:
     deadline_mono: float
     waited_ms: int = 0
     replies: int = 0
+    resent: bool = False
     timer: asyncio.Task | None = None
+    retry: asyncio.Task | None = None
     quiet: asyncio.Task | None = None
     quiet_deadline: float = 0.0
     done: bool = False
@@ -140,8 +146,10 @@ class DesktopTasks:
 
     announce: object
     channel_ready: object
+    resend: object = None
     timeout_s: float = DESKTOP_TASK_TIMEOUT_S
     quiet_s: float = DESKTOP_TASK_QUIET_S
+    retry_s: float = DESKTOP_TASK_RETRY_S
     _open: dict[str, _OpenTask] = field(default_factory=dict)
     _finished: list[_Finished] = field(default_factory=list)
     _seen: set[str] = field(default_factory=set)
@@ -169,6 +177,7 @@ class DesktopTasks:
         )
         self._open[task_id] = task
         task.timer = asyncio.create_task(self._expire(task), name="desktop-task-timeout")
+        task.retry = asyncio.create_task(self._retry(task), name="desktop-task-retry")
         log_desktop_hop(task_id, "accepted", at=task.started)
         return task_id
 
@@ -192,6 +201,7 @@ class DesktopTasks:
         if task is not None:
             self._seen.add(key)
             task.replies += 1
+            self._cancel_retry(task)
             holding = is_holding_line(phrase)
             if holding:
                 self._cancel_quiet(task)
@@ -265,6 +275,7 @@ class DesktopTasks:
                     "remaining_s": max(0.0, task.deadline_mono - now),
                     "waited_ms": task.waited_ms,
                     "replies": task.replies,
+                    "resent": task.resent,
                     "quiet_remaining_s": quiet_left,
                     "seen": seen,
                 }
@@ -302,9 +313,12 @@ class DesktopTasks:
             deadline_mono=time.monotonic() + float(item.get("remaining_s") or 0),
             waited_ms=int(item.get("waited_ms") or 0),
             replies=int(item.get("replies") or 0),
+            resent=bool(item.get("resent")),
         )
         self._open[task.id] = task
         task.timer = asyncio.create_task(self._expire(task), name="desktop-task-timeout")
+        if not task.resent and not task.replies:
+            task.retry = asyncio.create_task(self._retry(task), name="desktop-task-retry")
         quiet_left = item.get("quiet_remaining_s")
         if isinstance(quiet_left, (int, float)) and task.replies:
             self._arm_quiet(task, delay=max(0.0, float(quiet_left)))
@@ -364,6 +378,13 @@ class DesktopTasks:
             return None
         return min(open_tasks, key=lambda task: task.deadline_mono)
 
+    def _cancel_retry(self, task: _OpenTask) -> None:
+        timer = task.retry
+        task.retry = None
+        if timer is not None and timer is not asyncio.current_task() and not timer.done():
+            timer.cancel()
+            self._cancelled.append(timer)
+
     def _cancel_quiet(self, task: _OpenTask) -> None:
         timer = task.quiet
         task.quiet = None
@@ -382,6 +403,7 @@ class DesktopTasks:
             return
         task.done = True
         self._cancel_quiet(task)
+        self._cancel_retry(task)
         timer = task.timer
         task.timer = None
         if timer is not None and timer is not asyncio.current_task() and not timer.done():
@@ -411,6 +433,26 @@ class DesktopTasks:
             return
         self._finish_open(task, remember=True)
         log_desktop_hop(task.id, "quiet")
+
+    async def _retry(self, task: _OpenTask) -> None:
+        """One silent resend if the box never wrote a reply. Never a second."""
+        delay = self.retry_s
+        remaining = task.deadline_mono - time.monotonic()
+        # Skip when the timeout would fire at or before this retry.
+        if delay <= 0 or remaining <= delay or self.resend is None:
+            return
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        if task.done or task.id not in self._open or task.replies or task.resent:
+            return
+        task.resent = True
+        log_desktop_hop(task.id, "resend")
+        try:
+            await self.resend(task.request)
+        except Exception:
+            logger.warning("desktop task resend failed id=%s", task.id)
 
     async def _expire(self, task: _OpenTask) -> None:
         delay = task.deadline_mono - time.monotonic()

@@ -210,9 +210,17 @@ export class NativeTranscriptClient {
     onOpen(response.status);
     let pending = Buffer.alloc(0);
     const state = {connected: false, sinceMs: context.sinceMs, generation: null};
+    // An aborted fetch can leave a body read pending for minutes. Cancelling the
+    // reader settles a pending read at once, whatever the socket does.
+    const reader = response.body?.getReader?.();
+    if (!reader) throw new Error('native_stream_format');
+    const stop = () => { reader.cancel().catch(() => {}); };
+    if (signal?.aborted) stop(); else signal?.addEventListener('abort', stop, {once: true});
     try {
-      for await (const bytes of response.body) {
-        const chunk = asBytes(bytes);
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        const chunk = asBytes(next.value);
         if (!chunk) continue;
         pending = Buffer.concat([pending, chunk]);
         if (pending.length > 2 * 1024 * 1024) throw new Error('event_too_large');
@@ -227,7 +235,10 @@ export class NativeTranscriptClient {
           for (const item of event) yield item;
         }
       }
-    } finally { await response.body?.cancel().catch(() => {}); }
+    } finally {
+      signal?.removeEventListener('abort', stop);
+      stop();
+    }
   }
 }
 
@@ -245,16 +256,22 @@ export function filterTranscriptFrame(frame, context, state) {
   }
   const rows = frame.rows;
   // Replay frames still carry box replies from a gap. User messages reject replay below.
-  if (!state.connected || !rows || rows.agentId !== context.agentId || (rows.sessionId || '') !== context.sessionId || !Number.isSafeInteger(rows.generation)) return [];
-  if (state.generation !== null && rows.generation !== state.generation) throw new Error('transcript_rebaseline_required');
-  state.generation = rows.generation;
+  if (!state.connected || !rows || rows.agentId !== context.agentId || (rows.sessionId || '') !== context.sessionId) return [];
+  // Replay rows arrive with only agentId, entries and replay: no generation.
+  // Without one, only box replies pass; user messages stay fail-closed.
+  const versioned = Number.isSafeInteger(rows.generation);
+  if (versioned) {
+    if (state.generation !== null && rows.generation !== state.generation) throw new Error('transcript_rebaseline_required');
+    state.generation = rows.generation;
+  }
+  const replay = rows.replay === true || !versioned;
   const result = [];
   for (const row of rows.entries ?? []) {
     // No blob reads, omitted-body reads or history snapshots are performed.
     if (typeof row.body !== 'string' || row.bodyOmitted) continue;
     let entry;
     try { entry = JSON.parse(Buffer.from(row.body, 'base64').toString('utf8')); } catch { continue; }
-    const event = filterNativeEvent({channel: 'transcript', payload: {type: 'appended', entry, ordered: {replicaKey: 'transcript:' + context.agentId, sequence: 0}}}, {...context, sinceMs: state.sinceMs, replay: rows.replay === true});
+    const event = filterNativeEvent({channel: 'transcript', payload: {type: 'appended', entry, ordered: {replicaKey: 'transcript:' + context.agentId, sequence: 0}}}, {...context, sinceMs: state.sinceMs, replay});
     if (event) result.push(event);
   }
   return result;
@@ -544,9 +561,16 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (!res.headersSent) send(502, {ok: false, error: 'native_stream_failed'});
       } finally {
         controller.abort();
-        await typedTask;
         streams.delete(controller);
+        // End downstream first: the gateway reconnects (and replays the gap) on EOF,
+        // and must not sit on its 60s read timeout while the transcript loop stops.
         res.end();
+        const stopping = Date.now();
+        let slowLogged = false;
+        const slow = setTimeout(() => { slowLogged = true; logStream('typed', 'slow_stop', {http_status: null, error_class: null}); }, 5000);
+        await typedTask;
+        clearTimeout(slow);
+        if (slowLogged) logStream('typed', 'stopped', {ms: Date.now() - stopping});
       }
       return;
     }

@@ -864,7 +864,7 @@ async def test_grace_that_does_not_recover_logs_the_wait(monkeypatch, caplog):
     await b._tool(
         {"name": "send_task", "call_id": "stuck", "arguments": '{"request":"weekend weather"}'}
     )
-    b._local.assert_not_awaited()
+    b._local.assert_awaited()
     line = next(r.getMessage() for r in caplog.records if "outcome=channel_down" in r.message)
     waited = int(line.split("waited_ms=")[1])
     assert waited >= 100
@@ -874,6 +874,75 @@ async def test_grace_that_does_not_recover_logs_the_wait(monkeypatch, caplog):
         if c.args[0]["type"] == "conversation.item.create"
     )
     assert "Desktop tasks are down right now." in raw
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_send_during_warm_is_tried_even_if_stream_stays_down(monkeypatch, caplog):
+    import logging
+    import time
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._native = _GraceChannel(recent=False)
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+
+    async def warm():
+        await asyncio.sleep(2)
+
+    b._warm_task = asyncio.create_task(warm())
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    started = time.monotonic()
+    await b._tool(
+        {"name": "send_task", "call_id": "cary", "arguments": '{"request":"indoor events in Cary"}'}
+    )
+    assert time.monotonic() - started < 0.4
+    b._local.assert_awaited()
+    assert b._native.ready is False
+    assert any("hop=accepted" in r.message for r in caplog.records)
+    assert not any("outcome=channel_down" in r.message for r in caplog.records)
+    b._warm_task.cancel()
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_bridge_resends_a_silent_no_reply_once(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._desktop_tasks.retry_s = 0.05
+    b._desktop_tasks.timeout_s = 2
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "once", "arguments": '{"request":"Durham events"}'}
+    )
+    await asyncio.sleep(0.15)
+    tool_calls = [c for c in b._local.await_args_list if c.args[0] == "/tool"]
+    assert len(tool_calls) == 2
+    assert tool_calls[1].args[1]["input"]["request"] == "Durham events"
+    assert any("hop=resend" in r.message for r in caplog.records)
+    await asyncio.sleep(0.15)
+    tool_calls = [c for c in b._local.await_args_list if c.args[0] == "/tool"]
+    assert len(tool_calls) == 2
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_bridge_does_not_resend_after_a_reply(monkeypatch):
+    b = make(monkeypatch)
+    b._desktop_tasks.retry_s = 0.05
+    b._desktop_tasks.timeout_s = 2
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "done", "arguments": '{"request":"Durham events"}'}
+    )
+    await b._native_update(_reply("Durham has a busy weekend.", "e-real"), False, track=True)
+    await asyncio.sleep(0.15)
+    tool_calls = [c for c in b._local.await_args_list if c.args[0] == "/tool"]
+    assert len(tool_calls) == 1
     await b.stop()
 
 
