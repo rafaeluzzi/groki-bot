@@ -479,6 +479,7 @@ def test_grok_drops_legacy_wrapper_routing_without_changing_local_instructions(
     assert "ask_grokbot" not in instructions and "returns at once" not in instructions
     assert "Use move_head for hardware." in instructions
     assert "relay=accepted" in instructions
+    assert "Do not promise to look it up later" in instructions
     assert b._executor.instructions() == source
 
 
@@ -650,10 +651,89 @@ async def test_unavailable_desktop_has_readable_english_without_diagnostic_code(
         if call.args[0]["type"] == "conversation.item.create"
     )
     output = json.loads(raw)
-    assert output["spoken"] == (
-        "The desktop assistant is not connected yet. Please try again shortly."
-    )
+    assert output["spoken"] == "Desktop tasks are down right now."
     assert "failureCode" not in output and "native_not_ready" not in raw
     assert b.metrics["tool_outcomes"][name + ":native_not_ready"] == 1
     assert "spoken" in b._provider_tool_instructions()
+    assert "Do not promise to look it up later" in b._provider_tool_instructions()
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_send_task_logs_channel_down(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._native.ready = False
+    await b._tool(
+        {"name": "send_task", "call_id": "offline", "arguments": '{"request":"events nearby"}'}
+    )
+    line = next(r.getMessage() for r in caplog.records if r.message.startswith("desktop task"))
+    assert "outcome=channel_down" in line
+    assert "events nearby" not in line
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_accepted_task_is_delivered_when_work_lands(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._local = AsyncMock(
+        return_value={"kind": "served", "output": {"relay": "accepted"}}
+    )
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "task", "arguments": '{"request":"events nearby"}'}
+    )
+    await b._native_update(
+        {
+            "type": "async_update.add",
+            "async_update": {
+                "topic": "work_landed",
+                "payload": [{"message": {"type": "text", "content": "Saturday market"}}],
+            },
+        },
+        False,
+        track=True,
+    )
+    line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
+    assert "outcome=delivered" in line
+    assert "events nearby" not in line and "Saturday" not in line
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_accepted_task_speaks_a_failure_after_the_turn(monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._desktop_tasks.timeout_s = 0.02
+    b._response_in_progress = False
+    b._local = AsyncMock(
+        return_value={"kind": "served", "output": {"relay": "accepted"}}
+    )
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "task", "arguments": '{"request":"events nearby"}'}
+    )
+    b._user_speaking = False
+    b._pending_response = False
+    b._response_requested = False
+    await asyncio.sleep(0.08)
+    updates = [
+        call.args[0]
+        for call in b._send.call_args_list
+        if call.args[0].get("type") == "async_update.add"
+    ]
+    assert updates
+    content = updates[-1]["async_update"]["payload"][0]["message"]["content"]
+    assert content == "I couldn't finish looking up events nearby."
+    line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
+    assert "outcome=timeout" in line
+    assert "events nearby" not in line
     await b.stop()

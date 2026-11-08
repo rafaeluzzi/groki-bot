@@ -5,6 +5,9 @@ import assert from 'node:assert/strict';
 import { createBridge, accountRpc, validateBody } from './gbot_voice_session_bridge.mjs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
+import { mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 async function freePort() {
   const s = createServer(); await new Promise(r => s.listen(0, '127.0.0.1', r));
@@ -233,5 +236,91 @@ test('a failed stale hangup is logged and the new call still registers', async (
     assert.equal((await pres('call-new',true)).status,200);
     assert.deepEqual(presence,['call-old:true','call-old:false','call-new:true']);
     assert.deepEqual(logs.filter(e=>e.state==='stale_hangup').map(e=>e.error_class),['upstream_http_502']);
+    assert.match(logs.find(e=>e.state==='stale_hangup').at, /^\d{4}-\d{2}-\d{2}T/);
   } finally {await new Promise(r=>server.close(r));}
+});
+
+test('HTTP 417 drops the cached sandbox and wakes it with a fresh EnsureSandBox', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  let ensures = 0;
+  const bodies = [];
+  const client = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async (method, body) => {
+      assert.equal(method, 'EnsureSandBox');
+      bodies.push(body);
+      ensures++;
+      return {gatewayUrl: `https://pod${ensures}.cursorvm.com`, gatewayToken: 'FAKE'};
+    },
+    fetcher: async () => ensures === 1
+      ? {ok: false, status: 417, body: {cancel: async () => {}}}
+      : {ok: true, status: 200, body: {cancel: async () => {}}},
+  });
+  await client.presence({agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false});
+  assert.equal(ensures, 2);
+  assert.deepEqual(bodies, [{}, {}]);
+});
+
+test('a terminated box stream is logged with a timestamp and drops the sandbox', async () => {
+  const port = await freePort();
+  let invalidated = 0;
+  const logs = [];
+  const sandbox = {
+    invalidate: () => { invalidated++; },
+    presence: async () => {},
+    callerAuthId: async () => 'owner',
+    openEvents: async () => new Response(new ReadableStream({start(controller) {
+      controller.error(new TypeError('terminated'));
+    }}), {headers: {'content-type': 'text/event-stream'}}),
+  };
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, toolsEnabled: false, sandbox,
+    transcript: {async *events() {}}, nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await fetch(`http://127.0.0.1:${port}/native/presence`, {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({agentId: 'a', callId: 'call-c', isOnTheLine: true, acceptsOverheard: false}),
+    })).status, 200);
+    const response = await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=call-c`);
+    await response.text().catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 30));
+    const error = logs.find(event => event.source === 'box' && event.state === 'error');
+    assert.equal(error.error_class, 'TypeError');
+    assert.equal(error.error_message, 'terminated');
+    assert.equal(error.frame, 'gbot_voice_session_bridge.mjs:box');
+    assert.match(error.at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(invalidated, 1);
+    assert.equal(JSON.stringify(logs).includes('SECRET'), false);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('a call left on disk is hung up before the next call registers', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-call-'));
+  const callStore = join(dir, 'call.json');
+  const presence = [];
+  const sandbox = {callerAuthId: async () => 'owner', presence: async body => { presence.push(`${body.callId}:${body.isOnTheLine}`); }};
+  const firstPort = await freePort();
+  const first = createBridge({port: firstPort, agentId: 'a', desktopEnabled: true, toolsEnabled: false, sandbox, callStore});
+  await new Promise(resolve => first.listen(firstPort, '127.0.0.1', resolve));
+  const pres = (port, callId, isOnTheLine) => fetch(`http://127.0.0.1:${port}/native/presence`, {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({agentId: 'a', callId, isOnTheLine, acceptsOverheard: false}),
+  });
+  try {
+    assert.equal((await pres(firstPort, 'call-old', true)).status, 200);
+    assert.equal(JSON.parse(readFileSync(callStore, 'utf8')).callId, 'call-old');
+  } finally { await new Promise(resolve => first.close(resolve)); }
+  const secondPort = await freePort();
+  const second = createBridge({port: secondPort, agentId: 'a', desktopEnabled: true, toolsEnabled: false, sandbox, callStore});
+  await new Promise(resolve => second.listen(secondPort, '127.0.0.1', resolve));
+  try {
+    assert.equal((await pres(secondPort, 'call-new', true)).status, 200);
+    assert.deepEqual(presence, ['call-old:true', 'call-old:false', 'call-new:true']);
+    assert.equal(JSON.parse(readFileSync(callStore, 'utf8')).callId, 'call-new');
+    await second.hangupActiveCall();
+    assert.deepEqual(presence.at(-1), 'call-new:false');
+  } finally { await new Promise(resolve => second.close(resolve)); }
 });
