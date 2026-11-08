@@ -791,6 +791,7 @@ class GbotVoiceBridge:
             kind = kind if kind in {"progress", "outcome"} else "outcome"
             task = self._desktop_tasks._oldest()
             if task is None:
+                logger.info("Grok native update topic=%s state=ignored reason=no_open_task", topic)
                 return
             log_desktop_hop(task.id, "handed", kind=kind)
             self._desktop_tasks.landed(spoken=state != "dropped", text=text)

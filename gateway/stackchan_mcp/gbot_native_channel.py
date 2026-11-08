@@ -156,7 +156,11 @@ class NativeVoiceChannel:
         return not self._closed and self._registered and self.connected.is_set()
 
     def within_reconnect_grace(self) -> bool:
-        """True when this channel was ready a moment ago and is trying again."""
+        """True when this channel was up a moment ago and is trying again.
+
+        ``_ready_mono`` is the last moment the stream was up, refreshed when it
+        drops. A stream that stayed up for minutes still gets the grace window.
+        """
         if self._closed or self._ready_mono is None:
             return False
         return (time.monotonic() - self._ready_mono) <= RECONNECT_RECENT_S
@@ -197,8 +201,11 @@ class NativeVoiceChannel:
                 was_ready = self.connected.is_set()
                 self._registered = False
                 self.connected.clear()
-                if was_ready and not self._closed and self._on_gap is not None:
-                    asyncio.create_task(self._on_gap(), name="desktop-stream-gap")
+                if was_ready:
+                    # Last moment it was up, so a long-lived stream still gets grace.
+                    self._ready_mono = time.monotonic()
+                    if not self._closed and self._on_gap is not None:
+                        asyncio.create_task(self._on_gap(), name="desktop-stream-gap")
             if not self._closed:
                 await asyncio.sleep(self._retry_delay)
 

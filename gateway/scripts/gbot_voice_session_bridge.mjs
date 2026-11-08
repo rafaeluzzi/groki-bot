@@ -146,10 +146,14 @@ export class NativeSandboxClient {
   }
   // The box stream died under us. Forget the URL so the next presence wakes a pod.
   invalidate() { this.#connection = undefined; }
-  // Health-check the box. A hibernated pod answers 417, and #fetch then runs EnsureSandBox {}.
+  // Wake a hibernated pod. /health goes through #fetch, so a 417 still drops the
+  // cache and runs EnsureSandBox. Do not open /events: a second stream makes the
+  // pod close the one this process is already reading.
   async warm() {
     try {
-      await this.probe();
+      const health = await this.#fetch('/health', {signal: AbortSignal.timeout(20000)});
+      await health.body?.cancel();
+      if (!health.ok) throw new Error(`upstream_http_${health.status}`);
     } catch {
       this.invalidate();
       await this.#connect();

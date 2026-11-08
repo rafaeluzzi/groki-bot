@@ -60,6 +60,9 @@ test('native bootstrap uses fixed read-only request and cancels bodies without r
   }});
   const result = await client.probe(); assert.equal(result.ok,true); assert.deepEqual(paths,['/health','/events']); assert.equal(cancelled,2);
   assert.equal(JSON.stringify(result).includes('FAKE'),false);
+  paths.length = 0;
+  await client.warm();
+  assert.deepEqual(paths, ['/health']);
 });
 
 test('a stale sandbox connection is dropped and re-ensured once instead of failing forever', async () => {
