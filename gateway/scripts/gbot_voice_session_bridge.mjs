@@ -5,7 +5,7 @@
  * Never persists credentials or refreshes/modifies the client's account state.
  * Internal APIs are version dependent; expired sessions must be renewed in the app.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { pbkdf2Sync, createDecipheriv, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -19,7 +19,10 @@ export const RPC_ROUTES = Object.freeze({
   'POST /session': 'VoiceCallHarnessSession',
   'POST /tool': 'VoiceCallHarnessTool',
 });
-const STALE_SANDBOX_STATUS = new Set([401, 403, 404, 410, 502, 503, 504]);
+// 417 is pod_hibernated: the box is asleep or mid-transition. Grok Bot's own
+// gateway client treats that status as "wake and reconnect". A cached URL
+// answers 417 forever until EnsureSandBox runs again.
+const STALE_SANDBOX_STATUS = new Set([401, 403, 404, 410, 417, 502, 503, 504]);
 
 export function loadAccount() {
   const data = JSON.parse(readFileSync(join(homedir(), 'Library/Application Support/Grok Bot/sand-secrets.json'), 'utf8'));
@@ -141,6 +144,8 @@ export class NativeSandboxClient {
   #drop(connection) {
     if (this.#connection === connection) this.#connection = undefined;
   }
+  // The box stream died under us. Forget the URL so the next presence wakes a pod.
+  invalidate() { this.#connection = undefined; }
   async openEvents(signal) {
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), 20000);
@@ -194,7 +199,9 @@ export class NativeTranscriptClient {
     const state = {connected: false, sinceMs: context.sinceMs, generation: null};
     try {
       for await (const bytes of response.body) {
-        pending = Buffer.concat([pending, bytes]);
+        const chunk = asBytes(bytes);
+        if (!chunk) continue;
+        pending = Buffer.concat([pending, chunk]);
         if (pending.length > 2 * 1024 * 1024) throw new Error('event_too_large');
         while (pending.length >= 5) {
           const size = pending.readUInt32BE(1), flags = pending[0];
@@ -292,10 +299,52 @@ export function validateBody(route, body) {
   return body;
 }
 
-function streamFailure(error) {
+function asBytes(value) {
+  if (value instanceof Uint8Array) return value;
+  if (typeof value === 'string') return Buffer.from(value);
+  return null;
+}
+
+function safeErrorMessage(error) {
+  const message = String(error?.message ?? '');
+  if (message === 'terminated' || message === 'fetch failed') return message;
+  if (/^upstream_http_\d{3}$/.test(message)) return message;
+  if (/^The ".{1,40}" argument must be/.test(message)) return message.slice(0, 120);
+  return null;
+}
+
+function streamFailure(error, where) {
   const status = /^upstream_http_(\d{3})$/.exec(error?.message ?? '');
   const name = ['Error', 'TypeError', 'AbortError', 'TimeoutError'].includes(error?.name) ? error.name : 'other';
-  return {http_status: status ? Number(status[1]) : null, error_class: name};
+  const failure = {http_status: status ? Number(status[1]) : null, error_class: name};
+  const message = safeErrorMessage(error);
+  if (message) failure.error_message = message;
+  if (where) failure.frame = where;
+  const cause = error?.cause?.code;
+  if (typeof cause === 'string' && /^[A-Z0-9_]{1,40}$/.test(cause)) failure.cause = cause;
+  return failure;
+}
+
+export function loadCall(path) {
+  if (!path) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    if (!parsed || typeof parsed.agentId !== 'string' || typeof parsed.callId !== 'string') return null;
+    if (!/^[A-Za-z0-9_-]{1,120}$/.test(parsed.callId)) return null;
+    return {agentId: parsed.agentId, callId: parsed.callId, acceptsOverheard: parsed.acceptsOverheard === true};
+  } catch { return null; }
+}
+
+export function rememberCall(path, call) {
+  if (!path || !call) return;
+  try {
+    writeFileSync(path, JSON.stringify({agentId: call.agentId, callId: call.callId, acceptsOverheard: call.acceptsOverheard === true}));
+  } catch { /* the call is still registered in memory */ }
+}
+
+export function forgetCall(path) {
+  if (!path) return;
+  try { unlinkSync(path); } catch { /* already gone */ }
 }
 
 function waitForNativeRetry(milliseconds, signal) {
@@ -307,13 +356,26 @@ function waitForNativeRetry(milliseconds, signal) {
   });
 }
 
-export function createBridge({ port = 18771, rpc = accountRpc, agentId = process.env.STACKCHAN_GBOT_VOICE_BOT_ID || process.env.STACKCHAN_GBOT_VOICE_AGENT_ID || process.env.STACKCHAN_TOOL_BOT_ID, toolsEnabled = process.env.STACKCHAN_GBOT_VOICE_TOOLS === '1', desktopEnabled = Boolean(process.env.STACKCHAN_TOOL_BOT?.trim()) || process.env.STACKCHAN_GBOT_VOICE_DESKTOP === '1', sandbox = new NativeSandboxClient({connectMode: 'normal'}), transcript = new NativeTranscriptClient(), nativeRetryDelayMs = 5000, nativeLog = event => console.log(JSON.stringify({event: 'gbot_native_stream', ...event})), sessionId = process.env.STACKCHAN_GBOT_VOICE_SESSION_ID || '' } = {}) {
+export function createBridge({ port = 18771, rpc = accountRpc, agentId = process.env.STACKCHAN_GBOT_VOICE_BOT_ID || process.env.STACKCHAN_GBOT_VOICE_AGENT_ID || process.env.STACKCHAN_TOOL_BOT_ID, toolsEnabled = process.env.STACKCHAN_GBOT_VOICE_TOOLS === '1', desktopEnabled = Boolean(process.env.STACKCHAN_TOOL_BOT?.trim()) || process.env.STACKCHAN_GBOT_VOICE_DESKTOP === '1', sandbox = new NativeSandboxClient({connectMode: 'normal'}), transcript = new NativeTranscriptClient(), nativeRetryDelayMs = 5000, nativeLog = event => console.log(JSON.stringify({event: 'gbot_native_stream', ...event})), sessionId = process.env.STACKCHAN_GBOT_VOICE_SESSION_ID || '', callStore = null } = {}) {
   if (!Number.isFinite(nativeRetryDelayMs) || nativeRetryDelayMs < 10 || nativeRetryDelayMs > 30000) throw new Error('invalid_native_retry_delay');
-  const logStream = (source, state, extra = {}) => nativeLog({source, state, ...extra});
+  const logStream = (source, state, extra = {}) => nativeLog({source, state, at: new Date().toISOString(), ...extra});
   let activeCall = null;
   let presenceBusy = false;
   const streams = new Set();
-  return createServer(async (req, res) => {
+  const hangupActiveCall = async () => {
+    const call = activeCall || loadCall(callStore);
+    for (const controller of streams) controller.abort();
+    activeCall = null;
+    if (!call) return;
+    try {
+      await sandbox.presence({agentId: call.agentId, callId: call.callId, isOnTheLine: false, acceptsOverheard: !!call.acceptsOverheard});
+      logStream('presence', 'shutdown_hangup', {http_status: 200, error_class: null});
+      forgetCall(callStore);
+    } catch (error) {
+      logStream('presence', 'shutdown_hangup', streamFailure(error, 'gbot_voice_session_bridge.mjs:shutdown'));
+    }
+  };
+  const server = createServer(async (req, res) => {
     const send = (status, value) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' }); res.end(JSON.stringify(value)); };
     const address = req.socket.remoteAddress;
     if (address !== '127.0.0.1' || req.headers.origin !== undefined || req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'none' || req.headers.host !== `127.0.0.1:${port}`) return send(403, { ok: false, error: 'local_client_only' });
@@ -351,16 +413,22 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
                 controller.abort();
                 break;
               }
-              logStream('typed', 'error', streamFailure(error));
+              logStream('typed', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:typed'));
             }
             await waitForNativeRetry(nativeRetryDelayMs, controller.signal);
           }
         })();
         let pending = '';
         const decoder = new TextDecoder();
-        for await (const bytes of upstream.body) {
-          if (activeCall !== context) break;
-          pending += decoder.decode(bytes, {stream: true}).replace(/\r\n/g, '\n');
+        const reader = upstream.body?.getReader?.();
+        if (!reader) throw new TypeError('terminated');
+        try {
+        while (true) {
+          const next = await reader.read();
+          if (next.done || activeCall !== context) break;
+          const chunk = asBytes(next.value);
+          if (!chunk || chunk.byteLength === 0) continue;
+          pending += decoder.decode(chunk, {stream: true}).replace(/\r\n/g, '\n');
           if (pending.length > 2 * 1024 * 1024) throw new Error('event_too_large');
           let end;
           while ((end = pending.indexOf('\n\n')) !== -1) {
@@ -382,9 +450,15 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
             if (context.seen.size > 2000) context.seen.delete(context.seen.values().next().value);
           }
         }
+        } finally { reader.releaseLock?.(); }
         if (!controller.signal.aborted) logStream('box', 'eof', {http_status: null, error_class: null});
       } catch (error) {
-        if (!controller.signal.aborted) logStream('box', 'error', streamFailure(error));
+        if (!controller.signal.aborted) {
+          logStream('box', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:box'));
+          // undici raises TypeError "terminated" when the pod closes the SSE socket.
+          // The cached gateway URL is the asleep box; drop it so the next presence wakes.
+          if (error?.name === 'TypeError') sandbox.invalidate?.();
+        }
         if (!res.headersSent) send(502, {ok: false, error: 'native_stream_failed'});
       } finally {
         controller.abort();
@@ -422,15 +496,21 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (activeCall && body.callId !== activeCall.callId) {
           // A foreign callId may only hang up its own call; never clear someone else's.
           if (!body.isOnTheLine) return send(409, {ok: false, error: 'call_conflict'});
-          // New gateway session (new callId) taking over a stale call left by a gateway-only restart.
+          // New gateway session (new callId) taking over a call this process still has.
           for (const controller of streams) controller.abort();
           stale = activeCall;
           activeCall = null;
+        } else if (!activeCall && body.isOnTheLine) {
+          // SIGKILL of the gateway or SIGTERM of this helper drops the in-memory call.
+          // The call id on disk is the one to hang up before the new call registers.
+          const stored = loadCall(callStore);
+          if (stored && stored.callId !== body.callId) stale = stored;
         }
         presenceBusy = true;
         try {
-        // Grok keeps one call on the line per desktop and answers 417 to a new one until the old
-        // call hangs up, which otherwise only a Grok Bot relaunch does.
+        // HTTP 417 is a hibernated box, not a second voice call. Hanging up still
+        // matters for a call left on the line after -9/-15. The hangup itself
+        // re-ensures when the cached pod answers 417.
         if (stale) {
           try {
             await sandbox.presence({agentId: stale.agentId, callId: stale.callId, isOnTheLine: false, acceptsOverheard: stale.acceptsOverheard});
@@ -444,8 +524,10 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (body.isOnTheLine) {
           if (!activeCall) activeCall = {agentId, callId: body.callId, acceptsOverheard: body.acceptsOverheard, sessionId, authId, sinceMs: Date.now(), seen: new Set()};
           else activeCall.acceptsOverheard = body.acceptsOverheard;
+          rememberCall(callStore, activeCall);
         } else {
           activeCall = null; for (const controller of streams) controller.abort();
+          forgetCall(callStore);
         }
         return send(200, {ok: true});
         } finally { presenceBusy = false; }
@@ -465,12 +547,27 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       return send(502, { ok: false, error: safe });
     }
   });
+  server.hangupActiveCall = hangupActiveCall;
+  return server;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const port = Number(process.env.GBOT_VOICE_BRIDGE_PORT || 18771);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('invalid_port');
-  const server = createBridge({ port });
+  const callStore = join(homedir(), 'Library', 'Logs', 'groki-native-call.json');
+  const server = createBridge({ port, callStore });
   server.requestTimeout = 25000;
-  server.listen(port, '127.0.0.1', () => console.log(`Grok Bot voice session bridge listening on 127.0.0.1:${port}`));
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    Promise.resolve(server.hangupActiveCall()).finally(() => server.close(() => process.exit(0)));
+  };
+  process.once('SIGTERM', shutdown);
+  process.once('SIGINT', shutdown);
+  // A previous helper exited -15 without this handler, or the gateway was -9.
+  // Hang that call up (a 417 here re-ensures the asleep pod) before listening.
+  server.hangupActiveCall().finally(() => {
+    server.listen(port, '127.0.0.1', () => console.log(`Grok Bot voice session bridge listening on 127.0.0.1:${port}`));
+  });
 }

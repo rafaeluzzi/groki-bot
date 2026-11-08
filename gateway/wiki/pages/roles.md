@@ -25,6 +25,7 @@ Owns conversation and relay:
 - `show_panel` / `dismiss_panel`
 - Future Home Assistant / MQTT home control
 - Mac tools only when the user names the Mac
+- Desktop tasks (`send_task`) only when the desktop channel is up. If it is down, say desktop tasks are down or answer from what you know. Do not promise to come back later. An accepted task is spoken when it finishes, or as a short failure if it does not
 - Failover path via the iMac router (bridge ↔ xAI)
 
 Do not run two competing brains. The wiki is shared memory, not a third thinker.

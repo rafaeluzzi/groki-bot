@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 
+from .desktop_tasks import DesktopTasks, log_desktop_task
 from .voice_output_queue import VoiceOutputQueue
 from .gbot_native_channel import NativeVoiceChannel
 
@@ -198,6 +199,10 @@ class GbotVoiceBridge:
         self._resampler = Pcm16To24()
         self._stopped = False
         self.running = False
+        self._desktop_tasks = DesktopTasks(
+            announce=self._announce_desktop,
+            channel_ready=self._desktop_channel_ready,
+        )
         self.metrics = {
             "input_pcm_bytes": 0,
             "output_pcm_bytes": 0,
@@ -459,9 +464,12 @@ class GbotVoiceBridge:
         if "end_the_call" in self._remote_tools:
             instructions = instructions.replace("end_conversation", "end_the_call")
         return instructions + (
-            "\nOnly call tools declared in this session. For desktop tasks use native "
-            "send_task(request); report acceptance only after relay=accepted. "
-            "If send_task is not declared, desktop delegation is unavailable. "
+            "\nOnly call tools declared in this session. "
+            "Use send_task only when it is declared. "
+            "If send_task is not declared, or its result says desktop tasks are down, "
+            "say desktop tasks are down or answer from what you know. "
+            "Do not promise to look it up later or get back to them. "
+            "If relay=accepted, a later result or a short failure is spoken even after this turn; do not invent the result. "
             "When a tool result includes spoken, read only spoken to the user; do not read relay, errorClass, "
             "error codes, field names or debug info."
         )
@@ -498,9 +506,9 @@ class GbotVoiceBridge:
         return {
             "relay": "unreachable",
             "spoken": (
-                "The desktop assistant is not connected yet. Please try again shortly."
+                "Desktop tasks are down right now."
                 if code == "native_not_ready"
-                else "The desktop assistant cannot take tasks right now. Please try again shortly."
+                else "The desktop assistant cannot take that task right now."
             ),
             "errorClass": "voice_bridge",
         }
@@ -636,7 +644,36 @@ class GbotVoiceBridge:
         self._pending_response = True
         await self._flush_pending()
 
-    async def _native_update(self, event, is_user):
+    def _desktop_channel_ready(self) -> bool:
+        native = self._native
+        return bool(
+            native and getattr(native, "ready", False) and self.running and not self._stopped
+        )
+
+    async def _announce_desktop(self, text: str) -> bool:
+        if self._stopped or not self.running:
+            return False
+        return await self._announce_result(text)
+
+    def take_desktop_work(self) -> list:
+        return self._desktop_tasks.export_for_handoff()
+
+    async def say_desktop_later(self, item: dict) -> bool:
+        """Speak a result the previous voice session could not, or keep its timer."""
+        if item.get("open"):
+            self._desktop_tasks.adopt(item)
+            return True
+        if self._stopped or not self.running:
+            return False
+        said = await self._announce_desktop(item.get("text") or "")
+        if said:
+            log_desktop_task(str(item["id"]), str(item["start"]), str(item["outcome"]))
+        return said
+
+    async def _native_from_channel(self, event, is_user):
+        await self._native_update(event, is_user, track=True)
+
+    async def _native_update(self, event, is_user, *, track=False):
         topic = event.get("async_update", {}).get("topic")
         topic = topic if topic in {"work_landed", "user_message"} else "other"
         state = "dropped" if self._stopped or not self.running else "queued"
@@ -644,6 +681,14 @@ class GbotVoiceBridge:
         key = topic + ":" + state
         counts[key] = counts.get(key, 0) + 1
         logger.info("Grok native update topic=%s state=%s", topic, state)
+        if track and topic == "work_landed" and not is_user:
+            text = ""
+            payload = event.get("async_update", {}).get("payload") or []
+            if payload and isinstance(payload[0], dict):
+                content = (payload[0].get("message") or {}).get("content")
+                if isinstance(content, str):
+                    text = content
+            self._desktop_tasks.landed(spoken=state != "dropped", text=text)
         if self._stopped or not self.running:
             return
         if is_user:
@@ -830,7 +875,7 @@ class GbotVoiceBridge:
                     self.url,
                     self.agent_id,
                     self.call_id,
-                    self._native_update,
+                    self._native_from_channel,
                 )
                 await self._native.start()
             self.metrics["startup_stage"] = "started"
@@ -1120,15 +1165,15 @@ class GbotVoiceBridge:
                 self._native and self._native.ready
             ):
                 outcome = "native_not_ready"
-                result = (
-                    self._desktop_failure("native_not_ready")
-                    if name == "send_task"
-                    else {
+                if name == "send_task":
+                    self._desktop_tasks.refuse()
+                    result = self._desktop_failure("native_not_ready")
+                else:
+                    result = {
                         "ok": False,
-                        "error": "The desktop assistant is not connected yet. Please try again shortly.",
-                        "spoken": "The desktop assistant is not connected yet. Please try again shortly.",
+                        "error": "Desktop tasks are down right now.",
+                        "spoken": "Desktop tasks are down right now.",
                     }
-                )
             elif name == "send_task":
                 request = arguments.get("request")
                 if (
@@ -1165,6 +1210,8 @@ class GbotVoiceBridge:
                     )
                     result = self._native_tool_result("send_task", result)
                     outcome = "native_" + result["relay"]
+                    if result.get("relay") == "accepted":
+                        self._desktop_tasks.start(request)
             elif name == "end_the_call":
                 result = {"ok": True}
                 if self._on_end_conversation:
@@ -1248,6 +1295,7 @@ class GbotVoiceBridge:
 
     async def stop(self):
         self._stopped = True
+        await self._desktop_tasks.aclose()
         self._cancel_idle()
         self._pending_updates.clear()
         self._pending_response = False

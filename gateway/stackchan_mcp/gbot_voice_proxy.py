@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 import logging
 import time
 
+from .desktop_tasks import log_desktop_task
 from .gbot_voice_bridge import GbotVoiceBridge
 from .gemini_voice_proxy import GeminiVoiceProxy
 from .koji_wiki import publish_bridge_presence
@@ -24,6 +25,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
     reconnect_initial_delay_s: float = 1.0
     reconnect_max_delay_s: float = 30.0
     _health_task: asyncio.Task | None = field(default=None, init=False)
+    _desktop_unsaid: list = field(default_factory=list, init=False)
     _health: dict = field(default_factory=lambda: {
         "provider": "gbot_voice", "state": "stopped", "reconnect_attempts": 0,
         "successful_checks": 0, "last_verified_at": None, "last_check_at": None,
@@ -145,6 +147,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
                     continue
             self._record_connection(False, self._health["last_error"] or "connection_lost")
             await self._abort_in_flight_tts()
+            self._take_desktop_work()
             await super().stop()
             # The supervisor owns recovery; explicit stop cancels this task.
             self._stopped = False
@@ -154,7 +157,36 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             self._record_connection(connected, None if connected else self._health["last_error"])
             if connected:
                 checked_at = asyncio.get_running_loop().time()
+                await self._flush_desktop_work()
             delay = min(self.reconnect_max_delay_s, delay * 2)
+
+    def _take_desktop_work(self):
+        bridge = self._bridge
+        take = getattr(bridge, "take_desktop_work", None)
+        if callable(take):
+            self._desktop_unsaid.extend(take())
+
+    async def _flush_desktop_work(self):
+        bridge = self._bridge
+        say = getattr(bridge, "say_desktop_later", None)
+        if not callable(say):
+            return
+        pending, self._desktop_unsaid = self._desktop_unsaid, []
+        still = []
+        for item in pending:
+            try:
+                ok = await say(item)
+            except Exception:
+                logger.warning("desktop task handoff failed id=%s", item.get("id"))
+                ok = False
+            if not ok:
+                still.append(item)
+        self._desktop_unsaid = still + self._desktop_unsaid
+
+    def _abandon_desktop_work(self):
+        for item in self._desktop_unsaid:
+            log_desktop_task(str(item.get("id")), str(item.get("start")), "failed")
+        self._desktop_unsaid.clear()
 
     async def stop(self):
         task, self._health_task = self._health_task, None
@@ -162,6 +194,8 @@ class GbotVoiceProxy(GeminiVoiceProxy):
         if task is not None and task is not asyncio.current_task():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        self._take_desktop_work()
+        self._abandon_desktop_work()
         await self._abort_in_flight_tts()
         await super().stop()
         self._health["state"] = "stopped"
