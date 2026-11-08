@@ -671,6 +671,7 @@ async def test_unavailable_send_task_logs_channel_down(monkeypatch, caplog):
     )
     line = next(r.getMessage() for r in caplog.records if r.message.startswith("desktop task"))
     assert "outcome=channel_down" in line
+    assert "waited_ms=0" in line
     assert "events nearby" not in line
     await b.stop()
 
@@ -736,4 +737,111 @@ async def test_accepted_task_speaks_a_failure_after_the_turn(monkeypatch, caplog
     line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
     assert "outcome=timeout" in line
     assert "events nearby" not in line
+    await b.stop()
+
+
+class _GraceChannel:
+    def __init__(self, *, recent):
+        self.ready = False
+        self.recent = recent
+
+    def within_reconnect_grace(self):
+        return self.recent
+
+    async def close(self):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_reconnect_grace_sends_when_the_channel_returns(monkeypatch, caplog):
+    import asyncio
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    channel = _GraceChannel(recent=True)
+    b._native = channel
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+
+    async def recover():
+        await asyncio.sleep(0.08)
+        channel.ready = True
+
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    waiter = asyncio.create_task(recover())
+    await b._tool(
+        {"name": "send_task", "call_id": "blip", "arguments": '{"request":"weekend weather"}'}
+    )
+    await waiter
+    b._local.assert_awaited()
+    raw = next(
+        c.args[0]["item"]["output"]
+        for c in b._send.call_args_list
+        if c.args[0]["type"] == "conversation.item.create"
+    )
+    assert "Desktop tasks are down" not in raw
+    await b._native_update(
+        {
+            "type": "async_update.add",
+            "async_update": {
+                "topic": "work_landed",
+                "payload": [{"message": {"type": "text", "content": "Warm and dry."}}],
+            },
+        },
+        False,
+        track=True,
+    )
+    line = next(r.getMessage() for r in caplog.records if "outcome=delivered" in r.message)
+    waited = int(line.split("waited_ms=")[1])
+    assert 0 < waited < 8000
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_long_outage_fails_without_waiting(monkeypatch, caplog):
+    import logging
+    import time
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._native = _GraceChannel(recent=False)
+    b._local = AsyncMock()
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    started = time.monotonic()
+    await b._tool(
+        {"name": "send_task", "call_id": "down", "arguments": '{"request":"weekend weather"}'}
+    )
+    assert time.monotonic() - started < 0.4
+    b._local.assert_not_awaited()
+    line = next(r.getMessage() for r in caplog.records if r.message.startswith("desktop task"))
+    assert "outcome=channel_down" in line
+    assert "waited_ms=0" in line
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_grace_that_does_not_recover_logs_the_wait(monkeypatch, caplog):
+    import logging
+
+    import stackchan_mcp.gbot_voice_bridge as bridge
+
+    monkeypatch.setattr(bridge, "RECONNECT_GRACE_S", 0.12)
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._native = _GraceChannel(recent=True)
+    b._local = AsyncMock()
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "stuck", "arguments": '{"request":"weekend weather"}'}
+    )
+    b._local.assert_not_awaited()
+    line = next(r.getMessage() for r in caplog.records if "outcome=channel_down" in r.message)
+    waited = int(line.split("waited_ms=")[1])
+    assert waited >= 100
+    raw = next(
+        c.args[0]["item"]["output"]
+        for c in b._send.call_args_list
+        if c.args[0]["type"] == "conversation.item.create"
+    )
+    assert "Desktop tasks are down right now." in raw
     await b.stop()

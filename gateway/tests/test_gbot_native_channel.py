@@ -3,12 +3,32 @@
 """The authenticated helper boundary, using client-native update envelopes."""
 
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 from aiohttp import web
 import pytest
 
-from stackchan_mcp.gbot_native_channel import NativeVoiceChannel, update_event
+from stackchan_mcp.gbot_native_channel import (
+    RECONNECT_GRACE_S,
+    RECONNECT_RECENT_S,
+    NativeVoiceChannel,
+    update_event,
+)
+
+
+def test_reconnect_grace_covers_only_a_recent_ready_channel():
+    assert RECONNECT_GRACE_S == 8
+    assert RECONNECT_RECENT_S == 30
+    channel = NativeVoiceChannel(None, "http://127.0.0.1", "a", "c", None)
+    assert channel.within_reconnect_grace() is False
+    channel._ready_mono = time.monotonic()
+    assert channel.within_reconnect_grace() is True
+    channel._ready_mono = time.monotonic() - 31
+    assert channel.within_reconnect_grace() is False
+    channel._closed = True
+    channel._ready_mono = time.monotonic()
+    assert channel.within_reconnect_grace() is False
 
 
 def test_work_landed_is_native_data_and_cannot_grant_new_user_authority():

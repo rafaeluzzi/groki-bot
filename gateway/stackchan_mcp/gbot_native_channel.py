@@ -18,6 +18,12 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# A send_task during a short reconnect waits this long for the box stream to return.
+RECONNECT_GRACE_S = 8.0
+# Ready more recently than this is a blip (the pod drops the socket and presence
+# returns within a few seconds). Down longer than this fails at once.
+RECONNECT_RECENT_S = 30.0
+
 # The helper already reduces its errors to fixed words such as upstream_http_429.
 NATIVE_ERROR_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
 
@@ -107,6 +113,7 @@ class NativeVoiceChannel:
         self._typed_seen = set()
         self._presence_status = None
         self._error = None
+        self._ready_mono = None
         self.connected = asyncio.Event()
 
     async def _presence(self, on):
@@ -137,6 +144,12 @@ class NativeVoiceChannel:
     @property
     def ready(self):
         return not self._closed and self._registered and self.connected.is_set()
+
+    def within_reconnect_grace(self) -> bool:
+        """True when this channel was ready a moment ago and is trying again."""
+        if self._closed or self._ready_mono is None:
+            return False
+        return (time.monotonic() - self._ready_mono) <= RECONNECT_RECENT_S
 
     def health(self):
         """Desktop readiness for voice-health. Same condition as native_not_ready."""
@@ -198,6 +211,7 @@ class NativeVoiceChannel:
                 self._error = await helper_error(response)
                 raise RuntimeError("native_events_unavailable")
             self._error = None
+            self._ready_mono = time.monotonic()
             self.connected.set()
             logger.info("Grok native channel state=ready")
             data, length = [], 0

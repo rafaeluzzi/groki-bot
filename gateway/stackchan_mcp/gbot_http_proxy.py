@@ -35,12 +35,14 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-try:  # Same .env as the gateway, so one file configures both processes.
-    from dotenv import load_dotenv
+# Tests set STACKCHAN_SKIP_DOTENV so a developer .env cannot change the bot under test.
+if os.getenv("STACKCHAN_SKIP_DOTENV") != "1":
+    try:  # Same .env as the gateway, so one file configures both processes.
+        from dotenv import load_dotenv
 
-    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-except ImportError:  # pragma: no cover - python-dotenv is a core dependency
-    pass
+        load_dotenv(Path(__file__).resolve().parents[1] / ".env")
+    except ImportError:  # pragma: no cover - python-dotenv is a core dependency
+        pass
 
 from .gbot_client import (
     GrokBotClient,
