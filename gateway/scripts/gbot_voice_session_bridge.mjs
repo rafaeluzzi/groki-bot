@@ -245,16 +245,22 @@ export function filterTranscriptFrame(frame, context, state) {
   }
   const rows = frame.rows;
   // Replay frames still carry box replies from a gap. User messages reject replay below.
-  if (!state.connected || !rows || rows.agentId !== context.agentId || (rows.sessionId || '') !== context.sessionId || !Number.isSafeInteger(rows.generation)) return [];
-  if (state.generation !== null && rows.generation !== state.generation) throw new Error('transcript_rebaseline_required');
-  state.generation = rows.generation;
+  if (!state.connected || !rows || rows.agentId !== context.agentId || (rows.sessionId || '') !== context.sessionId) return [];
+  // Replay rows arrive with only agentId, entries and replay: no generation.
+  // Without one, only box replies pass; user messages stay fail-closed.
+  const versioned = Number.isSafeInteger(rows.generation);
+  if (versioned) {
+    if (state.generation !== null && rows.generation !== state.generation) throw new Error('transcript_rebaseline_required');
+    state.generation = rows.generation;
+  }
+  const replay = rows.replay === true || !versioned;
   const result = [];
   for (const row of rows.entries ?? []) {
     // No blob reads, omitted-body reads or history snapshots are performed.
     if (typeof row.body !== 'string' || row.bodyOmitted) continue;
     let entry;
     try { entry = JSON.parse(Buffer.from(row.body, 'base64').toString('utf8')); } catch { continue; }
-    const event = filterNativeEvent({channel: 'transcript', payload: {type: 'appended', entry, ordered: {replicaKey: 'transcript:' + context.agentId, sequence: 0}}}, {...context, sinceMs: state.sinceMs, replay: rows.replay === true});
+    const event = filterNativeEvent({channel: 'transcript', payload: {type: 'appended', entry, ordered: {replicaKey: 'transcript:' + context.agentId, sequence: 0}}}, {...context, sinceMs: state.sinceMs, replay});
     if (event) result.push(event);
   }
   return result;
@@ -544,9 +550,13 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (!res.headersSent) send(502, {ok: false, error: 'native_stream_failed'});
       } finally {
         controller.abort();
-        await typedTask;
         streams.delete(controller);
+        // End downstream first: the gateway reconnects (and replays the gap) on EOF,
+        // and must not sit on its 60s read timeout while the transcript loop stops.
         res.end();
+        const slow = setTimeout(() => logStream('typed', 'slow_stop', {http_status: null, error_class: null}), 5000);
+        await typedTask;
+        clearTimeout(slow);
       }
       return;
     }

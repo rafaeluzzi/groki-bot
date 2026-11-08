@@ -197,3 +197,40 @@ async def test_quiet_after_a_real_answer_finishes_without_a_failure_phrase():
     assert tasks._open == {}
     assert spoken == []
     assert tasks._finished and tasks._finished[0].request == "Saturday market"
+
+
+@pytest.mark.asyncio
+async def test_gap_replies_replayed_after_reconnect_land_on_their_own_tasks(caplog):
+    # 2026-11-08 16:52: Cary sent during a slow warm, Durham 25s later. All three box
+    # replies landed in a 60s stream hole and arrive together on transcript replay.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    spoken = []
+
+    async def announce(text):
+        spoken.append(text)
+        return True
+
+    tasks = _tracker(announce, timeout_s=0.3)
+    tasks.quiet_s = 30
+    cary = tasks.start("Indoor events in Cary")
+    durham = tasks.start("Durham events this weekend")
+    base = 1_794_000_000_000
+    tasks._open[cary].started_ms = base  # 21:52:06.993
+    tasks._open[durham].started_ms = base + 25_127  # 21:52:32.120
+
+    holding = tasks.accept_reply("t43s0", "I'm looking up indoor events in Cary now.", base + 7_049)
+    cary_list = tasks.accept_reply("t43s1", "I found eight indoor options in Cary.", base + 23_746)
+    durham_list = tasks.accept_reply("t44s0", "Durham has a busy weekend.", base + 34_375)
+    replay_again = tasks.accept_reply("t43s1", "I found eight indoor options in Cary.", base + 23_746)
+
+    assert holding["task_id"] == cary
+    assert cary_list["task_id"] == cary
+    assert durham_list["task_id"] == durham
+    assert replay_again is None
+    await asyncio.sleep(0.5)
+    assert spoken == []
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"id={cary} hop=timeout_skipped" in m for m in messages)
+    assert any(f"id={durham} hop=timeout_skipped" in m for m in messages)
+    assert not any("outcome=timeout" in m for m in messages)
+    await tasks.aclose()

@@ -33,7 +33,9 @@ DESKTOP_TASK_TIMEOUT_S = 90.0
 # the 90s failure clock. Anything later is spoken once as a late result.
 DESKTOP_TASK_QUIET_S = 12.0
 # A reply stamped just before we logged the task start still belongs to it.
-REPLY_SKEW_MS = 3000
+# Transcript request stamps land within ~40 ms of our start log, and a reply takes
+# seconds. 3s credited the Cary list (21:52:30.7) to Durham, sent at 21:52:32.1.
+REPLY_SKEW_MS = 1000
 # The channel was up, and no reply had arrived.
 TIMEOUT_UP_PHRASE = "That one didn't come back in time."
 # The channel was down when the wait ended.
