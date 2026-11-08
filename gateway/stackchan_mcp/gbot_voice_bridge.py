@@ -17,7 +17,6 @@ import re
 import struct
 import time
 import uuid
-from datetime import datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
@@ -27,6 +26,10 @@ from .voice_output_queue import VoiceOutputQueue
 from .gbot_native_channel import RECONNECT_GRACE_S, WARM_SKIP_S, NativeVoiceChannel
 
 logger = logging.getLogger(__name__)
+
+# Koji's follow-up mic aborts an in-flight desktop reply. Wait this long for a
+# real user transcript before saying the cancel was the mic, not the person.
+DESKTOP_RESEND_WAIT_S = 2.0
 
 
 class Pcm16To24:
@@ -203,9 +206,11 @@ class GbotVoiceBridge:
         self._desktop_tasks = DesktopTasks(
             announce=self._announce_desktop,
             channel_ready=self._desktop_channel_ready,
-            lookup=self._lookup_desktop_answer,
         )
-        self._nudge_seen: set[str] = set()
+        self._async_sent: list = []
+        self._desktop_live: dict = {}
+        self._resend_slots: list = []
+        self._resend_wait_s = DESKTOP_RESEND_WAIT_S
         self._used_mono = None
         self._warm_task = None
         self.metrics = {
@@ -633,9 +638,12 @@ class GbotVoiceBridge:
             return
         while self._pending_updates:
             event = self._pending_updates.pop(0)
+            slot = event.pop("_desktop_slot", None) if isinstance(event, dict) else None
             # Client-native orchestrated updates do not reserve a manual
             # response slot: the server may choose not to create a response.
             await self._send(event)
+            if isinstance(event, dict) and event.get("type") == "async_update.add":
+                self._async_sent.append(slot)
             topic = event.get("async_update", {}).get("topic")
             topic = topic if topic in {"work_landed", "user_message"} else "other"
             counts = self.metrics["native_updates"]
@@ -674,8 +682,21 @@ class GbotVoiceBridge:
         if item.get("open"):
             self._desktop_tasks.adopt(item)
             return True
+        if item.get("remember"):
+            self._desktop_tasks.remember(item)
+            return True
         if self._stopped or not self.running:
             return False
+        if item.get("reply"):
+            slot = {
+                "task_id": str(item.get("id") or ""),
+                "started": str(item.get("start") or ""),
+                "waited_ms": int(item.get("waited_ms") or 0),
+                "say": item.get("text") or "",
+                "resent": False,
+                "settled": False,
+            }
+            return await self._announce_result(item.get("text") or "", slot=slot)
         said = await self._announce_desktop(item.get("text") or "")
         if said:
             log_desktop_task(
@@ -714,33 +735,16 @@ class GbotVoiceBridge:
             self._used_mono = time.monotonic()
 
     async def _on_native_gap(self) -> None:
-        """The box stream dropped. One status read covers a result that arrived in the gap."""
-        if not self._desktop_tasks._open:
-            return
-        task = self._desktop_tasks._oldest()
+        """The box stream dropped. The transcript backfill speaks anything it missed."""
+        task = self._desktop_tasks.oldest()
         if task is not None:
             log_desktop_hop(task.id, "stream_gap")
-        await self._desktop_tasks.recover()
 
-    async def _lookup_desktop_answer(self):
-        if self._http is None:
-            return None
-        task = self._desktop_tasks._oldest()
-        payload = {"agentId": self.agent_id, "callId": self.call_id}
+    async def _on_native_signal(self) -> None:
+        """A nudge arrived. It is not spoken; the transcript entry is the result."""
+        task = self._desktop_tasks.oldest()
         if task is not None:
-            payload["request"] = task.request[:1500]
-            try:
-                payload["sinceMs"] = int(datetime.fromisoformat(task.started).timestamp() * 1000)
-            except ValueError:
-                pass
-        try:
-            result = await self._local("/native/call", payload)
-        except Exception:
-            return None
-        answer = result.get("answer") if isinstance(result, dict) else None
-        if not isinstance(answer, str) or not answer.strip():
-            return None
-        return answer
+            log_desktop_hop(task.id, "signal")
 
     async def _wait_for_native(self) -> int:
         """Wait out a short reconnect. Returns how long the wait lasted, in ms.
@@ -765,6 +769,70 @@ class GbotVoiceBridge:
     async def _native_from_channel(self, event, is_user):
         await self._native_update(event, is_user, track=True)
 
+    def _note_user_followed(self) -> None:
+        for slot in self._resend_slots:
+            slot["user_followed"] = True
+
+    def _schedule_resend(self, slot: dict) -> None:
+        # TODO(koji): Koji's follow-up mic aborts an in-flight desktop result
+        # (Portal interrupt → response.cancel) before the answer is heard.
+        # Stop opening that mic over an async_update. This one re-send is a stopgap.
+        waiter = asyncio.create_task(self._resend_after(slot), name="desktop-resend")
+        slot["resend_task"] = waiter
+        self._resend_slots.append(slot)
+
+    async def _resend_after(self, slot: dict) -> None:
+        try:
+            await asyncio.sleep(self._resend_wait_s)
+        except asyncio.CancelledError:
+            return
+        if slot.get("user_followed") or slot.get("resent") or self._stopped or not self.running:
+            return
+        slot["resent"] = True
+        await self._announce_result(
+            slot["say"],
+            slot={
+                "task_id": slot["task_id"],
+                "started": slot["started"],
+                "waited_ms": slot["waited_ms"],
+                "say": slot["say"],
+                "resent": True,
+                "settled": False,
+            },
+        )
+
+    def _settle_spoken(self, slot: dict) -> None:
+        if slot.get("settled"):
+            return
+        slot["settled"] = "spoken"
+        log_desktop_hop(slot["task_id"], "spoken")
+        log_desktop_task(
+            slot["task_id"], slot["started"], "delivered", waited_ms=slot["waited_ms"]
+        )
+
+    def _settle_cancelled(self, slot: dict) -> None:
+        if slot.get("settled"):
+            return
+        slot["settled"] = "cancelled"
+        log_desktop_hop(slot["task_id"], "cancelled")
+        log_desktop_task(
+            slot["task_id"], slot["started"], "cancelled", waited_ms=slot["waited_ms"]
+        )
+        if not slot.get("resent"):
+            self._schedule_resend(slot)
+
+    def _settle_desktop_response(self, response_id, event) -> None:
+        slot = self._desktop_live.pop(response_id, None)
+        if slot is None or slot.get("settled"):
+            return
+        status = (event.get("response") or {}).get("status") if isinstance(event, dict) else None
+        cancelled = response_id in self._suppressed or status in {"cancelled", "canceled"}
+        audio = self.audio_bytes_by_response.get(response_id, 0) > 0
+        if cancelled:
+            self._settle_cancelled(slot)
+        elif audio and status not in {"failed"}:
+            self._settle_spoken(slot)
+
     async def _native_update(self, event, is_user, *, track=False):
         topic = event.get("async_update", {}).get("topic")
         topic = topic if topic in {"work_landed", "user_message"} else "other"
@@ -774,30 +842,55 @@ class GbotVoiceBridge:
         counts[key] = counts.get(key, 0) + 1
         logger.info("Grok native update topic=%s state=%s", topic, state)
         if track and topic == "work_landed" and not is_user:
-            event_id = event.get("event_id")
-            if isinstance(event_id, str) and event_id in self._nudge_seen:
-                return
-            if isinstance(event_id, str):
-                self._nudge_seen.add(event_id)
-                if len(self._nudge_seen) > 2000:
-                    self._nudge_seen.clear()
+            entry_id = event.get("desktop_entry") or event.get("event_id") or ""
+            if not isinstance(entry_id, str) or not entry_id:
+                entry_id = "anon-" + uuid.uuid4().hex
             text = ""
+            at_ms = int(time.time() * 1000)
             payload = event.get("async_update", {}).get("payload") or []
             if payload and isinstance(payload[0], dict):
                 content = (payload[0].get("message") or {}).get("content")
                 if isinstance(content, str):
                     text = content
-            kind = event.get("desktop_kind")
-            kind = kind if kind in {"progress", "outcome"} else "outcome"
-            task = self._desktop_tasks._oldest()
-            if task is None:
-                logger.info("Grok native update topic=%s state=ignored reason=no_open_task", topic)
+                stamp = payload[0].get("timestampMs")
+                if isinstance(stamp, (int, float)):
+                    at_ms = int(stamp)
+            if entry_id in self._desktop_tasks._seen:
+                logger.info("Grok native update topic=%s state=ignored reason=duplicate", topic)
                 return
-            log_desktop_hop(task.id, "handed", kind=kind)
-            self._desktop_tasks.landed(spoken=state != "dropped", text=text)
+            decision = self._desktop_tasks.accept_reply(entry_id, text, at_ms)
+            if decision is None:
+                logger.info("Grok native update topic=%s state=ignored reason=no_task", topic)
+                return
+            say = decision["say"]
+            event = {
+                "type": "async_update.add",
+                "event_id": event.get("event_id") or entry_id,
+                "async_update": {
+                    "topic": "work_landed",
+                    "payload": [
+                        {
+                            "message": {"type": "text", "content": say},
+                            "timestampMs": at_ms,
+                        }
+                    ],
+                },
+                "_desktop_slot": {
+                    "task_id": decision["task_id"],
+                    "started": decision["started"],
+                    "waited_ms": decision["waited_ms"],
+                    "say": say,
+                    "resent": False,
+                    "settled": False,
+                },
+            }
         if self._stopped or not self.running:
+            slot = event.get("_desktop_slot") if isinstance(event, dict) else None
+            if isinstance(slot, dict):
+                self._desktop_tasks.stash(slot)
             return
         if is_user:
+            self._note_user_followed()
             self._user_epoch += 1
             self._cancel_idle()
             if self._executor:
@@ -806,26 +899,26 @@ class GbotVoiceBridge:
         self._pending_updates.append(event)
         await self._flush_pending()
 
-    async def _announce_result(self, text):
+    async def _announce_result(self, text, slot=None):
         # Shared executor already labels this as untrusted result data.
         if self._stopped:
             return False
-        await self._native_update(
-            {
-                "type": "async_update.add",
-                "event_id": "local-result-" + str(uuid.uuid4()),
-                "async_update": {
-                    "topic": "work_landed",
-                    "payload": [
-                        {
-                            "message": {"type": "text", "content": text},
-                            "timestampMs": int(time.time() * 1000),
-                        }
-                    ],
-                },
+        event = {
+            "type": "async_update.add",
+            "event_id": "local-result-" + str(uuid.uuid4()),
+            "async_update": {
+                "topic": "work_landed",
+                "payload": [
+                    {
+                        "message": {"type": "text", "content": text},
+                        "timestampMs": int(time.time() * 1000),
+                    }
+                ],
             },
-            False,
-        )
+        }
+        if slot is not None:
+            event["_desktop_slot"] = slot
+        await self._native_update(event, False)
         return True
 
     @property
@@ -976,6 +1069,7 @@ class GbotVoiceBridge:
             if self._desktop_enabled:
                 stage = "native_presence"
                 self.metrics["startup_stage"] = stage
+                logger.info("desktop call start id=%s", self.call_id)
                 self._native = NativeVoiceChannel(
                     self._http,
                     self.url,
@@ -983,6 +1077,7 @@ class GbotVoiceBridge:
                     self.call_id,
                     self._native_from_channel,
                     on_gap=self._on_native_gap,
+                    on_signal=self._on_native_signal,
                 )
                 await self._native.start()
             self.metrics["startup_stage"] = "started"
@@ -1096,6 +1191,9 @@ class GbotVoiceBridge:
         self._drop_until_response = True
         if self._active_response:
             self._suppressed.add(self._active_response)
+            slot = self._desktop_live.pop(self._active_response, None)
+            if slot is not None:
+                self._settle_cancelled(slot)
         await self._output.cancel()
         self._turn_task = None
         await self._on_interrupt()
@@ -1123,6 +1221,11 @@ class GbotVoiceBridge:
                 if trigger in {"async_update", "server_vad", "response_create"}
                 else "other"
             )
+            if trigger == "async_update" and self._async_sent:
+                pending = self._async_sent.pop(0)
+                if pending is not None and self._active_response:
+                    pending["response_id"] = self._active_response
+                    self._desktop_live[self._active_response] = pending
             self._response_triggers[self._active_response] = trigger
             counts = self.metrics["response_triggers"]
             counts[trigger] = counts.get(trigger, 0) + 1
@@ -1176,6 +1279,8 @@ class GbotVoiceBridge:
                 await self._on_transcript(event)
             text = event.get("transcript", "")
             if kind == "conversation.item.input_audio_transcription.completed":
+                if isinstance(text, str) and text.strip():
+                    self._note_user_followed()
                 if self._executor:
                     await self._executor.observe_user_input(text, finished=True)
             elif self._on_text and text:
@@ -1186,6 +1291,7 @@ class GbotVoiceBridge:
                 return
             self._response_progress_at = None
             self._response_in_progress = False
+            self._settle_desktop_response(response_id, event)
             if response_id not in self._suppressed:
                 # Order normal completion after its audio without blocking VAD.
                 self._turn_task = self._output.submit(self._finish_turn)
@@ -1408,6 +1514,15 @@ class GbotVoiceBridge:
 
     async def stop(self):
         self._stopped = True
+        resends = [
+            slot.get("resend_task")
+            for slot in self._resend_slots
+            if slot.get("resend_task") is not None and not slot["resend_task"].done()
+        ]
+        for task in resends:
+            task.cancel()
+        if resends:
+            await asyncio.gather(*resends, return_exceptions=True)
         await self._desktop_tasks.aclose()
         self._cancel_idle()
         self._pending_updates.clear()

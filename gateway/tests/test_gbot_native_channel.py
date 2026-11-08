@@ -31,8 +31,31 @@ def test_reconnect_grace_covers_only_a_recent_ready_channel():
     assert channel.within_reconnect_grace() is False
 
 
-def test_work_landed_is_native_data_and_cannot_grant_new_user_authority():
+def test_transcript_reply_is_native_data_and_a_nudge_is_not_spoken():
     event, is_user = update_event(
+        {
+            "channel": "box-reply",
+            "payload": {
+                "agentId": "fixture-agent",
+                "callId": "fixture-call",
+                "entryId": "entry-9",
+                "text": "Finished fixture task.",
+                "atMs": 123456789,
+            },
+        },
+        "fixture-agent",
+        "fixture-call",
+    )
+    assert event["type"] == "async_update.add"
+    assert event["async_update"]["topic"] == "work_landed"
+    assert event["event_id"] == "entry-9"
+    assert event["desktop_source"] == "transcript"
+    assert event["async_update"]["payload"][0]["message"] == {
+        "type": "text",
+        "content": "Finished fixture task.",
+    }
+    assert not is_user
+    assert update_event(
         {
             "channel": "voice-call-nudge",
             "payload": {
@@ -44,43 +67,14 @@ def test_work_landed_is_native_data_and_cannot_grant_new_user_authority():
         },
         "fixture-agent",
         "fixture-call",
-    )
-    assert event["type"] == "async_update.add"
-    assert event["async_update"]["topic"] == "work_landed"
-    assert event["async_update"]["payload"][0]["message"] == {
-        "type": "text",
-        "content": "Finished fixture task.",
-    }
-    assert not is_user
-    assert event["desktop_kind"] == "outcome"
-
-
-def test_progress_nudge_is_a_result_and_an_ack_is_not():
-    progress, is_user = update_event(
-        {
-            "channel": "voice-call-nudge",
-            "eventId": "evt-9",
-            "payload": {
-                "agentId": "fixture-agent",
-                "callId": "fixture-call",
-                "kind": "progress",
-                "update": "Warm and dry.",
-            },
-        },
-        "fixture-agent",
-        "fixture-call",
-    )
-    assert not is_user
-    assert progress["event_id"] == "evt-9"
-    assert progress["desktop_kind"] == "progress"
+    ) is None
     assert update_event(
         {
-            "channel": "voice-call-nudge",
+            "channel": "box-signal",
             "payload": {
                 "agentId": "fixture-agent",
                 "callId": "fixture-call",
-                "kind": "ack",
-                "update": "got it",
+                "kind": "outcome",
             },
         },
         "fixture-agent",
@@ -135,7 +129,10 @@ async def test_native_channel_deduplicates_typed_and_drops_after_close():
 
 
 @pytest.mark.asyncio
-async def test_native_presence_and_sse_lifecycle():
+async def test_native_presence_and_sse_lifecycle(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.gbot_native_channel")
     from aiohttp import ClientSession, web
     import json
 
@@ -151,12 +148,13 @@ async def test_native_presence_and_sse_lifecycle():
         stream = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
         await stream.prepare(request)
         payload = {
-            "channel": "voice-call-nudge",
+            "channel": "box-reply",
             "payload": {
                 "agentId": "agent",
                 "callId": "call",
-                "kind": "outcome",
-                "update": "fixture result",
+                "entryId": "entry-1",
+                "text": "fixture result",
+                "atMs": 123456789,
             },
         }
         await stream.write(("data: " + json.dumps(payload) + "\n\n").encode())
@@ -197,6 +195,7 @@ async def test_native_presence_and_sse_lifecycle():
         assert all(item["acceptsOverheard"] is False for item in presence)
         assert received[0][0]["async_update"]["topic"] == "work_landed"
         assert received[0][1] is False
+        assert "desktop call start id=call" in caplog.text
         assert not channel.connected.is_set()
         closed = channel.health()
         assert closed["state"] == "unavailable" and closed["ready"] is False
@@ -245,6 +244,64 @@ async def test_presence_retry_recovers_readiness_without_restarting_voice():
     assert channel.ready and calls == 2
     await channel.close()
     assert not channel.ready and channel._task.done()
+
+
+@pytest.mark.asyncio
+async def test_a_live_stream_end_reconnects_without_the_five_second_wait():
+    channel = NativeVoiceChannel(
+        None, "http://127.0.0.1:18771", "agent", "call", AsyncMock()
+    )
+    channel._retry_delay = 30
+    listens = 0
+
+    async def presence(on):
+        if on:
+            channel._presence_status = 200
+
+    async def listen():
+        nonlocal listens
+        listens += 1
+        channel.connected.set()
+        if listens == 1:
+            return
+        await asyncio.Event().wait()
+
+    channel._presence = presence
+    channel._listen = listen
+    await channel.start()
+    await eventually(lambda: listens >= 2, timeout=1)
+    await channel.close()
+
+
+@pytest.mark.asyncio
+async def test_box_signal_is_not_spoken():
+    spoken = AsyncMock()
+    signaled = AsyncMock()
+    channel = NativeVoiceChannel(
+        None, "http://127.0.0.1:18771", "agent", "call-9", spoken, on_signal=signaled
+    )
+    await channel.accept_event(
+        {
+            "channel": "box-signal",
+            "payload": {"agentId": "agent", "callId": "call-9", "kind": "outcome"},
+        }
+    )
+    await channel.accept_event(
+        {
+            "channel": "box-reply",
+            "payload": {
+                "agentId": "agent",
+                "callId": "call-9",
+                "entryId": "e1",
+                "text": "Saturday market",
+                "atMs": 50,
+            },
+        }
+    )
+    signaled.assert_awaited_once()
+    spoken.assert_awaited_once()
+    sent = spoken.await_args.args[0]
+    assert sent["async_update"]["payload"][0]["message"]["content"] == "Saturday market"
 
 
 @pytest.mark.asyncio

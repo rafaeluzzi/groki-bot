@@ -69,6 +69,46 @@ def make(monkeypatch, enabled=True):
     return b
 
 
+def _reply(text, entry="e1"):
+    import time
+
+    return {
+        "type": "async_update.add",
+        "event_id": entry,
+        "desktop_entry": entry,
+        "async_update": {
+            "topic": "work_landed",
+            "payload": [
+                {
+                    "message": {"type": "text", "content": text},
+                    "timestampMs": int(time.time() * 1000),
+                }
+            ],
+        },
+    }
+
+
+async def _finish_audio(b, response_id="r1"):
+    import base64
+
+    await b._handle_event(
+        {
+            "type": "response.created",
+            "response": {"id": response_id, "metadata": {"trigger": "async_update"}},
+        }
+    )
+    await b._handle_event(
+        {
+            "type": "response.audio.delta",
+            "response_id": response_id,
+            "delta": base64.b64encode(b"\x00\x00").decode(),
+        }
+    )
+    await b._handle_event(
+        {"type": "response.done", "response": {"id": response_id, "status": "completed"}}
+    )
+
+
 @pytest.mark.asyncio
 async def test_advertised_alias_dispatches_original_local_name(monkeypatch):
     b = make(monkeypatch)
@@ -689,19 +729,15 @@ async def test_accepted_task_is_delivered_when_work_lands(monkeypatch, caplog):
     await b._tool(
         {"name": "send_task", "call_id": "task", "arguments": '{"request":"events nearby"}'}
     )
-    await b._native_update(
-        {
-            "type": "async_update.add",
-            "async_update": {
-                "topic": "work_landed",
-                "payload": [{"message": {"type": "text", "content": "Saturday market"}}],
-            },
-        },
-        False,
-        track=True,
-    )
+    await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+    b._pending_response = False
+    b._response_requested = False
+    await b._native_update(_reply("Saturday market", "e-market"), False, track=True)
+    assert not any("outcome=delivered" in r.message for r in caplog.records)
+    await _finish_audio(b)
     line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
     assert "outcome=delivered" in line
+    assert "hop=spoken" in caplog.text
     assert "events nearby" not in line and "Saturday" not in line
     await b.stop()
 
@@ -773,6 +809,9 @@ async def test_reconnect_grace_sends_when_the_channel_returns(monkeypatch, caplo
         {"name": "send_task", "call_id": "blip", "arguments": '{"request":"weekend weather"}'}
     )
     await waiter
+    await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+    b._pending_response = False
+    b._response_requested = False
     b._local.assert_awaited()
     raw = next(
         c.args[0]["item"]["output"]
@@ -780,17 +819,8 @@ async def test_reconnect_grace_sends_when_the_channel_returns(monkeypatch, caplo
         if c.args[0]["type"] == "conversation.item.create"
     )
     assert "Desktop tasks are down" not in raw
-    await b._native_update(
-        {
-            "type": "async_update.add",
-            "async_update": {
-                "topic": "work_landed",
-                "payload": [{"message": {"type": "text", "content": "Warm and dry."}}],
-            },
-        },
-        False,
-        track=True,
-    )
+    await b._native_update(_reply("Warm and dry.", "e-warm"), False, track=True)
+    await _finish_audio(b, "warm-audio")
     line = next(r.getMessage() for r in caplog.records if "outcome=delivered" in r.message)
     waited = int(line.split("waited_ms=")[1])
     assert 0 < waited < 8000
@@ -847,49 +877,172 @@ async def test_grace_that_does_not_recover_logs_the_wait(monkeypatch, caplog):
     await b.stop()
 
 
-@pytest.mark.asyncio
-async def test_replayed_result_is_handed_once(monkeypatch):
-    b = make(monkeypatch)
-    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
-    await b._handle_event({"type": "input_audio_buffer.speech_started"})
-    await b._tool(
-        {"name": "send_task", "call_id": "once", "arguments": '{"request":"weekend weather"}'}
-    )
-    event = {
-        "type": "async_update.add",
-        "event_id": "evt-1",
-        "desktop_kind": "progress",
-        "async_update": {
-            "topic": "work_landed",
-            "payload": [{"message": {"type": "text", "content": "Warm and dry."}}],
-        },
-    }
-    await b._native_update(event, False, track=True)
-    await b._native_update({**event, "event_id": "evt-2", "desktop_kind": "outcome"}, False, track=True)
+def _updates(b):
     queued = [
-        item
-        for item in b._pending_updates
-        if item.get("type") == "async_update.add"
+        item for item in b._pending_updates if item.get("type") == "async_update.add"
     ]
     sent = [
         call.args[0]
         for call in b._send.call_args_list
         if call.args[0].get("type") == "async_update.add"
     ]
-    assert len(queued) + len(sent) == 1
-    carried = (queued or sent)[0]
-    assert carried["async_update"]["payload"][0]["message"]["content"] == "Warm and dry."
+    return queued + sent
+
+
+@pytest.mark.asyncio
+async def test_holding_line_and_answer_are_each_spoken_once_while_open(monkeypatch):
+    b = make(monkeypatch)
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+    b._desktop_tasks.quiet_s = 30
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "once", "arguments": '{"request":"Durham events"}'}
+    )
+    await b._native_update(
+        _reply("Looking up Durham events for November 14 and 15 now.", "e-hold"),
+        False,
+        track=True,
+    )
+    await b._native_update(
+        _reply("Looking up Durham events for November 14 and 15 now.", "e-hold"),
+        False,
+        track=True,
+    )
+    await b._native_update(_reply("Durham has a packed weekend.", "e-real"), False, track=True)
+    texts = [
+        item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
+    ]
+    assert texts == [
+        "Looking up Durham events for November 14 and 15 now.",
+        "Durham has a packed weekend.",
+    ]
+    assert len(b._desktop_tasks._open) == 1
     await b.stop()
 
 
 @pytest.mark.asyncio
-async def test_stream_gap_reads_the_call_record_once(monkeypatch):
+async def test_nudge_and_transcript_copy_are_spoken_once(monkeypatch):
+    from stackchan_mcp.gbot_native_channel import update_event
+
     b = make(monkeypatch)
-    b._desktop_tasks.lookup = AsyncMock(return_value="From the record.")
-    b._desktop_tasks.start("weather")
+    b._desktop_tasks.start("Saturday market")
+    signal = {
+        "channel": "box-signal",
+        "payload": {"agentId": "agent", "callId": b.call_id, "kind": "outcome"},
+    }
+    reply = {
+        "channel": "box-reply",
+        "payload": {
+            "agentId": "agent",
+            "callId": b.call_id,
+            "entryId": "e-same",
+            "text": "The market opens at 8.",
+            "atMs": int(__import__("time").time() * 1000),
+        },
+    }
+    assert update_event(signal, "agent", b.call_id) is None
+    await b._on_native_signal()
+    event, is_user = update_event(reply, "agent", b.call_id)
+    await b._native_update(event, is_user, track=True)
+    await b._native_update(event, is_user, track=True)
+    texts = [
+        item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
+    ]
+    assert texts == ["The market opens at 8."]
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_reply_during_a_stream_gap_is_backfilled_once(monkeypatch):
+    b = make(monkeypatch)
+    b._desktop_tasks.start("Saturday market")
     await b._on_native_gap()
     await b._on_native_gap()
-    assert b._desktop_tasks.lookup.await_count == 1
+    assert _updates(b) == []
+    event, is_user = __import__(
+        "stackchan_mcp.gbot_native_channel", fromlist=["update_event"]
+    ).update_event(
+        {
+            "channel": "box-reply",
+            "payload": {
+                "agentId": "agent",
+                "callId": b.call_id,
+                "entryId": "e-gap",
+                "text": "The market is on Saturday.",
+                "atMs": int(__import__("time").time() * 1000),
+            },
+        },
+        "agent",
+        b.call_id,
+    )
+    await b._native_update(event, is_user, track=True)
+    await b._native_update(event, is_user, track=True)
+    texts = [
+        item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
+    ]
+    assert texts == ["The market is on Saturday."]
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_late_reply_after_timeout_is_spoken_once(monkeypatch):
+    b = make(monkeypatch)
+    b._desktop_tasks.timeout_s = 0.02
+    b._response_in_progress = False
+    task_id = b._desktop_tasks.start("DPAC lookup")
+    await asyncio.sleep(0.08)
+    assert task_id not in b._desktop_tasks._open
+    await b._native_update(
+        _reply("The show is at 7.", "e-late"),
+        False,
+        track=True,
+    )
+    await b._native_update(_reply("The show is at 7.", "e-late"), False, track=True)
+    texts = [
+        item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
+    ]
+    assert texts[-1] == "That DPAC lookup just came back: The show is at 7."
+    assert texts.count(texts[-1]) == 1
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_reply_is_logged_cancelled_and_resent_once(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.gbot_voice_bridge")
+    b = make(monkeypatch)
+    b._resend_wait_s = 0.05
+    b._desktop_tasks.start("Saturday market")
+    await b._native_update(_reply("The market opens at 8.", "e-cancel"), False, track=True)
+    await b._handle_event(
+        {
+            "type": "response.created",
+            "response": {"id": "cut", "metadata": {"trigger": "async_update"}},
+        }
+    )
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+    assert any("outcome=cancelled" in r.message for r in caplog.records)
+    assert not any("outcome=delivered" in r.message for r in caplog.records)
+    await asyncio.sleep(0.12)
+    texts = [
+        item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
+    ]
+    assert texts.count("The market opens at 8.") == 2
+    await b._handle_event(
+        {
+            "type": "response.created",
+            "response": {"id": "cut-2", "metadata": {"trigger": "async_update"}},
+        }
+    )
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await asyncio.sleep(0.12)
+    texts = [
+        item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
+    ]
+    assert texts.count("The market opens at 8.") == 2
     await b.stop()
 
 

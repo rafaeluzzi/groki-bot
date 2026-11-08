@@ -10,7 +10,6 @@ import logging
 import math
 import re
 import time
-import uuid
 import weakref
 from urllib.parse import urlencode
 
@@ -26,8 +25,8 @@ RECONNECT_RECENT_S = 30.0
 # Skip another desktop wake when one succeeded, or a task was sent, more recently than this.
 WARM_SKIP_S = 300.0
 
-# The desktop speaks a finished lookup as either of these. An ack is only a receipt.
-NUDGE_RESULT_KINDS = frozenset({"progress", "outcome"})
+# The box stream's nudge is only a "read the transcript" signal. An ack is not.
+NUDGE_SIGNAL_KINDS = frozenset({"progress", "outcome"})
 
 # The helper already reduces its errors to fixed words such as upstream_http_429.
 NATIVE_ERROR_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
@@ -65,15 +64,23 @@ def update_event(message, agent_id, call_id):
     if payload.get("agentId") != agent_id or payload.get("callId") != call_id:
         return None
     channel = message.get("channel")
-    nudge_kind = None
-    if channel == "voice-call-nudge" and payload.get("kind") in NUDGE_RESULT_KINDS:
-        nudge_kind = payload.get("kind")
-        text, topic = payload.get("update"), "work_landed"
-        event_id = payload.get("eventId") or message.get("eventId")
-        if not isinstance(event_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", event_id):
-            event_id = "seeded-nudge-" + str(uuid.uuid4())
-        timestamp = int(time.time() * 1000)
-        is_user = False
+    # voice-call-nudge and box-signal carry no result text. The transcript does.
+    if channel in {"voice-call-nudge", "box-signal"}:
+        return None
+    if channel == "box-reply":
+        text, topic = payload.get("text"), "work_landed"
+        entry_id = payload.get("entryId")
+        timestamp = payload.get("atMs")
+        if (
+            not isinstance(entry_id, str)
+            or not 0 < len(entry_id) <= 200
+            or type(timestamp) not in {int, float}
+            or not math.isfinite(timestamp)
+            or timestamp <= 0
+        ):
+            return None
+        event_id, is_user = entry_id, False
+        source = "transcript"
     elif channel == "typed-message":
         text, topic = payload.get("text"), "user_message"
         entry_id = payload.get("entryId")
@@ -87,6 +94,7 @@ def update_event(message, agent_id, call_id):
         ):
             return None
         event_id, is_user = "written-turn-" + entry_id, True
+        source = None
     else:
         return None  # Overheard is a different native protocol, not a completed task.
     if not isinstance(text, str) or not text.strip() or len(text) > 64000:
@@ -104,17 +112,19 @@ def update_event(message, agent_id, call_id):
             ],
         },
     }
-    if nudge_kind:
-        event["desktop_kind"] = nudge_kind
+    if source:
+        event["desktop_entry"] = event_id
+        event["desktop_source"] = source
     return event, is_user
 
 
 class NativeVoiceChannel:
-    def __init__(self, http, base_url, agent_id, call_id, on_update, on_gap=None):
+    def __init__(self, http, base_url, agent_id, call_id, on_update, on_gap=None, on_signal=None):
         self._http, self._url = http, base_url
         self.agent_id, self.call_id = agent_id, call_id
         self._on_update = on_update
         self._on_gap = on_gap
+        self._on_signal = on_signal
         self._task = None
         self._closed = False
         self._registered = False
@@ -124,6 +134,7 @@ class NativeVoiceChannel:
         self._presence_status = None
         self._error = None
         self._ready_mono = None
+        self._call_logged = False
         self.connected = asyncio.Event()
 
     async def _presence(self, on):
@@ -147,6 +158,9 @@ class NativeVoiceChannel:
                 logger.info("Grok native presence on=%s status=%d error=%s", on, response.status, error)
                 raise RuntimeError("native_presence_unavailable")
             logger.info("Grok native presence on=%s status=%d", on, response.status)
+            if on and not self._call_logged:
+                self._call_logged = True
+                logger.info("desktop call start id=%s", self.call_id)
             result = await response.json()
             if result.get("ok") is False:
                 raise RuntimeError("native_presence_rejected")
@@ -207,9 +221,24 @@ class NativeVoiceChannel:
                     if not self._closed and self._on_gap is not None:
                         asyncio.create_task(self._on_gap(), name="desktop-stream-gap")
             if not self._closed:
-                await asyncio.sleep(self._retry_delay)
+                # A stream that was up and then ended is the ~150s clock (or a
+                # routine socket drop). Reconnect without the 5s backoff.
+                # Presence and HTTP failures still wait.
+                if not was_ready:
+                    await asyncio.sleep(self._retry_delay)
 
     async def accept_event(self, message):
+        if (
+            isinstance(message, dict)
+            and message.get("channel") == "box-signal"
+            and isinstance(message.get("payload"), dict)
+            and message["payload"].get("agentId") == self.agent_id
+            and message["payload"].get("callId") == self.call_id
+            and message["payload"].get("kind") in NUDGE_SIGNAL_KINDS
+        ):
+            if not self._closed and self._on_signal is not None:
+                await self._on_signal()
+            return
         parsed = update_event(message, self.agent_id, self.call_id)
         if self._closed or parsed is None:
             return
