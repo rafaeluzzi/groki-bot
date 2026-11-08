@@ -159,15 +159,6 @@ export class NativeSandboxClient {
       await this.#connect();
     }
   }
-  async getVoiceCall({agentId, callId}) {
-    const response = await this.#fetch('/api/getVoiceCall', {
-      method: 'POST', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({id: agentId, callId}), signal: AbortSignal.timeout(20000),
-    });
-    if (response.status === 404) { await response.body?.cancel(); return null; }
-    if (!response.ok) { await response.body?.cancel(); throw new Error(`upstream_http_${response.status}`); }
-    return response.json();
-  }
   async openEvents(signal) {
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), 20000);
@@ -253,7 +244,8 @@ export function filterTranscriptFrame(frame, context, state) {
     throw new Error('transcript_rebaseline_required');
   }
   const rows = frame.rows;
-  if (!state.connected || !rows || rows.agentId !== context.agentId || (rows.sessionId || '') !== context.sessionId || rows.replay === true || !Number.isSafeInteger(rows.generation)) return [];
+  // Replay frames still carry box replies from a gap. User messages reject replay below.
+  if (!state.connected || !rows || rows.agentId !== context.agentId || (rows.sessionId || '') !== context.sessionId || !Number.isSafeInteger(rows.generation)) return [];
   if (state.generation !== null && rows.generation !== state.generation) throw new Error('transcript_rebaseline_required');
   state.generation = rows.generation;
   const result = [];
@@ -262,42 +254,43 @@ export function filterTranscriptFrame(frame, context, state) {
     if (typeof row.body !== 'string' || row.bodyOmitted) continue;
     let entry;
     try { entry = JSON.parse(Buffer.from(row.body, 'base64').toString('utf8')); } catch { continue; }
-    const event = filterNativeEvent({channel: 'transcript', payload: {type: 'appended', entry, ordered: {replicaKey: 'transcript:' + context.agentId, sequence: 0}}}, {...context, sinceMs: state.sinceMs});
+    const event = filterNativeEvent({channel: 'transcript', payload: {type: 'appended', entry, ordered: {replicaKey: 'transcript:' + context.agentId, sequence: 0}}}, {...context, sinceMs: state.sinceMs, replay: rows.replay === true});
     if (event) result.push(event);
   }
   return result;
 }
 
-// A nudge created while send_task is still on the wire can be stamped slightly before we log the start.
-const ANSWER_SKEW_MS = 3000;
+const NUDGE_KINDS = new Set(['ack', 'progress', 'outcome', 'overheard']);
 
-export function callAnswer(record, opts = {}) {
-  const nudges = record && Array.isArray(record.nudges) ? record.nudges : [];
-  const since = Number(opts.sinceMs);
-  const wanted = typeof opts.request === 'string' ? opts.request.trim().slice(0, 1500) : '';
-  for (let i = nudges.length - 1; i >= 0; i--) {
-    const nudge = nudges[i];
-    const text = nudge && typeof nudge.answer === 'string' ? nudge.answer.trim() : '';
-    if (!text) continue;
-    const stored = nudge && typeof nudge.request === 'string' ? nudge.request.trim().slice(0, 1500) : '';
-    if (wanted && stored && stored !== wanted) continue;
-    const stamp = Number(nudge.answeredAtMs ?? nudge.atMs);
-    if (Number.isFinite(since) && Number.isFinite(stamp) && stamp + ANSWER_SKEW_MS < since) continue;
-    return text.slice(0, 16000);
-  }
-  return null;
+// The pod closes the SSE socket on a fixed clock. That is not a stale sandbox.
+export function isRoutineStreamEnd(error) {
+  const message = String(error?.message ?? '');
+  const cause = String(error?.cause?.code ?? error?.cause?.message ?? '');
+  return message === 'terminated' || cause === 'UND_ERR_SOCKET' || message.includes('UND_ERR_SOCKET');
 }
 
-const NUDGE_KINDS = new Set(['ack', 'progress', 'outcome', 'overheard']);
+function boxReply(entry, context) {
+  if (!entry || entry.kind !== 'send-message' || typeof entry.id !== 'string' || !entry.id) return null;
+  const message = entry.message;
+  if (!message || message.type !== 'text' || typeof message.channel !== 'string' || typeof message.content !== 'string') return null;
+  if (!message.channel.startsWith('voice:')) return null;
+  const callId = message.channel.slice('voice:'.length).trim();
+  if (!callId || callId !== context.callId) return null;
+  const text = message.content.trim();
+  if (!text || !Number.isFinite(entry.timestampMs)) return null;
+  const key = 'entry:' + entry.id;
+  if (context.seen.has(key)) return null;
+  context.seen.add(key);
+  return {channel: 'box-reply', payload: {agentId: context.agentId, callId, entryId: entry.id, text: text.slice(0, 16000), atMs: entry.timestampMs}};
+}
 
 export function filterNativeEvent(event, context) {
   const p = event?.payload;
   if (!p || typeof p !== 'object') return null;
   if (event.channel === 'voice-call-nudge') {
-    if (p.agentId !== context.agentId || p.callId !== context.callId || !['progress', 'outcome', 'overheard'].includes(p.kind) || typeof p.update !== 'string' || !p.update.trim()) return null;
+    // A nudge is only "something landed, read the transcript". The text is not spoken.
+    if (p.agentId !== context.agentId || p.callId !== context.callId || !['progress', 'outcome', 'overheard'].includes(p.kind)) return null;
     if (p.kind === 'overheard' && !context.acceptsOverheard) return null;
-    // Equal text is not an event identity: separate tasks can return exactly
-    // the same result. Only an explicit upstream event ID can identify replay.
     const eventId = typeof event.eventId === 'string' && event.eventId.length > 0 && event.eventId.length <= 256
       ? event.eventId : undefined;
     if (eventId !== undefined) {
@@ -305,9 +298,9 @@ export function filterNativeEvent(event, context) {
       if (context.seen.has(key)) return null;
       context.seen.add(key);
     }
-    const payload = {agentId: p.agentId, callId: p.callId, kind: p.kind, update: p.update.slice(0, 16000)};
+    const payload = {agentId: p.agentId, callId: p.callId, kind: p.kind};
     if (eventId !== undefined) payload.eventId = eventId;
-    return {channel: 'voice-call-nudge', payload};
+    return {channel: 'box-signal', payload};
   }
   if (event.channel !== 'transcript' || p.type !== 'appended') return null;
   // Ordered replica keys are the authoritative agent/session scope in 0.71.2.
@@ -315,6 +308,10 @@ export function filterNativeEvent(event, context) {
   const expected = 'transcript:' + context.agentId + (context.sessionId ? '\0' + context.sessionId : '');
   if (replica !== expected || !Number.isSafeInteger(p.ordered?.sequence)) return null;
   const entry = p.entry;
+  const reply = boxReply(entry, context);
+  if (reply) return reply;
+  // Replayed user turns are not new speech. Box replies above are, so a gap can be filled.
+  if (context.replay) return null;
   if (!entry || entry.kind !== 'message' || entry.role !== 'user' || typeof entry.id !== 'string' || !entry.id || typeof entry.content !== 'string') return null;
   if ('channel' in entry || 'fromAgent' in entry || 'channelSender' in entry || 'fromUser' in entry || entry.author?.kind !== 'cursor_user' || entry.author.id !== context.authId) return null;
   // No baseline/snapshot is ever forwarded. Timestamp bounds also reject replay
@@ -448,25 +445,6 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       ).finally(() => { warmFlight = null; });
       return send(200, await warmFlight);
     }
-    if (route === 'POST /native/call') {
-      if (!desktopEnabled && !toolsEnabled) return send(403, {ok: false, error: 'desktop_disabled'});
-      if (!activeCall) return send(403, {ok: false, error: 'call_not_allowed'});
-      let raw = '';
-      for await (const chunk of req) { raw += chunk; if (Buffer.byteLength(raw) > 4096) return send(413, {ok: false, error: 'body_too_large'}); }
-      let body;
-      try { body = raw ? JSON.parse(raw) : {}; } catch { return send(400, {ok: false, error: 'invalid_body'}); }
-      if (body.agentId !== agentId || body.callId !== activeCall.callId) return send(403, {ok: false, error: 'call_not_allowed'});
-      if (typeof sandbox.getVoiceCall !== 'function') return send(200, {ok: true, answer: null});
-      const sinceMs = typeof body.sinceMs === 'number' && Number.isFinite(body.sinceMs) ? body.sinceMs : undefined;
-      const request = typeof body.request === 'string' ? body.request.slice(0, 1500) : '';
-      try {
-        const record = await sandbox.getVoiceCall({agentId, callId: activeCall.callId});
-        return send(200, {ok: true, answer: callAnswer(record, {sinceMs, request})});
-      } catch (error) {
-        const safe = /^upstream_http_\d{3}$/.test(error?.message) ? error.message : 'bridge_request_failed';
-        return send(502, {ok: false, error: safe});
-      }
-    }
     if (route === 'GET /native/health') {
       if (!desktopEnabled && !toolsEnabled) return send(403, {ok: false, error: 'desktop_disabled'});
       try { return send(200, await sandbox.probe()); }
@@ -500,6 +478,11 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
                 break;
               }
               logStream('typed', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:typed'));
+              // A routine socket close is the same clock as the box stream. Don't sit on the 5s timer.
+              if (isRoutineStreamEnd(error)) {
+                await waitForNativeRetry(0, controller.signal);
+                continue;
+              }
             }
             await waitForNativeRetry(nativeRetryDelayMs, controller.signal);
           }
@@ -538,7 +521,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
               if (firstOther && context.notedChannels.size < 30) context.notedChannels.add(channel);
               if (channel === 'voice-call-nudge' || firstOther) {
                 logStream('box', 'event', {
-                  channel, kind, forwarded: event?.channel === 'voice-call-nudge',
+                  channel, kind, forwarded: event?.channel === 'box-signal',
                   event_id: typeof id === 'string' && id.length > 0 && id.length <= 80 ? id : null,
                 });
               }
@@ -553,9 +536,10 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       } catch (error) {
         if (!controller.signal.aborted) {
           logStream('box', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:box'));
-          // undici raises TypeError "terminated" when the pod closes the SSE socket.
-          // The cached gateway URL is the asleep box; drop it so the next presence wakes.
-          if (error?.name === 'TypeError') sandbox.invalidate?.();
+          // undici raises TypeError "terminated" / UND_ERR_SOCKET when the pod closes
+          // the SSE socket on its clock. The cached sandbox is still the right one.
+          // 417 and the other stale statuses still re-ensure inside #fetch.
+          if (error?.name === 'TypeError' && !isRoutineStreamEnd(error)) sandbox.invalidate?.();
         }
         if (!res.headersSent) send(502, {ok: false, error: 'native_stream_failed'});
       } finally {
@@ -620,8 +604,10 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         const authId = await sandbox.callerAuthId();
         await sandbox.presence(body);
         if (body.isOnTheLine) {
-          if (!activeCall) activeCall = {agentId, callId: body.callId, acceptsOverheard: body.acceptsOverheard, sessionId, authId, sinceMs: Date.now(), seen: new Set()};
-          else activeCall.acceptsOverheard = body.acceptsOverheard;
+          if (!activeCall) {
+            activeCall = {agentId, callId: body.callId, acceptsOverheard: body.acceptsOverheard, sessionId, authId, sinceMs: Date.now(), seen: new Set()};
+            logStream('presence', 'call_start', {call_id: body.callId});
+          } else activeCall.acceptsOverheard = body.acceptsOverheard;
           rememberCall(callStore, activeCall);
         } else {
           activeCall = null; for (const controller of streams) controller.abort();

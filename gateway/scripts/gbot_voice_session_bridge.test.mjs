@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { callAnswer, createBridge, accountRpc, filterNativeEvent, validateBody } from './gbot_voice_session_bridge.mjs';
+import { createBridge, accountRpc, filterNativeEvent, validateBody, isRoutineStreamEnd } from './gbot_voice_session_bridge.mjs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
 import { mkdtempSync, readFileSync } from 'node:fs';
@@ -105,6 +105,10 @@ test('native event filtering excludes history, other callers, sessions and dupli
   assert.equal(filterNativeEvent({...event,payload:{...event.payload,ordered:{replicaKey:'transcript:a\0other',sequence:1}}},context),null);
   assert.equal(filterNativeEvent(event,context).channel,'typed-message'); assert.equal(filterNativeEvent(event,context),null);
   assert.equal(filterNativeEvent({channel:'voice-call-nudge',payload:{agentId:'a',callId:'other',kind:'outcome',update:'fake'}},context),null);
+  const reply = {channel:'transcript',payload:{type:'appended',entry:{id:'box1',kind:'send-message',timestampMs:150,message:{type:'text',channel:'voice:call-c',content:'Saturday market'}},ordered:{replicaKey:'transcript:a',sequence:2}}};
+  assert.equal(filterNativeEvent(reply,context).channel,'box-reply');
+  assert.equal(filterNativeEvent(reply,context),null);
+  assert.equal(filterNativeEvent({...reply,payload:{...reply.payload,entry:{...reply.payload.entry,id:'other-call',message:{type:'text',channel:'voice:someone-else',content:'no'}}}},context),null);
 });
 
 test('desktop opt-in admits native send and search scoped to active call while unknown tools remain off', async () => {
@@ -145,12 +149,16 @@ test('server transcript stream drops replay and pre-connection entries and requi
   assert.equal(fetched,false);
 });
 
-test('separate native results with identical text are both delivered without event IDs', async () => {
+test('a nudge is a signal with no answer text, even when the text matches', async () => {
   const {filterNativeEvent} = await import('./gbot_voice_session_bridge.mjs');
   const context = {agentId:'a',callId:'call-c',seen:new Set()};
   const event = {channel:'voice-call-nudge',payload:{agentId:'a',callId:'call-c',kind:'outcome',update:'SAME FIXTURE RESULT'}};
-  assert.equal(filterNativeEvent(event,context)?.channel,'voice-call-nudge');
-  assert.equal(filterNativeEvent(event,context)?.channel,'voice-call-nudge');
+  const first = filterNativeEvent(event,context);
+  const second = filterNativeEvent(event,context);
+  assert.equal(first.channel,'box-signal');
+  assert.equal(second.channel,'box-signal');
+  assert.equal(first.payload.update, undefined);
+  assert.equal(JSON.stringify(first).includes('SAME FIXTURE'), false);
 });
 
 test('native event IDs deduplicate replays without conflating separate same-text results', async () => {
@@ -194,7 +202,10 @@ test('HTTP: typed EOF or error reconnects independently and box results still ar
       assert.ok(attempts>=2);
       box.enqueue(new TextEncoder().encode('data: '+JSON.stringify({channel:'voice-call-nudge',payload:{agentId:'a',callId:'call-c',kind:'outcome',update:'FIXTURE RESULT'}})+'\n\n'));
       const result=await reader.read();
-      assert.equal(result.done,false); assert.match(new TextDecoder().decode(result.value),/FIXTURE RESULT/);
+      assert.equal(result.done,false);
+      const body = new TextDecoder().decode(result.value);
+      assert.match(body, /box-signal/);
+      assert.equal(body.includes('FIXTURE RESULT'), false);
       assert.ok(logs.some(event=>event.source==='typed'&&event.state===failure));
       assert.equal(JSON.stringify(logs).includes('SECRET_FIXTURE'),false);
       await reader.cancel(); reader=null;
@@ -265,7 +276,34 @@ test('HTTP 417 drops the cached sandbox and wakes it with a fresh EnsureSandBox'
   assert.deepEqual(bodies, [{}, {}]);
 });
 
-test('a terminated box stream is logged with a timestamp and drops the sandbox', async () => {
+test('a non-routine box TypeError still drops the sandbox', async () => {
+  const port = await freePort();
+  let invalidated = 0;
+  const sandbox = {
+    invalidate: () => { invalidated++; },
+    presence: async () => {},
+    callerAuthId: async () => 'owner',
+    openEvents: async () => new Response(new ReadableStream({start(controller) {
+      controller.error(new TypeError('socket hang up'));
+    }}), {headers: {'content-type': 'text/event-stream'}}),
+  };
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, toolsEnabled: false, sandbox,
+    transcript: {async *events() {}}, nativeLog: () => {},
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    await fetch(`http://127.0.0.1:${port}/native/presence`, {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({agentId: 'a', callId: 'call-c', isOnTheLine: true, acceptsOverheard: false}),
+    });
+    await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=call-c`).then(r => r.text()).catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(invalidated, 1);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('a terminated box stream is logged and does not drop the sandbox', async () => {
   const port = await freePort();
   let invalidated = 0;
   const logs = [];
@@ -295,7 +333,9 @@ test('a terminated box stream is logged with a timestamp and drops the sandbox',
     assert.equal(error.error_message, 'terminated');
     assert.equal(error.frame, 'gbot_voice_session_bridge.mjs:box');
     assert.match(error.at, /^\d{4}-\d{2}-\d{2}T/);
-    assert.equal(invalidated, 1);
+    assert.equal(invalidated, 0);
+    assert.equal(isRoutineStreamEnd(Object.assign(new TypeError('terminated'), {cause: {code: 'UND_ERR_SOCKET'}})), true);
+    assert.ok(logs.some(event => event.state === 'call_start' && event.call_id === 'call-c'));
     assert.equal(JSON.stringify(logs).includes('SECRET'), false);
   } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
@@ -328,29 +368,32 @@ test('a call left on disk is hung up before the next call registers', async () =
   } finally { await new Promise(resolve => second.close(resolve)); }
 });
 
-test('a progress nudge is a result, and the same event id is not forwarded twice', () => {
+test('a progress nudge is only a signal, and the same event id is not forwarded twice', () => {
   const context = {agentId: 'a', callId: 'call-c', seen: new Set(), acceptsOverheard: false};
   const progress = {eventId: 'evt-1', channel: 'voice-call-nudge', payload: {agentId: 'a', callId: 'call-c', kind: 'progress', update: 'Warm and dry.'}};
-  assert.equal(filterNativeEvent(progress, context)?.payload.kind, 'progress');
+  const signal = filterNativeEvent(progress, context);
+  assert.equal(signal?.channel, 'box-signal');
+  assert.equal(signal?.payload.kind, 'progress');
+  assert.equal(signal?.payload.update, undefined);
   assert.equal(filterNativeEvent(progress, context), null);
   assert.equal(filterNativeEvent({channel: 'voice-call-nudge', payload: {agentId: 'a', callId: 'call-c', kind: 'ack', update: 'got it'}}, context), null);
-  assert.equal(callAnswer({nudges: [{answer: '  '}, {answer: 'Warm and dry.'}]}), 'Warm and dry.');
-  assert.equal(callAnswer({nudges: []}), null);
-  assert.equal(callAnswer(
-    {nudges: [{answer: 'Yesterday', request: 'weather', atMs: 1_000, answeredAtMs: 1_000}]},
-    {sinceMs: 20_000, request: 'weather'},
-  ), null);
-  assert.equal(callAnswer(
-    {nudges: [
-      {answer: 'Warm', request: 'weather', answeredAtMs: 5_000},
-      {answer: 'A market', request: 'events', answeredAtMs: 30_000},
-    ]},
-    {sinceMs: 20_000, request: 'weather'},
-  ), null);
-  assert.equal(callAnswer(
-    {nudges: [{answer: 'Warm and dry.', request: 'weather', atMs: 19_000, answeredAtMs: 25_000}]},
-    {sinceMs: 20_000, request: 'weather'},
-  ), 'Warm and dry.');
+});
+
+test('a replayed transcript send-message is backfilled once and a user replay is not', async () => {
+  const {filterTranscriptFrame} = await import('./gbot_voice_session_bridge.mjs');
+  const context = {agentId:'a', callId:'call-c', sessionId:'', authId:'owner', sinceMs:100, seen: new Set()};
+  const state = {};
+  filterTranscriptFrame({connected:{serverTimeMs:'110'}}, context, state);
+  const body = (entry) => Buffer.from(JSON.stringify(entry)).toString('base64');
+  const reply = {id:'gap-1', kind:'send-message', timestampMs:50, message:{type:'text', channel:'voice:call-c', content:'From the gap'}};
+  const user = {id:'old-user', kind:'message', role:'user', content:'earlier', timestampMs:200, author:{kind:'cursor_user', id:'owner'}};
+  const rows = {agentId:'a', sessionId:'', generation:1, replay:true, entries:[{body: body(reply)}, {body: body(user)}]};
+  const first = filterTranscriptFrame({rows}, context, state);
+  assert.equal(first.length, 1);
+  assert.equal(first[0].channel, 'box-reply');
+  assert.equal(first[0].payload.text, 'From the gap');
+  assert.equal(first[0].payload.entryId, 'gap-1');
+  assert.deepEqual(filterTranscriptFrame({rows}, context, state), []);
 });
 
 test('warm runs once while another warm is in flight, and the call record answer is returned', async () => {
@@ -362,7 +405,6 @@ test('warm runs once while another warm is in flight, and the call record answer
     callerAuthId: async () => 'owner',
     presence: async () => {},
     warm: () => { warmStarted += 1; return gate; },
-    getVoiceCall: async () => ({nudges: [{answer: 'FIXTURE ANSWER'}]}),
   };
   const server = createBridge({port, agentId: 'a', desktopEnabled: true, toolsEnabled: false, sandbox});
   await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
@@ -380,7 +422,6 @@ test('warm runs once while another warm is in flight, and the call record answer
     const done = await first;
     assert.equal((await done.json()).state, 'ready');
     assert.equal((await post('/native/presence', {agentId: 'a', callId: 'call-c', isOnTheLine: true, acceptsOverheard: false})).status, 200);
-    const record = await post('/native/call', {agentId: 'a', callId: 'call-c'});
-    assert.equal((await record.json()).answer, 'FIXTURE ANSWER');
+    assert.equal((await post('/native/call', {agentId: 'a', callId: 'call-c'})).status, 404);
   } finally { await new Promise(resolve => server.close(resolve)); }
 });

@@ -3,15 +3,19 @@
 """One line per desktop task the voice session hands off, and a spoken ending.
 
 ``send_task`` returns as soon as the desktop accepts the job. The voice turn
-often ends before the result exists. This tracker keeps the request and, within
-``DESKTOP_TASK_TIMEOUT_S``, either records the result or speaks a short failure
-on the existing announce path.
+often ends before the result exists. This tracker keeps the request until the
+timeout, or until the box has gone quiet after a real reply.
+
+Box replies, including holding lines, are spoken as their own updates. A
+holding line does not finish the task. That matches Grok Bot's own voice
+handler, which speaks every text ``send-message`` on ``voice:<callId>``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -21,14 +25,55 @@ logger = logging.getLogger(__name__)
 
 # One place to change. A desktop lookup that has not landed by then is spoken as a failure.
 DESKTOP_TASK_TIMEOUT_S = 90.0
-# The channel was up, and neither the stream nor the call record had a result.
+# Quiet after a non-holding reply before the task is finished.
+# Holding lines do not start this clock: the Durham trace's real answer arrived
+# 19s after "Looking up…", and that gap has to stay inside the open task.
+# 12s is long enough for a second bubble of the same answer (a detail a few
+# seconds later) and for the reply that was already in flight, and well under
+# the 90s failure clock. Anything later is spoken once as a late result.
+DESKTOP_TASK_QUIET_S = 12.0
+# A reply stamped just before we logged the task start still belongs to it.
+REPLY_SKEW_MS = 3000
+# The channel was up, and no reply had arrived.
 TIMEOUT_UP_PHRASE = "That one didn't come back in time."
 # The channel was down when the wait ended.
 TIMEOUT_DOWN_PHRASE = "Desktop tasks are down right now."
 
+# Progress beats the box sends before the answer. Spoken, but they leave the task open.
+_HOLDING_RE = re.compile(
+    r"^(looking up|still looking|still searching|searching|checking|working on|"
+    r"let me look|i'll look|i’m looking|on it|one moment)\b",
+    re.IGNORECASE,
+)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def is_holding_line(text: str) -> bool:
+    """True for a progress beat such as "Looking up Durham events…"."""
+    compact = " ".join(str(text or "").split())
+    if not compact or len(compact) > 200:
+        return False
+    if _HOLDING_RE.match(compact):
+        return True
+    return len(compact) <= 120 and (compact.endswith("…") or compact.endswith("..."))
+
+
+def late_phrase(request: str, text: str) -> str:
+    """A result that showed up after its task had already finished."""
+    label = " ".join(str(request or "").split())
+    if len(label) > 60:
+        label = label[:60].rstrip()
+    if not label:
+        label = "lookup"
+    body = " ".join(str(text or "").split())
+    return f"That {label} just came back: {body}"
 
 
 def log_desktop_task(
@@ -70,10 +115,23 @@ class _OpenTask:
     id: str
     request: str
     started: str
+    started_ms: int
     deadline_mono: float
     waited_ms: int = 0
+    replies: int = 0
     timer: asyncio.Task | None = None
+    quiet: asyncio.Task | None = None
+    quiet_deadline: float = 0.0
     done: bool = False
+
+
+@dataclass
+class _Finished:
+    id: str
+    request: str
+    started: str
+    started_ms: int
+    waited_ms: int
 
 
 @dataclass
@@ -82,10 +140,11 @@ class DesktopTasks:
 
     announce: object
     channel_ready: object
-    lookup: object = None
     timeout_s: float = DESKTOP_TASK_TIMEOUT_S
-    _lookup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    quiet_s: float = DESKTOP_TASK_QUIET_S
     _open: dict[str, _OpenTask] = field(default_factory=dict)
+    _finished: list[_Finished] = field(default_factory=list)
+    _seen: set[str] = field(default_factory=set)
     _unsaid: list[dict] = field(default_factory=list)
     _cancelled: list = field(default_factory=list)
 
@@ -104,6 +163,7 @@ class DesktopTasks:
             id=task_id,
             request=str(request or ""),
             started=_now(),
+            started_ms=_now_ms(),
             deadline_mono=time.monotonic() + budget,
             waited_ms=max(0, int(waited_ms)),
         )
@@ -112,65 +172,149 @@ class DesktopTasks:
         log_desktop_hop(task_id, "accepted", at=task.started)
         return task_id
 
-    def landed(self, *, spoken: bool, text: str) -> None:
-        """A desktop result arrived. ``spoken`` is false when the voice session could not take it."""
-        task = self._oldest()
-        if task is None:
-            return
-        self._finish_open(task)
+    def accept_reply(self, entry_id: str, text: str, at_ms: int) -> dict | None:
+        """Attach one transcript reply to a task. Does not log delivery.
+
+        Returns the words to speak, or None when this entry was already spoken
+        or is older than every task we still owe.
+        """
         phrase = text.strip() if isinstance(text, str) else ""
-        if spoken:
-            log_desktop_hop(task.id, "spoken")
-            log_desktop_task(task.id, task.started, "delivered", waited_ms=task.waited_ms)
-            return
+        if not phrase:
+            return None
+        key = str(entry_id or "")
+        if not key or key in self._seen:
+            return None
+        at = int(at_ms) if isinstance(at_ms, (int, float)) else _now_ms()
+        oldest = self._oldest_started()
+        if oldest is not None and at + REPLY_SKEW_MS < oldest.started_ms:
+            return None
+        task = self._owner(at)
+        if task is not None:
+            self._seen.add(key)
+            task.replies += 1
+            holding = is_holding_line(phrase)
+            if holding:
+                self._cancel_quiet(task)
+            else:
+                self._arm_quiet(task)
+            log_desktop_hop(task.id, "queued", holding=int(holding), late=0)
+            return self._decision(task, phrase, late=False)
+        owner = self._late_owner(at)
+        if owner is None:
+            return None
+        self._seen.add(key)
+        log_desktop_hop(owner.id, "queued", holding=0, late=1)
+        return {
+            "task_id": owner.id,
+            "started": owner.started,
+            "waited_ms": owner.waited_ms,
+            "say": late_phrase(owner.request, phrase),
+            "late": True,
+        }
+
+    def stash(self, decision: dict) -> None:
+        """The voice session could not take this reply. The next one speaks it."""
         self._unsaid.append(
             {
                 "open": False,
-                "id": task.id,
-                "start": task.started,
-                "outcome": "delivered",
-                "waited_ms": task.waited_ms,
-                "text": phrase or failure_phrase(task.request),
+                "reply": True,
+                "id": decision["task_id"],
+                "start": decision["started"],
+                "waited_ms": decision["waited_ms"],
+                "text": decision["say"],
             }
         )
+
+    def remember(self, item: dict) -> None:
+        """Keep a finished task so a late reply can still name it."""
+        if any(task.id == str(item.get("id")) for task in self._finished):
+            return
+        self._finished.append(
+            _Finished(
+                id=str(item.get("id") or ""),
+                request=str(item.get("request") or ""),
+                started=str(item.get("start") or _now()),
+                started_ms=int(item.get("started_ms") or 0),
+                waited_ms=int(item.get("waited_ms") or 0),
+            )
+        )
+        for entry_id in item.get("seen") or []:
+            if isinstance(entry_id, str) and entry_id:
+                self._seen.add(entry_id)
 
     def export_for_handoff(self) -> list[dict]:
         """Move unfinished work off this bridge so a new voice session can finish it."""
         now = time.monotonic()
+        seen = list(self._seen)
+        finished = list(self._finished)
+        self._finished.clear()
         items: list[dict] = []
         for task in list(self._open.values()):
-            self._finish_open(task)
+            quiet_left = None
+            if task.quiet is not None and not task.quiet.done():
+                # The quiet clock is wall time from when it was armed; export the remainder.
+                quiet_left = max(0.0, task.quiet_deadline - now)
+            self._finish_open(task, remember=False)
             items.append(
                 {
                     "open": True,
                     "id": task.id,
                     "request": task.request,
                     "start": task.started,
+                    "started_ms": task.started_ms,
                     "remaining_s": max(0.0, task.deadline_mono - now),
                     "waited_ms": task.waited_ms,
+                    "replies": task.replies,
+                    "quiet_remaining_s": quiet_left,
+                    "seen": seen,
                 }
             )
         items.extend(self._unsaid)
         self._unsaid.clear()
+        for done in finished:
+            items.append(
+                {
+                    "open": False,
+                    "remember": True,
+                    "id": done.id,
+                    "request": done.request,
+                    "start": done.started,
+                    "started_ms": done.started_ms,
+                    "waited_ms": done.waited_ms,
+                    "seen": seen,
+                }
+            )
+        self._seen.clear()
         return items
 
     def adopt(self, item: dict) -> None:
         """Continue a task exported from the previous voice session."""
+        for entry_id in item.get("seen") or []:
+            if isinstance(entry_id, str) and entry_id:
+                self._seen.add(entry_id)
         if not item.get("open"):
             return
         task = _OpenTask(
             id=str(item["id"]),
             request=str(item.get("request") or ""),
             started=str(item["start"]),
+            started_ms=int(item.get("started_ms") or _now_ms()),
             deadline_mono=time.monotonic() + float(item.get("remaining_s") or 0),
             waited_ms=int(item.get("waited_ms") or 0),
+            replies=int(item.get("replies") or 0),
         )
         self._open[task.id] = task
         task.timer = asyncio.create_task(self._expire(task), name="desktop-task-timeout")
+        quiet_left = item.get("quiet_remaining_s")
+        if isinstance(quiet_left, (int, float)) and task.replies:
+            self._arm_quiet(task, delay=max(0.0, float(quiet_left)))
+
+    def oldest(self) -> _OpenTask | None:
+        return self._oldest()
 
     def close(self) -> None:
         for task in list(self._open.values()):
-            self._finish_open(task)
+            self._finish_open(task, remember=False)
         self._open.clear()
 
     async def aclose(self) -> None:
@@ -179,45 +323,40 @@ class DesktopTasks:
         if cancelled:
             await asyncio.gather(*cancelled, return_exceptions=True)
 
-    async def recover(self) -> bool:
-        """One status read. Speaks a stored answer once, when a task is still open."""
-        if not self._open or self.lookup is None:
-            return False
-        async with self._lookup_lock:
-            task = self._oldest()
-            if task is None:
-                return False
-            text = None
-            try:
-                text = await self.lookup()
-            except Exception:
-                text = None
-            found = isinstance(text, str) and bool(text.strip())
-            log_desktop_hop(task.id, "status", found=int(found))
-            if not found or task.done or task.id not in self._open:
-                return False
-            self._finish_open(task)
-            said = False
-            try:
-                said = bool(await self.announce(text.strip()))
-            except Exception:
-                logger.warning("desktop task announcement failed id=%s", task.id)
-                said = False
-            if said:
-                log_desktop_hop(task.id, "spoken")
-                log_desktop_task(task.id, task.started, "delivered", waited_ms=task.waited_ms)
-                return True
-            self._unsaid.append(
-                {
-                    "open": False,
-                    "id": task.id,
-                    "start": task.started,
-                    "outcome": "delivered",
-                    "waited_ms": task.waited_ms,
-                    "text": text.strip(),
-                }
-            )
-            return True
+    def _decision(self, task: _OpenTask, phrase: str, *, late: bool) -> dict:
+        return {
+            "task_id": task.id,
+            "started": task.started,
+            "waited_ms": task.waited_ms,
+            "say": phrase,
+            "late": late,
+        }
+
+    def _owner(self, at_ms: int) -> _OpenTask | None:
+        open_tasks = [task for task in self._open.values() if not task.done]
+        if not open_tasks:
+            return None
+        oldest = min(open_tasks, key=lambda task: task.started_ms)
+        if at_ms + REPLY_SKEW_MS < oldest.started_ms:
+            return None
+        candidates = [task for task in open_tasks if task.started_ms <= at_ms + REPLY_SKEW_MS]
+        if not candidates:
+            return oldest
+        return max(candidates, key=lambda task: task.started_ms)
+
+    def _late_owner(self, at_ms: int) -> _Finished | None:
+        candidates = [
+            task for task in self._finished if task.started_ms <= at_ms + REPLY_SKEW_MS
+        ]
+        if not candidates:
+            return None
+        return max(candidates, key=lambda task: task.started_ms)
+
+    def _oldest_started(self) -> _OpenTask | None:
+        open_tasks = [task for task in self._open.values() if not task.done]
+        if not open_tasks:
+            return None
+        return min(open_tasks, key=lambda task: task.started_ms)
 
     def _oldest(self) -> _OpenTask | None:
         open_tasks = [task for task in self._open.values() if not task.done]
@@ -225,14 +364,53 @@ class DesktopTasks:
             return None
         return min(open_tasks, key=lambda task: task.deadline_mono)
 
-    def _finish_open(self, task: _OpenTask) -> None:
+    def _cancel_quiet(self, task: _OpenTask) -> None:
+        timer = task.quiet
+        task.quiet = None
+        if timer is not None and timer is not asyncio.current_task() and not timer.done():
+            timer.cancel()
+            self._cancelled.append(timer)
+
+    def _arm_quiet(self, task: _OpenTask, delay: float | None = None) -> None:
+        self._cancel_quiet(task)
+        wait = self.quiet_s if delay is None else delay
+        task.quiet_deadline = time.monotonic() + wait
+        task.quiet = asyncio.create_task(self._quiet(task, wait), name="desktop-task-quiet")
+
+    def _finish_open(self, task: _OpenTask, *, remember: bool) -> None:
+        if task.done:
+            return
         task.done = True
+        self._cancel_quiet(task)
         timer = task.timer
         task.timer = None
         if timer is not None and timer is not asyncio.current_task() and not timer.done():
             timer.cancel()
             self._cancelled.append(timer)
         self._open.pop(task.id, None)
+        if remember:
+            self._finished.append(
+                _Finished(
+                    id=task.id,
+                    request=task.request,
+                    started=task.started,
+                    started_ms=task.started_ms,
+                    waited_ms=task.waited_ms,
+                )
+            )
+            if len(self._finished) > 20:
+                del self._finished[:-20]
+
+    async def _quiet(self, task: _OpenTask, delay: float) -> None:
+        if delay > 0:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+        if task.done or task.id not in self._open:
+            return
+        self._finish_open(task, remember=True)
+        log_desktop_hop(task.id, "quiet")
 
     async def _expire(self, task: _OpenTask) -> None:
         delay = task.deadline_mono - time.monotonic()
@@ -243,11 +421,12 @@ class DesktopTasks:
                 return
         if task.done or task.id not in self._open:
             return
-        if await self.recover():
+        # A holding line or a real answer already arrived. Don't also say it failed.
+        if task.replies:
+            self._finish_open(task, remember=True)
+            log_desktop_hop(task.id, "timeout_skipped")
             return
-        if task.done or task.id not in self._open:
-            return
-        self._finish_open(task)
+        self._finish_open(task, remember=True)
         ready = False
         try:
             ready = bool(self.channel_ready())
@@ -262,7 +441,6 @@ class DesktopTasks:
             logger.warning("desktop task announcement failed id=%s", task.id)
             said = False
         if said:
-            log_desktop_hop(task.id, "spoken")
             log_desktop_task(task.id, task.started, outcome, waited_ms=task.waited_ms)
             return
         self._unsaid.append(
