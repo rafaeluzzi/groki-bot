@@ -30,7 +30,16 @@ def test_timeout_constant_is_ninety_seconds():
 def test_holding_lines_stay_short_progress_beats():
     assert is_holding_line("Looking up Durham events for November 14 and 15 now.")
     assert is_holding_line("Still searching…")
+    assert is_holding_line("Still searching")
+    assert is_holding_line("I'm looking up…")
+    assert is_holding_line("I’m looking up…")
+    assert is_holding_line("Looking up…")
+    # 2026-11-08 transcript, straight apostrophe. The quiet clock must not start.
+    assert is_holding_line("I'm looking up San Juan events for November 14 and 15 now.")
+    assert is_holding_line("I'm looking up indoor events in Cary for November 14 and 15 now.")
+    assert is_holding_line("I'm checking Saturday's forecast for Durham now.")
     assert not is_holding_line("Durham has a packed weekend, with the free Iron Pour festival.")
+    assert not is_holding_line("San Juan's big events this weekend are Wisin at the Coliseo.")
     assert late_phrase("DPAC lookup", "The show is at 7.") == (
         "That DPAC lookup just came back: The show is at 7."
     )
@@ -226,6 +235,7 @@ async def test_gap_replies_replayed_after_reconnect_land_on_their_own_tasks(capl
     replay_again = tasks.accept_reply("t43s1", "I found eight indoor options in Cary.", base + 23_746)
 
     assert holding["task_id"] == cary
+    assert any(f"id={cary} hop=queued holding=1 late=0" in m for m in [r.getMessage() for r in caplog.records])
     assert cary_list["task_id"] == cary
     assert durham_list["task_id"] == durham
     assert replay_again is None
@@ -235,6 +245,40 @@ async def test_gap_replies_replayed_after_reconnect_land_on_their_own_tasks(capl
     assert any(f"id={cary} hop=timeout_skipped" in m for m in messages)
     assert any(f"id={durham} hop=timeout_skipped" in m for m in messages)
     assert not any("outcome=timeout" in m for m in messages)
+    await tasks.aclose()
+
+
+@pytest.mark.asyncio
+async def test_san_juan_holding_line_keeps_a_20s_answer_in_the_open_task(caplog):
+    # 21a0a399622b: "I'm looking up San Juan…" was holding=0, quiet closed the task,
+    # and the real answer 14s later was late=1. A 20s gap stays inside the task.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    tasks = _tracker(None, timeout_s=30)
+    tasks.quiet_s = 0.05
+    task_id = tasks.start("San Juan events")
+    now = int(__import__("time").time() * 1000)
+    holding = tasks.accept_reply(
+        "t52s0",
+        "I'm looking up San Juan events for November 14 and 15 now.",
+        now,
+    )
+    assert holding["late"] is False
+    assert holding["task_id"] == task_id
+    assert tasks._open[task_id].quiet is None
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    answer = tasks.accept_reply(
+        "t52s1",
+        "San Juan's big events this weekend are Wisin at the Coliseo.",
+        now + 20_000,
+    )
+    assert answer["late"] is False
+    assert answer["task_id"] == task_id
+    assert answer["say"].startswith("San Juan's big events")
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"id={task_id} hop=queued holding=1 late=0" in m for m in messages)
+    assert any(f"id={task_id} hop=queued holding=0 late=0" in m for m in messages)
+    assert not any("late=1" in m for m in messages)
     await tasks.aclose()
 
 
