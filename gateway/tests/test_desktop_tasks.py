@@ -5,6 +5,7 @@ import pytest
 
 from stackchan_mcp.desktop_tasks import (
     DESKTOP_TASK_QUIET_S,
+    DESKTOP_TASK_RETRY_S,
     DESKTOP_TASK_TIMEOUT_S,
     TIMEOUT_DOWN_PHRASE,
     TIMEOUT_UP_PHRASE,
@@ -23,6 +24,7 @@ def test_timeout_constant_is_ninety_seconds():
     assert DESKTOP_TASK_TIMEOUT_S == 90
     # 12s covers a second bubble of the same answer without waiting out the 90s clock.
     assert DESKTOP_TASK_QUIET_S == 12
+    assert DESKTOP_TASK_RETRY_S == 45
 
 
 def test_holding_lines_stay_short_progress_beats():
@@ -233,4 +235,46 @@ async def test_gap_replies_replayed_after_reconnect_land_on_their_own_tasks(capl
     assert any(f"id={cary} hop=timeout_skipped" in m for m in messages)
     assert any(f"id={durham} hop=timeout_skipped" in m for m in messages)
     assert not any("outcome=timeout" in m for m in messages)
+    await tasks.aclose()
+
+
+@pytest.mark.asyncio
+async def test_no_reply_is_resent_once_never_twice(caplog):
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    sent = []
+
+    async def resend(request):
+        sent.append(request)
+        return True
+
+    tasks = DesktopTasks(
+        announce=None, channel_ready=lambda: True, resend=resend, timeout_s=2, retry_s=0.05
+    )
+    task_id = tasks.start("Indoor events in Cary")
+    await asyncio.sleep(0.15)
+    assert sent == ["Indoor events in Cary"]
+    assert tasks._open[task_id].resent is True
+    assert any(f"id={task_id} hop=resend" in r.getMessage() for r in caplog.records)
+    await asyncio.sleep(0.15)
+    assert sent == ["Indoor events in Cary"]
+    await tasks.aclose()
+
+
+@pytest.mark.asyncio
+async def test_delivered_task_is_never_resent():
+    sent = []
+
+    async def resend(request):
+        sent.append(request)
+        return True
+
+    tasks = DesktopTasks(
+        announce=None, channel_ready=lambda: True, resend=resend, timeout_s=2, retry_s=0.05
+    )
+    task_id = tasks.start("Durham events")
+    now = int(__import__("time").time() * 1000)
+    tasks.accept_reply("e1", "Durham has a busy weekend.", now)
+    await asyncio.sleep(0.15)
+    assert sent == []
+    assert task_id not in tasks._open or tasks._open[task_id].resent is False
     await tasks.aclose()
