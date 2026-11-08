@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createBridge, accountRpc, validateBody } from './gbot_voice_session_bridge.mjs';
+import { callAnswer, createBridge, accountRpc, filterNativeEvent, validateBody } from './gbot_voice_session_bridge.mjs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
 import { mkdtempSync, readFileSync } from 'node:fs';
@@ -323,4 +323,61 @@ test('a call left on disk is hung up before the next call registers', async () =
     await second.hangupActiveCall();
     assert.deepEqual(presence.at(-1), 'call-new:false');
   } finally { await new Promise(resolve => second.close(resolve)); }
+});
+
+test('a progress nudge is a result, and the same event id is not forwarded twice', () => {
+  const context = {agentId: 'a', callId: 'call-c', seen: new Set(), acceptsOverheard: false};
+  const progress = {eventId: 'evt-1', channel: 'voice-call-nudge', payload: {agentId: 'a', callId: 'call-c', kind: 'progress', update: 'Warm and dry.'}};
+  assert.equal(filterNativeEvent(progress, context)?.payload.kind, 'progress');
+  assert.equal(filterNativeEvent(progress, context), null);
+  assert.equal(filterNativeEvent({channel: 'voice-call-nudge', payload: {agentId: 'a', callId: 'call-c', kind: 'ack', update: 'got it'}}, context), null);
+  assert.equal(callAnswer({nudges: [{answer: '  '}, {answer: 'Warm and dry.'}]}), 'Warm and dry.');
+  assert.equal(callAnswer({nudges: []}), null);
+  assert.equal(callAnswer(
+    {nudges: [{answer: 'Yesterday', request: 'weather', atMs: 1_000, answeredAtMs: 1_000}]},
+    {sinceMs: 20_000, request: 'weather'},
+  ), null);
+  assert.equal(callAnswer(
+    {nudges: [
+      {answer: 'Warm', request: 'weather', answeredAtMs: 5_000},
+      {answer: 'A market', request: 'events', answeredAtMs: 30_000},
+    ]},
+    {sinceMs: 20_000, request: 'weather'},
+  ), null);
+  assert.equal(callAnswer(
+    {nudges: [{answer: 'Warm and dry.', request: 'weather', atMs: 19_000, answeredAtMs: 25_000}]},
+    {sinceMs: 20_000, request: 'weather'},
+  ), 'Warm and dry.');
+});
+
+test('warm runs once while another warm is in flight, and the call record answer is returned', async () => {
+  const port = await freePort();
+  let warmStarted = 0;
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const sandbox = {
+    callerAuthId: async () => 'owner',
+    presence: async () => {},
+    warm: () => { warmStarted += 1; return gate; },
+    getVoiceCall: async () => ({nudges: [{answer: 'FIXTURE ANSWER'}]}),
+  };
+  const server = createBridge({port, agentId: 'a', desktopEnabled: true, toolsEnabled: false, sandbox});
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  const post = (path, body) => fetch(`http://127.0.0.1:${port}${path}`, {
+    method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify(body),
+  });
+  try {
+    const first = post('/native/warm', {});
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const second = await post('/native/warm', {});
+    assert.equal(second.status, 200);
+    assert.equal((await second.json()).state, 'in_flight');
+    assert.equal(warmStarted, 1);
+    release();
+    const done = await first;
+    assert.equal((await done.json()).state, 'ready');
+    assert.equal((await post('/native/presence', {agentId: 'a', callId: 'call-c', isOnTheLine: true, acceptsOverheard: false})).status, 200);
+    const record = await post('/native/call', {agentId: 'a', callId: 'call-c'});
+    assert.equal((await record.json()).answer, 'FIXTURE ANSWER');
+  } finally { await new Promise(resolve => server.close(resolve)); }
 });

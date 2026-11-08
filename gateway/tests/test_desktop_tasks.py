@@ -1,10 +1,17 @@
 # SPDX-License-Identifier: MIT
 import asyncio
 import logging
+from unittest.mock import AsyncMock
 
 import pytest
 
-from stackchan_mcp.desktop_tasks import DESKTOP_TASK_TIMEOUT_S, DesktopTasks, failure_phrase
+from stackchan_mcp.desktop_tasks import (
+    DESKTOP_TASK_TIMEOUT_S,
+    TIMEOUT_DOWN_PHRASE,
+    TIMEOUT_UP_PHRASE,
+    DesktopTasks,
+    failure_phrase,
+)
 
 
 def _tracker(announce, *, ready=True, timeout_s=90.0):
@@ -50,9 +57,8 @@ async def test_landed_result_logs_delivered_once(caplog):
     tasks.start("events nearby")
     tasks.landed(spoken=True, text="There is a market on Saturday.")
     tasks.landed(spoken=True, text="extra")
-    lines = [r.getMessage() for r in caplog.records if r.message.startswith("desktop task")]
+    lines = [r.getMessage() for r in caplog.records if "outcome=delivered" in r.message]
     assert len(lines) == 1
-    assert "outcome=delivered" in lines[0]
     assert "market" not in lines[0]
     assert "events nearby" not in lines[0]
     await tasks.aclose()
@@ -70,7 +76,7 @@ async def test_timeout_speaks_a_failure_and_logs_timeout(caplog):
     tasks = _tracker(announce, ready=True, timeout_s=0.02)
     tasks.start("events nearby")
     await asyncio.sleep(0.08)
-    assert spoken == ["I couldn't finish looking up events nearby."]
+    assert spoken == [TIMEOUT_UP_PHRASE]
     line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
     assert "outcome=timeout" in line
     assert "events nearby" not in line
@@ -78,7 +84,10 @@ async def test_timeout_speaks_a_failure_and_logs_timeout(caplog):
 
 @pytest.mark.asyncio
 async def test_timeout_while_channel_down_logs_channel_down(caplog):
+    spoken = []
+
     async def announce(text):
+        spoken.append(text)
         return True
 
     caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
@@ -87,6 +96,7 @@ async def test_timeout_while_channel_down_logs_channel_down(caplog):
     await asyncio.sleep(0.08)
     line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
     assert "outcome=channel_down" in line
+    assert spoken == [TIMEOUT_DOWN_PHRASE]
 
 
 @pytest.mark.asyncio
@@ -101,7 +111,7 @@ async def test_unspoken_failure_is_exported_and_not_logged_yet(caplog):
     assert not any("outcome=" in r.message for r in caplog.records)
     exported = tasks.export_for_handoff()
     assert exported[0]["open"] is False
-    assert exported[0]["text"] == "I couldn't finish looking up events nearby."
+    assert exported[0]["text"] == TIMEOUT_UP_PHRASE
     assert exported[0]["outcome"] == "timeout"
 
 
@@ -126,3 +136,24 @@ async def test_exported_open_task_can_still_finish_on_the_next_tracker(caplog):
     line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
     assert "outcome=delivered" in line
     await second.aclose()
+
+
+@pytest.mark.asyncio
+async def test_status_check_delivers_the_record_and_does_not_time_out(caplog):
+    spoken = []
+
+    async def announce(text):
+        spoken.append(text)
+        return True
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    tasks = _tracker(announce, ready=True, timeout_s=0.2)
+    tasks.lookup = AsyncMock(return_value="Warm and dry.")
+    tasks.start("weather")
+    assert await tasks.recover() is True
+    await asyncio.sleep(0.3)
+    assert spoken == ["Warm and dry."]
+    assert tasks.lookup.await_count == 1
+    lines = [r.getMessage() for r in caplog.records if "outcome=" in r.message]
+    assert len(lines) == 1 and "outcome=delivered" in lines[0]
+    assert any("hop=status found=1" in r.message for r in caplog.records)

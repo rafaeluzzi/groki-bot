@@ -733,7 +733,7 @@ async def test_accepted_task_speaks_a_failure_after_the_turn(monkeypatch, caplog
     ]
     assert updates
     content = updates[-1]["async_update"]["payload"][0]["message"]["content"]
-    assert content == "I couldn't finish looking up events nearby."
+    assert content == "That one didn't come back in time."
     line = next(r.getMessage() for r in caplog.records if "outcome=" in r.message)
     assert "outcome=timeout" in line
     assert "events nearby" not in line
@@ -845,3 +845,89 @@ async def test_grace_that_does_not_recover_logs_the_wait(monkeypatch, caplog):
     )
     assert "Desktop tasks are down right now." in raw
     await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_replayed_result_is_handed_once(monkeypatch):
+    b = make(monkeypatch)
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "once", "arguments": '{"request":"weekend weather"}'}
+    )
+    event = {
+        "type": "async_update.add",
+        "event_id": "evt-1",
+        "desktop_kind": "progress",
+        "async_update": {
+            "topic": "work_landed",
+            "payload": [{"message": {"type": "text", "content": "Warm and dry."}}],
+        },
+    }
+    await b._native_update(event, False, track=True)
+    await b._native_update({**event, "event_id": "evt-2", "desktop_kind": "outcome"}, False, track=True)
+    queued = [
+        item
+        for item in b._pending_updates
+        if item.get("type") == "async_update.add"
+    ]
+    sent = [
+        call.args[0]
+        for call in b._send.call_args_list
+        if call.args[0].get("type") == "async_update.add"
+    ]
+    assert len(queued) + len(sent) == 1
+    carried = (queued or sent)[0]
+    assert carried["async_update"]["payload"][0]["message"]["content"] == "Warm and dry."
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_stream_gap_reads_the_call_record_once(monkeypatch):
+    b = make(monkeypatch)
+    b._desktop_tasks.lookup = AsyncMock(return_value="From the record.")
+    b._desktop_tasks.start("weather")
+    await b._on_native_gap()
+    await b._on_native_gap()
+    assert b._desktop_tasks.lookup.await_count == 1
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_warm_does_not_block_the_turn_and_skips_inside_the_window(monkeypatch):
+    b = make(monkeypatch)
+    b._http = object()
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def local(path, payload=None):
+        calls.append(path)
+        if path == "/native/warm":
+            started.set()
+            await release.wait()
+            return {"ok": True, "state": "ready", "ms": 4}
+        raise AssertionError(path)
+
+    b._local = local
+    started_at = asyncio.get_running_loop().time()
+    await b.send_text("what's the weather this weekend")
+    assert asyncio.get_running_loop().time() - started_at < 0.2
+    await asyncio.wait_for(started.wait(), 1)
+    await b.send_text("again")
+    assert calls == ["/native/warm"]
+    release.set()
+    await b._warm_task
+    await b.send_text("later")
+    assert calls == ["/native/warm"]
+    b._http = None
+    await b.stop()
+
+
+def test_a_fresh_reconnect_still_counts_as_the_channel_up(monkeypatch):
+    b = make(monkeypatch)
+    b._native.ready = False
+    b._native.within_reconnect_grace = lambda: True
+    assert b._desktop_channel_ready() is True
+    b._native.within_reconnect_grace = lambda: False
+    assert b._desktop_channel_ready() is False

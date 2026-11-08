@@ -23,6 +23,11 @@ RECONNECT_GRACE_S = 8.0
 # Ready more recently than this is a blip (the pod drops the socket and presence
 # returns within a few seconds). Down longer than this fails at once.
 RECONNECT_RECENT_S = 30.0
+# Skip another desktop wake when one succeeded, or a task was sent, more recently than this.
+WARM_SKIP_S = 300.0
+
+# The desktop speaks a finished lookup as either of these. An ack is only a receipt.
+NUDGE_RESULT_KINDS = frozenset({"progress", "outcome"})
 
 # The helper already reduces its errors to fixed words such as upstream_http_429.
 NATIVE_ERROR_RE = re.compile(r"^[A-Za-z0-9_]{1,64}$")
@@ -60,9 +65,13 @@ def update_event(message, agent_id, call_id):
     if payload.get("agentId") != agent_id or payload.get("callId") != call_id:
         return None
     channel = message.get("channel")
-    if channel == "voice-call-nudge" and payload.get("kind") == "outcome":
+    nudge_kind = None
+    if channel == "voice-call-nudge" and payload.get("kind") in NUDGE_RESULT_KINDS:
+        nudge_kind = payload.get("kind")
         text, topic = payload.get("update"), "work_landed"
-        event_id = "seeded-nudge-" + str(uuid.uuid4())
+        event_id = payload.get("eventId") or message.get("eventId")
+        if not isinstance(event_id, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", event_id):
+            event_id = "seeded-nudge-" + str(uuid.uuid4())
         timestamp = int(time.time() * 1000)
         is_user = False
     elif channel == "typed-message":
@@ -82,29 +91,30 @@ def update_event(message, agent_id, call_id):
         return None  # Overheard is a different native protocol, not a completed task.
     if not isinstance(text, str) or not text.strip() or len(text) > 64000:
         return None
-    return (
-        {
-            "type": "async_update.add",
-            "event_id": event_id,
-            "async_update": {
-                "topic": topic,
-                "payload": [
-                    {
-                        "message": {"type": "text", "content": text},
-                        "timestampMs": timestamp,
-                    }
-                ],
-            },
+    event = {
+        "type": "async_update.add",
+        "event_id": event_id,
+        "async_update": {
+            "topic": topic,
+            "payload": [
+                {
+                    "message": {"type": "text", "content": text},
+                    "timestampMs": timestamp,
+                }
+            ],
         },
-        is_user,
-    )
+    }
+    if nudge_kind:
+        event["desktop_kind"] = nudge_kind
+    return event, is_user
 
 
 class NativeVoiceChannel:
-    def __init__(self, http, base_url, agent_id, call_id, on_update):
+    def __init__(self, http, base_url, agent_id, call_id, on_update, on_gap=None):
         self._http, self._url = http, base_url
         self.agent_id, self.call_id = agent_id, call_id
         self._on_update = on_update
+        self._on_gap = on_gap
         self._task = None
         self._closed = False
         self._registered = False
@@ -184,8 +194,11 @@ class NativeVoiceChannel:
                     self._error,
                 )
             finally:
+                was_ready = self.connected.is_set()
                 self._registered = False
                 self.connected.clear()
+                if was_ready and not self._closed and self._on_gap is not None:
+                    asyncio.create_task(self._on_gap(), name="desktop-stream-gap")
             if not self._closed:
                 await asyncio.sleep(self._retry_delay)
 

@@ -52,6 +52,40 @@ def test_work_landed_is_native_data_and_cannot_grant_new_user_authority():
         "content": "Finished fixture task.",
     }
     assert not is_user
+    assert event["desktop_kind"] == "outcome"
+
+
+def test_progress_nudge_is_a_result_and_an_ack_is_not():
+    progress, is_user = update_event(
+        {
+            "channel": "voice-call-nudge",
+            "eventId": "evt-9",
+            "payload": {
+                "agentId": "fixture-agent",
+                "callId": "fixture-call",
+                "kind": "progress",
+                "update": "Warm and dry.",
+            },
+        },
+        "fixture-agent",
+        "fixture-call",
+    )
+    assert not is_user
+    assert progress["event_id"] == "evt-9"
+    assert progress["desktop_kind"] == "progress"
+    assert update_event(
+        {
+            "channel": "voice-call-nudge",
+            "payload": {
+                "agentId": "fixture-agent",
+                "callId": "fixture-call",
+                "kind": "ack",
+                "update": "got it",
+            },
+        },
+        "fixture-agent",
+        "fixture-call",
+    ) is None
 
 
 def test_only_filtered_current_user_message_becomes_a_user_update():
