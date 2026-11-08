@@ -149,6 +149,28 @@ test('server transcript stream drops replay and pre-connection entries and requi
   assert.equal(fetched,false);
 });
 
+test('transcript stream stops on abort even when the fetch and its body ignore it', async () => {
+  const {NativeTranscriptClient} = await import('./gbot_voice_session_bridge.mjs');
+  const hello = Buffer.from(JSON.stringify({connected:{serverTimeMs:1}}));
+  const prefix = Buffer.alloc(5); prefix.writeUInt32BE(hello.length, 1);
+  let sent = false;
+  // Neither the fetch nor the body source honours abort or cancel: the read only ends if we cancel it.
+  const body = new ReadableStream({
+    pull(controller) { if (!sent) { sent = true; controller.enqueue(Buffer.concat([prefix, hello])); return; } return new Promise(() => {}); },
+    cancel() { return new Promise(() => {}); },
+  });
+  const client = new NativeTranscriptClient({accountLoader: () => ({token:'t', machineId:'m'}),
+    fetcher: async () => new Response(body, {headers:{'content-type':'application/connect+json'}})});
+  const controller = new AbortController();
+  const started = Date.now();
+  const done = (async () => { for await (const ignored of client.events({agentId:'a', callId:'c', sessionId:'', sinceMs:0}, controller.signal)) {} })();
+  await new Promise(resolve => setTimeout(resolve, 50));
+  controller.abort();
+  const result = await Promise.race([done.then(() => 'ended'), new Promise(resolve => setTimeout(() => resolve('hung'), 1000))]);
+  assert.equal(result, 'ended');
+  assert.ok(Date.now() - started < 1000);
+});
+
 test('a nudge is a signal with no answer text, even when the text matches', async () => {
   const {filterNativeEvent} = await import('./gbot_voice_session_bridge.mjs');
   const context = {agentId:'a',callId:'call-c',seen:new Set()};

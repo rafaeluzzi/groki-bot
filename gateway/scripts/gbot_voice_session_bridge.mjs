@@ -210,9 +210,17 @@ export class NativeTranscriptClient {
     onOpen(response.status);
     let pending = Buffer.alloc(0);
     const state = {connected: false, sinceMs: context.sinceMs, generation: null};
+    // An aborted fetch can leave a body read pending for minutes. Cancelling the
+    // reader settles a pending read at once, whatever the socket does.
+    const reader = response.body?.getReader?.();
+    if (!reader) throw new Error('native_stream_format');
+    const stop = () => { reader.cancel().catch(() => {}); };
+    if (signal?.aborted) stop(); else signal?.addEventListener('abort', stop, {once: true});
     try {
-      for await (const bytes of response.body) {
-        const chunk = asBytes(bytes);
+      while (true) {
+        const next = await reader.read();
+        if (next.done) break;
+        const chunk = asBytes(next.value);
         if (!chunk) continue;
         pending = Buffer.concat([pending, chunk]);
         if (pending.length > 2 * 1024 * 1024) throw new Error('event_too_large');
@@ -227,7 +235,10 @@ export class NativeTranscriptClient {
           for (const item of event) yield item;
         }
       }
-    } finally { await response.body?.cancel().catch(() => {}); }
+    } finally {
+      signal?.removeEventListener('abort', stop);
+      stop();
+    }
   }
 }
 
