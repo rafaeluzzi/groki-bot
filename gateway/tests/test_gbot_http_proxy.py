@@ -58,6 +58,7 @@ class ProxyServer:
                 "FAKE_GBOT_STATE": str(self.state),
                 "PYTHONUNBUFFERED": "1",
                 "PYTHONPATH": str(GATEWAY_DIR),
+                "STACKCHAN_SKIP_DOTENV": "1",
             }
         )
         env.pop("STACKCHAN_TOOL_BOT", None)

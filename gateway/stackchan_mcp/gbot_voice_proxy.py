@@ -185,7 +185,12 @@ class GbotVoiceProxy(GeminiVoiceProxy):
 
     def _abandon_desktop_work(self):
         for item in self._desktop_unsaid:
-            log_desktop_task(str(item.get("id")), str(item.get("start")), "failed")
+            log_desktop_task(
+                str(item.get("id")),
+                str(item.get("start")),
+                "failed",
+                waited_ms=int(item.get("waited_ms") or 0),
+            )
         self._desktop_unsaid.clear()
 
     async def stop(self):

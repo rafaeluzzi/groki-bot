@@ -27,14 +27,22 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def log_desktop_task(task_id: str, started: str, outcome: str, *, ended: str | None = None) -> None:
-    """One line: id, start, end, outcome. The request text stays out of the log."""
+def log_desktop_task(
+    task_id: str,
+    started: str,
+    outcome: str,
+    *,
+    ended: str | None = None,
+    waited_ms: int = 0,
+) -> None:
+    """One line: id, start, end, outcome, how long a reconnect wait lasted. No request text."""
     logger.info(
-        "desktop task id=%s start=%s end=%s outcome=%s",
+        "desktop task id=%s start=%s end=%s outcome=%s waited_ms=%d",
         task_id,
         started,
         ended or _now(),
         outcome,
+        int(waited_ms),
     )
 
 
@@ -53,6 +61,7 @@ class _OpenTask:
     request: str
     started: str
     deadline_mono: float
+    waited_ms: int = 0
     timer: asyncio.Task | None = None
     done: bool = False
 
@@ -68,18 +77,23 @@ class DesktopTasks:
     _unsaid: list[dict] = field(default_factory=list)
     _cancelled: list = field(default_factory=list)
 
-    def refuse(self) -> None:
+    def refuse(self, waited_ms: int = 0) -> None:
         """The desktop channel was down, so the tool did not hand the task off."""
         now = _now()
-        log_desktop_task(uuid.uuid4().hex[:12], now, "channel_down", ended=now)
+        log_desktop_task(
+            uuid.uuid4().hex[:12], now, "channel_down", ended=now, waited_ms=waited_ms
+        )
 
-    def start(self, request: str) -> str:
+    def start(self, request: str, *, waited_ms: int = 0) -> str:
         task_id = uuid.uuid4().hex[:12]
+        # The reconnect wait is part of the 90s budget, not extra time.
+        budget = max(0.0, self.timeout_s - max(0, waited_ms) / 1000.0)
         task = _OpenTask(
             id=task_id,
             request=str(request or ""),
             started=_now(),
-            deadline_mono=time.monotonic() + self.timeout_s,
+            deadline_mono=time.monotonic() + budget,
+            waited_ms=max(0, int(waited_ms)),
         )
         self._open[task_id] = task
         task.timer = asyncio.create_task(self._expire(task), name="desktop-task-timeout")
@@ -93,7 +107,7 @@ class DesktopTasks:
         self._finish_open(task)
         phrase = text.strip() if isinstance(text, str) else ""
         if spoken:
-            log_desktop_task(task.id, task.started, "delivered")
+            log_desktop_task(task.id, task.started, "delivered", waited_ms=task.waited_ms)
             return
         self._unsaid.append(
             {
@@ -101,6 +115,7 @@ class DesktopTasks:
                 "id": task.id,
                 "start": task.started,
                 "outcome": "delivered",
+                "waited_ms": task.waited_ms,
                 "text": phrase or failure_phrase(task.request),
             }
         )
@@ -118,6 +133,7 @@ class DesktopTasks:
                     "request": task.request,
                     "start": task.started,
                     "remaining_s": max(0.0, task.deadline_mono - now),
+                    "waited_ms": task.waited_ms,
                 }
             )
         items.extend(self._unsaid)
@@ -133,6 +149,7 @@ class DesktopTasks:
             request=str(item.get("request") or ""),
             started=str(item["start"]),
             deadline_mono=time.monotonic() + float(item.get("remaining_s") or 0),
+            waited_ms=int(item.get("waited_ms") or 0),
         )
         self._open[task.id] = task
         task.timer = asyncio.create_task(self._expire(task), name="desktop-task-timeout")
@@ -187,7 +204,7 @@ class DesktopTasks:
             logger.warning("desktop task announcement failed id=%s", task.id)
             said = False
         if said:
-            log_desktop_task(task.id, task.started, outcome)
+            log_desktop_task(task.id, task.started, outcome, waited_ms=task.waited_ms)
             return
         self._unsaid.append(
             {
@@ -195,6 +212,7 @@ class DesktopTasks:
                 "id": task.id,
                 "start": task.started,
                 "outcome": outcome,
+                "waited_ms": task.waited_ms,
                 "text": phrase,
             }
         )

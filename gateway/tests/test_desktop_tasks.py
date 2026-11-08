@@ -19,6 +19,19 @@ def test_failure_phrase_uses_the_request():
     assert failure_phrase("events nearby") == "I couldn't finish looking up events nearby."
 
 
+@pytest.mark.asyncio
+async def test_reconnect_wait_comes_out_of_the_timeout_budget():
+    import time
+
+    tasks = _tracker(None, timeout_s=90)
+    tasks.start("events nearby", waited_ms=2000)
+    task = next(iter(tasks._open.values()))
+    remaining = task.deadline_mono - time.monotonic()
+    assert 87 <= remaining <= 88.5
+    assert task.waited_ms == 2000
+    await tasks.aclose()
+
+
 def test_refuse_logs_channel_down_without_the_request(caplog):
     caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
     _tracker(None).refuse()
