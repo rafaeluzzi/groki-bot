@@ -17,13 +17,14 @@ import re
 import struct
 import time
 import uuid
+from datetime import datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 
-from .desktop_tasks import DesktopTasks, log_desktop_task
+from .desktop_tasks import DesktopTasks, log_desktop_hop, log_desktop_task
 from .voice_output_queue import VoiceOutputQueue
-from .gbot_native_channel import RECONNECT_GRACE_S, NativeVoiceChannel
+from .gbot_native_channel import RECONNECT_GRACE_S, WARM_SKIP_S, NativeVoiceChannel
 
 logger = logging.getLogger(__name__)
 
@@ -202,7 +203,11 @@ class GbotVoiceBridge:
         self._desktop_tasks = DesktopTasks(
             announce=self._announce_desktop,
             channel_ready=self._desktop_channel_ready,
+            lookup=self._lookup_desktop_answer,
         )
+        self._nudge_seen: set[str] = set()
+        self._used_mono = None
+        self._warm_task = None
         self.metrics = {
             "input_pcm_bytes": 0,
             "output_pcm_bytes": 0,
@@ -470,6 +475,8 @@ class GbotVoiceBridge:
             "say desktop tasks are down or answer from what you know. "
             "Do not promise to look it up later or get back to them. "
             "If relay=accepted, a later result or a short failure is spoken even after this turn; do not invent the result. "
+            "When that failure says the task did not come back in time, say that. "
+            "Say desktop tasks are down only when the tool result says they are down. "
             "When a tool result includes spoken, read only spoken to the user; do not read relay, errorClass, "
             "error codes, field names or debug info."
         )
@@ -645,10 +652,14 @@ class GbotVoiceBridge:
         await self._flush_pending()
 
     def _desktop_channel_ready(self) -> bool:
+        """Up when the stream is ready, or it dropped a moment ago and is reconnecting."""
         native = self._native
-        return bool(
-            native and getattr(native, "ready", False) and self.running and not self._stopped
-        )
+        if native is None or not self.running or self._stopped:
+            return False
+        if getattr(native, "ready", False):
+            return True
+        grace = getattr(native, "within_reconnect_grace", None)
+        return bool(callable(grace) and grace())
 
     async def _announce_desktop(self, text: str) -> bool:
         if self._stopped or not self.running:
@@ -674,6 +685,62 @@ class GbotVoiceBridge:
                 waited_ms=int(item.get("waited_ms") or 0),
             )
         return said
+
+    def _maybe_warm(self) -> None:
+        """Wake a desktop that has been idle. The voice turn does not wait."""
+        if self._http is None or not self._desktop_enabled:
+            return
+        if self._used_mono is not None and (time.monotonic() - self._used_mono) < WARM_SKIP_S:
+            return
+        if self._warm_task is not None and not self._warm_task.done():
+            return
+        self._warm_task = asyncio.create_task(self._warm_desktop(), name="desktop-warm")
+
+    async def _warm_desktop(self) -> None:
+        logger.info("desktop warm hop=warm_start")
+        started = time.monotonic()
+        try:
+            result = await self._local("/native/warm", {})
+        except Exception:
+            logger.info("desktop warm hop=warm_ready ms=%d state=failed", int((time.monotonic() - started) * 1000))
+            return
+        ms = result.get("ms") if isinstance(result, dict) else None
+        if not isinstance(ms, int):
+            ms = int((time.monotonic() - started) * 1000)
+        state = result.get("state") if isinstance(result, dict) else None
+        state = state if state in {"ready", "in_flight", "failed"} else "ready"
+        logger.info("desktop warm hop=warm_ready ms=%d state=%s", ms, state)
+        if state == "ready":
+            self._used_mono = time.monotonic()
+
+    async def _on_native_gap(self) -> None:
+        """The box stream dropped. One status read covers a result that arrived in the gap."""
+        if not self._desktop_tasks._open:
+            return
+        task = self._desktop_tasks._oldest()
+        if task is not None:
+            log_desktop_hop(task.id, "stream_gap")
+        await self._desktop_tasks.recover()
+
+    async def _lookup_desktop_answer(self):
+        if self._http is None:
+            return None
+        task = self._desktop_tasks._oldest()
+        payload = {"agentId": self.agent_id, "callId": self.call_id}
+        if task is not None:
+            payload["request"] = task.request[:1500]
+            try:
+                payload["sinceMs"] = int(datetime.fromisoformat(task.started).timestamp() * 1000)
+            except ValueError:
+                pass
+        try:
+            result = await self._local("/native/call", payload)
+        except Exception:
+            return None
+        answer = result.get("answer") if isinstance(result, dict) else None
+        if not isinstance(answer, str) or not answer.strip():
+            return None
+        return answer
 
     async def _wait_for_native(self) -> int:
         """Wait out a short reconnect. Returns how long the wait lasted, in ms.
@@ -707,12 +774,26 @@ class GbotVoiceBridge:
         counts[key] = counts.get(key, 0) + 1
         logger.info("Grok native update topic=%s state=%s", topic, state)
         if track and topic == "work_landed" and not is_user:
+            event_id = event.get("event_id")
+            if isinstance(event_id, str) and event_id in self._nudge_seen:
+                return
+            if isinstance(event_id, str):
+                self._nudge_seen.add(event_id)
+                if len(self._nudge_seen) > 2000:
+                    self._nudge_seen.clear()
             text = ""
             payload = event.get("async_update", {}).get("payload") or []
             if payload and isinstance(payload[0], dict):
                 content = (payload[0].get("message") or {}).get("content")
                 if isinstance(content, str):
                     text = content
+            kind = event.get("desktop_kind")
+            kind = kind if kind in {"progress", "outcome"} else "outcome"
+            task = self._desktop_tasks._oldest()
+            if task is None:
+                logger.info("Grok native update topic=%s state=ignored reason=no_open_task", topic)
+                return
+            log_desktop_hop(task.id, "handed", kind=kind)
             self._desktop_tasks.landed(spoken=state != "dropped", text=text)
         if self._stopped or not self.running:
             return
@@ -901,6 +982,7 @@ class GbotVoiceBridge:
                     self.agent_id,
                     self.call_id,
                     self._native_from_channel,
+                    on_gap=self._on_native_gap,
                 )
                 await self._native.start()
             self.metrics["startup_stage"] = "started"
@@ -987,6 +1069,7 @@ class GbotVoiceBridge:
         return None
 
     async def send_text(self, text):
+        self._maybe_warm()
         self._cancel_idle()
         self._user_epoch += 1
         if self._executor:
@@ -1047,6 +1130,7 @@ class GbotVoiceBridge:
             self.response_started_at[self._active_response] = time.monotonic()
             self._drop_until_response = False
         elif kind == "input_audio_buffer.speech_started":
+            self._maybe_warm()
             self._response_progress_at = None
             self.metrics["speech_starts"] += 1
             self._user_epoch += 1
@@ -1239,6 +1323,7 @@ class GbotVoiceBridge:
                     result = self._native_tool_result("send_task", result)
                     outcome = "native_" + result["relay"]
                     if result.get("relay") == "accepted":
+                        self._used_mono = time.monotonic()
                         self._desktop_tasks.start(request, waited_ms=waited_ms)
             elif name == "end_the_call":
                 result = {"ok": True}

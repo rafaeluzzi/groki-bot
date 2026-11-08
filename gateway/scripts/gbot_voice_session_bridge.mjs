@@ -146,6 +146,28 @@ export class NativeSandboxClient {
   }
   // The box stream died under us. Forget the URL so the next presence wakes a pod.
   invalidate() { this.#connection = undefined; }
+  // Wake a hibernated pod. /health goes through #fetch, so a 417 still drops the
+  // cache and runs EnsureSandBox. Do not open /events: a second stream makes the
+  // pod close the one this process is already reading.
+  async warm() {
+    try {
+      const health = await this.#fetch('/health', {signal: AbortSignal.timeout(20000)});
+      await health.body?.cancel();
+      if (!health.ok) throw new Error(`upstream_http_${health.status}`);
+    } catch {
+      this.invalidate();
+      await this.#connect();
+    }
+  }
+  async getVoiceCall({agentId, callId}) {
+    const response = await this.#fetch('/api/getVoiceCall', {
+      method: 'POST', headers: {'content-type': 'application/json'},
+      body: JSON.stringify({id: agentId, callId}), signal: AbortSignal.timeout(20000),
+    });
+    if (response.status === 404) { await response.body?.cancel(); return null; }
+    if (!response.ok) { await response.body?.cancel(); throw new Error(`upstream_http_${response.status}`); }
+    return response.json();
+  }
   async openEvents(signal) {
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), 20000);
@@ -246,11 +268,33 @@ export function filterTranscriptFrame(frame, context, state) {
   return result;
 }
 
+// A nudge created while send_task is still on the wire can be stamped slightly before we log the start.
+const ANSWER_SKEW_MS = 3000;
+
+export function callAnswer(record, opts = {}) {
+  const nudges = record && Array.isArray(record.nudges) ? record.nudges : [];
+  const since = Number(opts.sinceMs);
+  const wanted = typeof opts.request === 'string' ? opts.request.trim().slice(0, 1500) : '';
+  for (let i = nudges.length - 1; i >= 0; i--) {
+    const nudge = nudges[i];
+    const text = nudge && typeof nudge.answer === 'string' ? nudge.answer.trim() : '';
+    if (!text) continue;
+    const stored = nudge && typeof nudge.request === 'string' ? nudge.request.trim().slice(0, 1500) : '';
+    if (wanted && stored && stored !== wanted) continue;
+    const stamp = Number(nudge.answeredAtMs ?? nudge.atMs);
+    if (Number.isFinite(since) && Number.isFinite(stamp) && stamp + ANSWER_SKEW_MS < since) continue;
+    return text.slice(0, 16000);
+  }
+  return null;
+}
+
+const NUDGE_KINDS = new Set(['ack', 'progress', 'outcome', 'overheard']);
+
 export function filterNativeEvent(event, context) {
   const p = event?.payload;
   if (!p || typeof p !== 'object') return null;
   if (event.channel === 'voice-call-nudge') {
-    if (p.agentId !== context.agentId || p.callId !== context.callId || !['outcome', 'overheard'].includes(p.kind) || typeof p.update !== 'string' || !p.update.trim()) return null;
+    if (p.agentId !== context.agentId || p.callId !== context.callId || !['progress', 'outcome', 'overheard'].includes(p.kind) || typeof p.update !== 'string' || !p.update.trim()) return null;
     if (p.kind === 'overheard' && !context.acceptsOverheard) return null;
     // Equal text is not an event identity: separate tasks can return exactly
     // the same result. Only an explicit upstream event ID can identify replay.
@@ -261,7 +305,9 @@ export function filterNativeEvent(event, context) {
       if (context.seen.has(key)) return null;
       context.seen.add(key);
     }
-    return {channel: 'voice-call-nudge', payload: {agentId: p.agentId, callId: p.callId, kind: p.kind, update: p.update.slice(0, 16000)}};
+    const payload = {agentId: p.agentId, callId: p.callId, kind: p.kind, update: p.update.slice(0, 16000)};
+    if (eventId !== undefined) payload.eventId = eventId;
+    return {channel: 'voice-call-nudge', payload};
   }
   if (event.channel !== 'transcript' || p.type !== 'appended') return null;
   // Ordered replica keys are the authoritative agent/session scope in 0.71.2.
@@ -361,6 +407,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
   const logStream = (source, state, extra = {}) => nativeLog({source, state, at: new Date().toISOString(), ...extra});
   let activeCall = null;
   let presenceBusy = false;
+  let warmFlight = null;
   const streams = new Set();
   const hangupActiveCall = async () => {
     const call = activeCall || loadCall(callStore);
@@ -381,6 +428,45 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
     if (address !== '127.0.0.1' || req.headers.origin !== undefined || req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'none' || req.headers.host !== `127.0.0.1:${port}`) return send(403, { ok: false, error: 'local_client_only' });
     const route = `${req.method} ${req.url}`;
     if (route === 'GET /health') return send(200, { ok: true, source: 'grok-bot-existing-login', clientVersion: '0.71.2', agentId: agentId || null, toolsEnabled, desktopEnabled });
+    if (route === 'POST /native/warm') {
+      if (!desktopEnabled && !toolsEnabled) return send(403, {ok: false, error: 'desktop_disabled'});
+      if (warmFlight) return send(200, {ok: true, state: 'in_flight', ms: 0});
+      const started = Date.now();
+      logStream('warm', 'start', {});
+      const run = typeof sandbox.warm === 'function' ? sandbox.warm() : Promise.resolve();
+      warmFlight = Promise.resolve(run).then(
+        () => {
+          const ms = Date.now() - started;
+          logStream('warm', 'ready', {ms});
+          return {ok: true, state: 'ready', ms};
+        },
+        () => {
+          const ms = Date.now() - started;
+          logStream('warm', 'ready', {ms, state: 'failed'});
+          return {ok: true, state: 'failed', ms};
+        },
+      ).finally(() => { warmFlight = null; });
+      return send(200, await warmFlight);
+    }
+    if (route === 'POST /native/call') {
+      if (!desktopEnabled && !toolsEnabled) return send(403, {ok: false, error: 'desktop_disabled'});
+      if (!activeCall) return send(403, {ok: false, error: 'call_not_allowed'});
+      let raw = '';
+      for await (const chunk of req) { raw += chunk; if (Buffer.byteLength(raw) > 4096) return send(413, {ok: false, error: 'body_too_large'}); }
+      let body;
+      try { body = raw ? JSON.parse(raw) : {}; } catch { return send(400, {ok: false, error: 'invalid_body'}); }
+      if (body.agentId !== agentId || body.callId !== activeCall.callId) return send(403, {ok: false, error: 'call_not_allowed'});
+      if (typeof sandbox.getVoiceCall !== 'function') return send(200, {ok: true, answer: null});
+      const sinceMs = typeof body.sinceMs === 'number' && Number.isFinite(body.sinceMs) ? body.sinceMs : undefined;
+      const request = typeof body.request === 'string' ? body.request.slice(0, 1500) : '';
+      try {
+        const record = await sandbox.getVoiceCall({agentId, callId: activeCall.callId});
+        return send(200, {ok: true, answer: callAnswer(record, {sinceMs, request})});
+      } catch (error) {
+        const safe = /^upstream_http_\d{3}$/.test(error?.message) ? error.message : 'bridge_request_failed';
+        return send(502, {ok: false, error: safe});
+      }
+    }
     if (route === 'GET /native/health') {
       if (!desktopEnabled && !toolsEnabled) return send(403, {ok: false, error: 'desktop_disabled'});
       try { return send(200, await sandbox.probe()); }
@@ -440,10 +526,22 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
               continue;
             }
             let event;
+            let parsed;
             try {
-              const parsed = JSON.parse(data);
+              parsed = JSON.parse(data);
               const id = block.split('\n').find(line => line.startsWith('id:'))?.slice(3).trim();
               event = filterNativeEvent(id ? {...parsed, eventId: id} : parsed, context);
+              const kind = NUDGE_KINDS.has(parsed?.payload?.kind) ? parsed.payload.kind : 'other';
+              const channel = typeof parsed?.channel === 'string' && /^[a-z0-9-]{1,40}$/.test(parsed.channel) ? parsed.channel : 'other';
+              if (!context.notedChannels) context.notedChannels = new Set();
+              const firstOther = channel !== 'voice-call-nudge' && !context.notedChannels.has(channel);
+              if (firstOther && context.notedChannels.size < 30) context.notedChannels.add(channel);
+              if (channel === 'voice-call-nudge' || firstOther) {
+                logStream('box', 'event', {
+                  channel, kind, forwarded: event?.channel === 'voice-call-nudge',
+                  event_id: typeof id === 'string' && id.length > 0 && id.length <= 80 ? id : null,
+                });
+              }
             } catch { continue; }
             if (event?.channel === 'typed-message') event = null;
             if (event && !res.write('data: ' + JSON.stringify(event) + '\n\n')) throw new Error('slow_consumer');

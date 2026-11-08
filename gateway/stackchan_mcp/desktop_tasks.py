@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 # One place to change. A desktop lookup that has not landed by then is spoken as a failure.
 DESKTOP_TASK_TIMEOUT_S = 90.0
+# The channel was up, and neither the stream nor the call record had a result.
+TIMEOUT_UP_PHRASE = "That one didn't come back in time."
+# The channel was down when the wait ended.
+TIMEOUT_DOWN_PHRASE = "Desktop tasks are down right now."
 
 
 def _now() -> str:
@@ -44,6 +48,12 @@ def log_desktop_task(
         outcome,
         int(waited_ms),
     )
+
+
+def log_desktop_hop(task_id: str, hop: str, **fields: object) -> None:
+    """One hop for a task. Extra fields are fixed words, never the request or the result."""
+    extra = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info("desktop task id=%s hop=%s%s", task_id, hop, f" {extra}" if extra else "")
 
 
 def failure_phrase(request: str) -> str:
@@ -72,7 +82,9 @@ class DesktopTasks:
 
     announce: object
     channel_ready: object
+    lookup: object = None
     timeout_s: float = DESKTOP_TASK_TIMEOUT_S
+    _lookup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     _open: dict[str, _OpenTask] = field(default_factory=dict)
     _unsaid: list[dict] = field(default_factory=list)
     _cancelled: list = field(default_factory=list)
@@ -97,6 +109,7 @@ class DesktopTasks:
         )
         self._open[task_id] = task
         task.timer = asyncio.create_task(self._expire(task), name="desktop-task-timeout")
+        log_desktop_hop(task_id, "accepted", at=task.started)
         return task_id
 
     def landed(self, *, spoken: bool, text: str) -> None:
@@ -107,6 +120,7 @@ class DesktopTasks:
         self._finish_open(task)
         phrase = text.strip() if isinstance(text, str) else ""
         if spoken:
+            log_desktop_hop(task.id, "spoken")
             log_desktop_task(task.id, task.started, "delivered", waited_ms=task.waited_ms)
             return
         self._unsaid.append(
@@ -165,6 +179,46 @@ class DesktopTasks:
         if cancelled:
             await asyncio.gather(*cancelled, return_exceptions=True)
 
+    async def recover(self) -> bool:
+        """One status read. Speaks a stored answer once, when a task is still open."""
+        if not self._open or self.lookup is None:
+            return False
+        async with self._lookup_lock:
+            task = self._oldest()
+            if task is None:
+                return False
+            text = None
+            try:
+                text = await self.lookup()
+            except Exception:
+                text = None
+            found = isinstance(text, str) and bool(text.strip())
+            log_desktop_hop(task.id, "status", found=int(found))
+            if not found or task.done or task.id not in self._open:
+                return False
+            self._finish_open(task)
+            said = False
+            try:
+                said = bool(await self.announce(text.strip()))
+            except Exception:
+                logger.warning("desktop task announcement failed id=%s", task.id)
+                said = False
+            if said:
+                log_desktop_hop(task.id, "spoken")
+                log_desktop_task(task.id, task.started, "delivered", waited_ms=task.waited_ms)
+                return True
+            self._unsaid.append(
+                {
+                    "open": False,
+                    "id": task.id,
+                    "start": task.started,
+                    "outcome": "delivered",
+                    "waited_ms": task.waited_ms,
+                    "text": text.strip(),
+                }
+            )
+            return True
+
     def _oldest(self) -> _OpenTask | None:
         open_tasks = [task for task in self._open.values() if not task.done]
         if not open_tasks:
@@ -189,6 +243,10 @@ class DesktopTasks:
                 return
         if task.done or task.id not in self._open:
             return
+        if await self.recover():
+            return
+        if task.done or task.id not in self._open:
+            return
         self._finish_open(task)
         ready = False
         try:
@@ -196,7 +254,7 @@ class DesktopTasks:
         except Exception:
             ready = False
         outcome = "timeout" if ready else "channel_down"
-        phrase = failure_phrase(task.request)
+        phrase = TIMEOUT_UP_PHRASE if ready else TIMEOUT_DOWN_PHRASE
         said = False
         try:
             said = bool(await self.announce(phrase))
@@ -204,6 +262,7 @@ class DesktopTasks:
             logger.warning("desktop task announcement failed id=%s", task.id)
             said = False
         if said:
+            log_desktop_hop(task.id, "spoken")
             log_desktop_task(task.id, task.started, outcome, waited_ms=task.waited_ms)
             return
         self._unsaid.append(
