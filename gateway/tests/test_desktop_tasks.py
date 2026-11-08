@@ -38,6 +38,8 @@ def test_holding_lines_stay_short_progress_beats():
     assert is_holding_line("I'm looking up San Juan events for November 14 and 15 now.")
     assert is_holding_line("I'm looking up indoor events in Cary for November 14 and 15 now.")
     assert is_holding_line("I'm checking Saturday's forecast for Durham now.")
+    assert is_holding_line("I'm pulling Saturday's hourly forecast for Durham now.")
+    assert not is_holding_line("I'm not seeing any events now.")
     assert not is_holding_line("Durham has a packed weekend, with the free Iron Pour festival.")
     assert not is_holding_line("San Juan's big events this weekend are Wisin at the Coliseo.")
     assert late_phrase("DPAC lookup", "The show is at 7.") == (
@@ -275,6 +277,39 @@ async def test_san_juan_holding_line_keeps_a_20s_answer_in_the_open_task(caplog)
     assert answer["late"] is False
     assert answer["task_id"] == task_id
     assert answer["say"].startswith("San Juan's big events")
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"id={task_id} hop=queued holding=1 late=0" in m for m in messages)
+    assert any(f"id={task_id} hop=queued holding=0 late=0" in m for m in messages)
+    assert not any("late=1" in m for m in messages)
+    await tasks.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pulling_forecast_line_keeps_a_20s_answer_in_the_open_task(caplog):
+    # a8195e8708a3: "I'm pulling Saturday's hourly forecast for Durham now."
+    # was holding=0, so the quiet clock started before the forecast arrived.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    tasks = _tracker(None, timeout_s=30)
+    tasks.quiet_s = 0.05
+    task_id = tasks.start("Durham hourly forecast")
+    now = int(__import__("time").time() * 1000)
+    holding = tasks.accept_reply(
+        "t54s0",
+        "I'm pulling Saturday's hourly forecast for Durham now.",
+        now,
+    )
+    assert holding["late"] is False
+    assert holding["task_id"] == task_id
+    assert tasks._open[task_id].quiet is None
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    answer = tasks.accept_reply(
+        "t54s1",
+        "Saturday in Durham looks dry, cool, and breezy.",
+        now + 20_000,
+    )
+    assert answer["late"] is False
+    assert answer["task_id"] == task_id
     messages = [r.getMessage() for r in caplog.records]
     assert any(f"id={task_id} hop=queued holding=1 late=0" in m for m in messages)
     assert any(f"id={task_id} hop=queued holding=0 late=0" in m for m in messages)

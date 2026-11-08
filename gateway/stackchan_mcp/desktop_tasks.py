@@ -46,12 +46,15 @@ TIMEOUT_DOWN_PHRASE = "Desktop tasks are down right now."
 # Progress beats the box sends before the answer. Spoken, but they leave the task open.
 # The transcript uses a straight apostrophe ("I'm looking up … now."). The pattern
 # used to require U+2019, so that line started the quiet clock.
+# The verb is not fixed: "I'm looking up … now.", "I'm checking … now.",
+# "I'm pulling Saturday's hourly forecast for Durham now." Same shape.
 _APOSTROPHE = str.maketrans({"\u2018": "'", "\u2019": "'", "`": "'"})
 _HOLDING_RE = re.compile(
     r"^(looking up|still looking|still searching|searching|checking|working on|"
     r"let me look|i'll look|i'm looking|i'm checking|on it|one moment)\b",
     re.IGNORECASE,
 )
+_HOLDING_NOW_RE = re.compile(r"^i'm \w+ing\b.*\bnow\.?$", re.IGNORECASE)
 
 
 def _now() -> str:
@@ -67,13 +70,13 @@ def is_holding_line(text: str) -> bool:
 
     Seen on the voice transcript: "I'm looking up San Juan events for November
     14 and 15 now.", "I'm checking Saturday's forecast for Durham now.",
-    "Looking up…", "Still searching". A holding line is spoken and does not
-    start the quiet clock.
+    "I'm pulling Saturday's hourly forecast for Durham now.", "Looking up…",
+    "Still searching". A holding line is spoken and does not start the quiet clock.
     """
     compact = " ".join(str(text or "").split()).translate(_APOSTROPHE)
     if not compact or len(compact) > 200:
         return False
-    if _HOLDING_RE.match(compact):
+    if _HOLDING_RE.match(compact) or _HOLDING_NOW_RE.match(compact):
         return True
     return len(compact) <= 120 and (compact.endswith("…") or compact.endswith("..."))
 
