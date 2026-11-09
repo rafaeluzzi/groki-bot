@@ -1168,14 +1168,14 @@ async def test_late_reply_after_timeout_is_spoken_once(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_reply_is_logged_cancelled_and_resent_once(monkeypatch, caplog):
+async def test_cancelled_reply_is_not_spoken_again_and_does_not_start_quiet(monkeypatch, caplog):
     import logging
 
     caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
     caplog.set_level(logging.INFO, logger="stackchan_mcp.gbot_voice_bridge")
     b = make(monkeypatch)
-    b._resend_wait_s = 0.05
-    b._desktop_tasks.start("Saturday market")
+    b._desktop_tasks.quiet_s = 0.05
+    task_id = b._desktop_tasks.start("Saturday market")
     await b._native_update(_reply("The market opens at 8.", "e-cancel"), False, track=True)
     await b._handle_event(
         {
@@ -1187,23 +1187,25 @@ async def test_cancelled_reply_is_logged_cancelled_and_resent_once(monkeypatch, 
     await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
     assert any("outcome=cancelled" in r.message for r in caplog.records)
     assert not any("outcome=delivered" in r.message for r in caplog.records)
-    await asyncio.sleep(0.12)
+    await asyncio.sleep(0.2)
     texts = [
         item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
     ]
-    assert texts.count("The market opens at 8.") == 2
-    await b._handle_event(
-        {
-            "type": "response.created",
-            "response": {"id": "cut-2", "metadata": {"trigger": "async_update"}},
-        }
-    )
-    await b._handle_event({"type": "input_audio_buffer.speech_started"})
-    await asyncio.sleep(0.12)
+    assert texts.count("The market opens at 8.") == 1
+    assert task_id in b._desktop_tasks._open
+    task = b._desktop_tasks._open[task_id]
+    assert task.quiet is None
+    assert task.pending_playback == 0
+    assert not any(f"id={task_id} hop=quiet" in r.message for r in caplog.records)
+    await b._native_update(_reply("It opens at nine.", "e-later"), False, track=True)
     texts = [
         item["async_update"]["payload"][0]["message"]["content"] for item in _updates(b)
     ]
-    assert texts.count("The market opens at 8.") == 2
+    assert texts.count("The market opens at 8.") == 1
+    assert texts.count("It opens at nine.") == 1
+    assert not any("just came back" in text for text in texts)
+    assert task_id in b._desktop_tasks._open
+    assert b._desktop_tasks._open[task_id].quiet is None
     await b.stop()
 
 
