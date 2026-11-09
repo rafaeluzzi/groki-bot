@@ -743,6 +743,98 @@ async def test_accepted_task_is_delivered_when_work_lands(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
+async def test_unlabeled_reply_is_spoken_and_quiet_waits_for_playback(monkeypatch, caplog):
+    # 13e84dcebc96: the answer's response was trigger=other, so it never logged
+    # spoken, and quiet had already started at queue time.
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    release = asyncio.Event()
+
+    async def playback():
+        await release.wait()
+
+    b = make(monkeypatch)
+    b._on_turn_complete = playback
+    b._desktop_tasks.quiet_s = 0.05
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "ash", "arguments": '{"request":"Asheville forecast"}'}
+    )
+    await b._handle_event({"type": "input_audio_buffer.speech_stopped"})
+    b._pending_response = False
+    b._response_requested = False
+    await b._native_update(_reply("Tuesday in Asheville stays dry.", "t59s1"), False, track=True)
+    task_id = next(iter(b._desktop_tasks._open))
+    import base64
+
+    await b._handle_event(
+        {"type": "response.created", "response": {"id": "r-other", "metadata": {"trigger": "other"}}}
+    )
+    await b._handle_event(
+        {
+            "type": "response.audio.delta",
+            "response_id": "r-other",
+            "delta": base64.b64encode(b"\x00\x00").decode(),
+        }
+    )
+    await b._handle_event(
+        {"type": "response.done", "response": {"id": "r-other", "status": "completed"}}
+    )
+    assert any(f"id={task_id} hop=spoken" in r.message for r in caplog.records)
+    assert any(f"id={task_id}" in r.message and "outcome=delivered" in r.message for r in caplog.records)
+    assert task_id in b._desktop_tasks._open
+    assert b._desktop_tasks._open[task_id].quiet is None
+    release.set()
+    await b._turn_task
+    await asyncio.sleep(0.12)
+    assert task_id not in b._desktop_tasks._open
+    messages = [r.message for r in caplog.records]
+    spoken_at = next(i for i, m in enumerate(messages) if f"id={task_id} hop=spoken" in m)
+    quiet_at = next(i for i, m in enumerate(messages) if f"id={task_id} hop=quiet" in m)
+    assert spoken_at < quiet_at
+    await b.stop()
+
+
+@pytest.mark.asyncio
+async def test_user_speech_does_not_take_a_pending_desktop_reply(monkeypatch, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    b = make(monkeypatch)
+    b._local = AsyncMock(return_value={"kind": "served", "output": {"relay": "accepted"}})
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._tool(
+        {"name": "send_task", "call_id": "ash", "arguments": '{"request":"Asheville forecast"}'}
+    )
+    b._pending_response = False
+    b._response_requested = False
+    b._response_in_progress = False
+    b._user_speaking = False
+    await b._native_update(_reply("Tuesday in Asheville stays dry.", "t59s1"), False, track=True)
+    import base64
+
+    await b._handle_event(
+        {
+            "type": "response.created",
+            "response": {"id": "vad", "metadata": {"trigger": "server_vad"}},
+        }
+    )
+    await b._handle_event(
+        {
+            "type": "response.audio.delta",
+            "response_id": "vad",
+            "delta": base64.b64encode(b"\x00\x00").decode(),
+        }
+    )
+    await b._handle_event({"type": "response.done", "response": {"id": "vad", "status": "completed"}})
+    assert not any("hop=spoken" in r.message for r in caplog.records)
+    assert b._async_sent
+    await b.stop()
+
+
+@pytest.mark.asyncio
 async def test_accepted_task_speaks_a_failure_after_the_turn(monkeypatch, caplog):
     import asyncio
     import logging

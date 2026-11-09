@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import logging
 import time
 
-from .desktop_tasks import log_desktop_task
+from .desktop_tasks import handoff_already_closed, log_desktop_task
 from .gbot_voice_bridge import GbotVoiceBridge
 from .gemini_voice_proxy import GeminiVoiceProxy
 from .koji_wiki import publish_bridge_presence
@@ -185,6 +185,10 @@ class GbotVoiceProxy(GeminiVoiceProxy):
 
     def _abandon_desktop_work(self):
         for item in self._desktop_unsaid:
+            # Quiet, timeout, and delivered already logged their outcome.
+            # 19:15:04 wrote outcome=failed again for c7516f0be274 and df6e899db105.
+            if handoff_already_closed(item):
+                continue
             log_desktop_task(
                 str(item.get("id")),
                 str(item.get("start")),

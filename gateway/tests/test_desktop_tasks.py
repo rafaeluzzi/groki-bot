@@ -11,8 +11,10 @@ from stackchan_mcp.desktop_tasks import (
     TIMEOUT_UP_PHRASE,
     DesktopTasks,
     failure_phrase,
+    handoff_already_closed,
     is_holding_line,
     late_phrase,
+    log_desktop_task,
 )
 
 
@@ -30,7 +32,19 @@ def test_timeout_constant_is_ninety_seconds():
 def test_holding_lines_stay_short_progress_beats():
     assert is_holding_line("Looking up Durham events for November 14 and 15 now.")
     assert is_holding_line("Still searching…")
+    assert is_holding_line("Still searching")
+    assert is_holding_line("I'm looking up…")
+    assert is_holding_line("I’m looking up…")
+    assert is_holding_line("Looking up…")
+    # 2026-11-08 transcript, straight apostrophe. The quiet clock must not start.
+    assert is_holding_line("I'm looking up San Juan events for November 14 and 15 now.")
+    assert is_holding_line("I'm looking up indoor events in Cary for November 14 and 15 now.")
+    assert is_holding_line("I'm checking Saturday's forecast for Durham now.")
+    assert is_holding_line("I'm pulling Saturday's hourly forecast for Durham now.")
+    assert not is_holding_line("I'm seeing three shows open now.")
+    assert not is_holding_line("I'm not seeing any events now.")
     assert not is_holding_line("Durham has a packed weekend, with the free Iron Pour festival.")
+    assert not is_holding_line("San Juan's big events this weekend are Wisin at the Coliseo.")
     assert late_phrase("DPAC lookup", "The show is at 7.") == (
         "That DPAC lookup just came back: The show is at 7."
     )
@@ -191,14 +205,57 @@ async def test_quiet_after_a_real_answer_finishes_without_a_failure_phrase():
 
     tasks = _tracker(announce, ready=True, timeout_s=30)
     tasks.quiet_s = 0.05
-    tasks.start("Saturday market")
+    task_id = tasks.start("Saturday market")
     now = int(__import__("time").time() * 1000)
     tasks.accept_reply("e1", "The market is on Saturday morning.", now)
     assert len(tasks._open) == 1
+    assert tasks._open[task_id].quiet is None
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    tasks.playback_finished(task_id, holding=False)
     await asyncio.sleep(0.12)
     assert tasks._open == {}
     assert spoken == []
     assert tasks._finished and tasks._finished[0].request == "Saturday market"
+
+
+def test_a_closed_task_is_not_failed_again_on_session_close(caplog):
+    # 19:15:04 logged outcome=failed for c7516f0be274 (quiet at 19:01:15) and df6e899db105.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    items = [
+        {"id": "c7516f0be274", "start": "t0", "remember": True, "waited_ms": 0},
+        {"id": "df6e899db105", "start": "t1", "outcome_logged": True, "waited_ms": 0},
+        {"id": "still-open", "start": "t2", "waited_ms": 0},
+    ]
+    for item in items:
+        if handoff_already_closed(item):
+            continue
+        log_desktop_task(item["id"], item["start"], "failed", waited_ms=item["waited_ms"])
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("c7516f0be274" in m for m in messages)
+    assert not any("df6e899db105" in m for m in messages)
+    assert any("id=still-open" in m and "outcome=failed" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_queued_answer_stays_open_until_playback_finishes(caplog):
+    # 13e84dcebc96: quiet fired 12s after queued, while the answer was still playing.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    tasks = _tracker(None, timeout_s=30)
+    tasks.quiet_s = 0.05
+    task_id = tasks.start("Asheville forecast")
+    now = int(__import__("time").time() * 1000)
+    tasks.accept_reply("t59s1", "Tuesday in Asheville stays dry.", now)
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    assert tasks._open[task_id].quiet is None
+    tasks.playback_finished(task_id, holding=False)
+    await asyncio.sleep(0.12)
+    assert task_id not in tasks._open
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"id={task_id} hop=quiet" in m for m in messages)
+    exported = tasks.export_for_handoff()
+    assert exported and all(handoff_already_closed(item) for item in exported)
 
 
 @pytest.mark.asyncio
@@ -226,6 +283,7 @@ async def test_gap_replies_replayed_after_reconnect_land_on_their_own_tasks(capl
     replay_again = tasks.accept_reply("t43s1", "I found eight indoor options in Cary.", base + 23_746)
 
     assert holding["task_id"] == cary
+    assert any(f"id={cary} hop=queued holding=1 late=0" in m for m in [r.getMessage() for r in caplog.records])
     assert cary_list["task_id"] == cary
     assert durham_list["task_id"] == durham
     assert replay_again is None
@@ -235,6 +293,73 @@ async def test_gap_replies_replayed_after_reconnect_land_on_their_own_tasks(capl
     assert any(f"id={cary} hop=timeout_skipped" in m for m in messages)
     assert any(f"id={durham} hop=timeout_skipped" in m for m in messages)
     assert not any("outcome=timeout" in m for m in messages)
+    await tasks.aclose()
+
+
+@pytest.mark.asyncio
+async def test_san_juan_holding_line_keeps_a_20s_answer_in_the_open_task(caplog):
+    # 21a0a399622b: "I'm looking up San Juan…" was holding=0, quiet closed the task,
+    # and the real answer 14s later was late=1. A 20s gap stays inside the task.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    tasks = _tracker(None, timeout_s=30)
+    tasks.quiet_s = 0.05
+    task_id = tasks.start("San Juan events")
+    now = int(__import__("time").time() * 1000)
+    holding = tasks.accept_reply(
+        "t52s0",
+        "I'm looking up San Juan events for November 14 and 15 now.",
+        now,
+    )
+    assert holding["late"] is False
+    assert holding["task_id"] == task_id
+    assert tasks._open[task_id].quiet is None
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    answer = tasks.accept_reply(
+        "t52s1",
+        "San Juan's big events this weekend are Wisin at the Coliseo.",
+        now + 20_000,
+    )
+    assert answer["late"] is False
+    assert answer["task_id"] == task_id
+    assert answer["say"].startswith("San Juan's big events")
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"id={task_id} hop=queued holding=1 late=0" in m for m in messages)
+    assert any(f"id={task_id} hop=queued holding=0 late=0" in m for m in messages)
+    assert not any("late=1" in m for m in messages)
+    await tasks.aclose()
+
+
+@pytest.mark.asyncio
+async def test_pulling_forecast_line_keeps_a_20s_answer_in_the_open_task(caplog):
+    # a8195e8708a3: "I'm pulling Saturday's hourly forecast for Durham now."
+    # was holding=0, so the quiet clock started before the forecast arrived.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    tasks = _tracker(None, timeout_s=30)
+    tasks.quiet_s = 0.05
+    task_id = tasks.start("Durham hourly forecast")
+    now = int(__import__("time").time() * 1000)
+    holding = tasks.accept_reply(
+        "t54s0",
+        "I'm pulling Saturday's hourly forecast for Durham now.",
+        now,
+    )
+    assert holding["late"] is False
+    assert holding["task_id"] == task_id
+    assert tasks._open[task_id].quiet is None
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    answer = tasks.accept_reply(
+        "t54s1",
+        "Saturday in Durham looks dry, cool, and breezy.",
+        now + 20_000,
+    )
+    assert answer["late"] is False
+    assert answer["task_id"] == task_id
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"id={task_id} hop=queued holding=1 late=0" in m for m in messages)
+    assert any(f"id={task_id} hop=queued holding=0 late=0" in m for m in messages)
+    assert not any("late=1" in m for m in messages)
     await tasks.aclose()
 
 

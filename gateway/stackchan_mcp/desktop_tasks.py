@@ -27,12 +27,12 @@ logger = logging.getLogger(__name__)
 DESKTOP_TASK_TIMEOUT_S = 90.0
 # No transcript reply by then: one silent resend of the same request. Never a second.
 DESKTOP_TASK_RETRY_S = 45.0
-# Quiet after a non-holding reply before the task is finished.
-# Holding lines do not start this clock: the Durham trace's real answer arrived
-# 19s after "Looking up…", and that gap has to stay inside the open task.
-# 12s is long enough for a second bubble of the same answer (a detail a few
-# seconds later) and for the reply that was already in flight, and well under
-# the 90s failure clock. Anything later is spoken once as a late result.
+# Quiet after a non-holding reply has finished playing, before the task is finished.
+# It does not start when the reply is queued: 13e84dcebc96 closed while Koji was
+# still speaking the answer, and that answer never logged spoken.
+# Holding lines do not start this clock. 12s is long enough for a second bubble
+# of the same answer and well under the 90s failure clock. Anything later is
+# spoken once as a late result.
 DESKTOP_TASK_QUIET_S = 12.0
 # A reply stamped just before we logged the task start still belongs to it.
 # Transcript request stamps land within ~40 ms of our start log, and a reply takes
@@ -44,9 +44,18 @@ TIMEOUT_UP_PHRASE = "That one didn't come back in time."
 TIMEOUT_DOWN_PHRASE = "Desktop tasks are down right now."
 
 # Progress beats the box sends before the answer. Spoken, but they leave the task open.
+# The transcript uses a straight apostrophe ("I'm looking up … now."). The pattern
+# used to require U+2019, so that line started the quiet clock.
+# The progress verbs are looking, checking, pulling, and searching.
+# "I'm seeing three shows open now." is an answer, not a holding line.
+_APOSTROPHE = str.maketrans({"\u2018": "'", "\u2019": "'", "`": "'"})
 _HOLDING_RE = re.compile(
     r"^(looking up|still looking|still searching|searching|checking|working on|"
-    r"let me look|i'll look|i’m looking|on it|one moment)\b",
+    r"let me look|i'll look|i'm looking|i'm checking|on it|one moment)\b",
+    re.IGNORECASE,
+)
+_HOLDING_NOW_RE = re.compile(
+    r"^i'm (looking|checking|pulling|searching)\b.*\bnow\.?$",
     re.IGNORECASE,
 )
 
@@ -60,11 +69,18 @@ def _now_ms() -> int:
 
 
 def is_holding_line(text: str) -> bool:
-    """True for a progress beat such as "Looking up Durham events…"."""
-    compact = " ".join(str(text or "").split())
+    """True for a progress beat the box sends before the answer.
+
+    Seen on the voice transcript: "I'm looking up San Juan events for November
+    14 and 15 now.", "I'm checking Saturday's forecast for Durham now.",
+    "I'm pulling Saturday's hourly forecast for Durham now.", "Looking up…",
+    "Still searching". "I'm seeing three shows open now." is an answer.
+    A holding line is spoken and does not start the quiet clock.
+    """
+    compact = " ".join(str(text or "").split()).translate(_APOSTROPHE)
     if not compact or len(compact) > 200:
         return False
-    if _HOLDING_RE.match(compact):
+    if _HOLDING_RE.match(compact) or _HOLDING_NOW_RE.match(compact):
         return True
     return len(compact) <= 120 and (compact.endswith("…") or compact.endswith("..."))
 
@@ -99,6 +115,15 @@ def log_desktop_task(
     )
 
 
+def handoff_already_closed(item: dict) -> bool:
+    """True when this handoff item already has a terminal outcome.
+
+    Quiet, timeout, and delivered tasks are exported so a new session can still
+    name a late reply. Closing the voice session must not log ``failed`` again.
+    """
+    return bool(item.get("remember") or item.get("outcome_logged"))
+
+
 def log_desktop_hop(task_id: str, hop: str, **fields: object) -> None:
     """One hop for a task. Extra fields are fixed words, never the request or the result."""
     extra = " ".join(f"{key}={value}" for key, value in fields.items())
@@ -128,6 +153,7 @@ class _OpenTask:
     retry: asyncio.Task | None = None
     quiet: asyncio.Task | None = None
     quiet_deadline: float = 0.0
+    pending_playback: int = 0
     done: bool = False
 
 
@@ -153,6 +179,7 @@ class DesktopTasks:
     _open: dict[str, _OpenTask] = field(default_factory=dict)
     _finished: list[_Finished] = field(default_factory=list)
     _seen: set[str] = field(default_factory=set)
+    _outcome_ids: set[str] = field(default_factory=set)
     _unsaid: list[dict] = field(default_factory=list)
     _cancelled: list = field(default_factory=list)
 
@@ -203,10 +230,9 @@ class DesktopTasks:
             task.replies += 1
             self._cancel_retry(task)
             holding = is_holding_line(phrase)
-            if holding:
-                self._cancel_quiet(task)
-            else:
-                self._arm_quiet(task)
+            # The quiet clock starts when this reply finishes playing, not now.
+            task.pending_playback += 1
+            self._cancel_quiet(task)
             log_desktop_hop(task.id, "queued", holding=int(holding), late=0)
             return self._decision(task, phrase, late=False)
         owner = self._late_owner(at)
@@ -277,6 +303,8 @@ class DesktopTasks:
                     "replies": task.replies,
                     "resent": task.resent,
                     "quiet_remaining_s": quiet_left,
+                    "pending_playback": task.pending_playback,
+                    "outcome_logged": task.id in self._outcome_ids,
                     "seen": seen,
                 }
             )
@@ -291,9 +319,10 @@ class DesktopTasks:
                     "request": done.request,
                     "start": done.started,
                     "started_ms": done.started_ms,
-                    "waited_ms": done.waited_ms,
-                    "seen": seen,
-                }
+                "waited_ms": done.waited_ms,
+                "outcome_logged": True,
+                "seen": seen,
+            }
             )
         self._seen.clear()
         return items
@@ -314,14 +343,41 @@ class DesktopTasks:
             waited_ms=int(item.get("waited_ms") or 0),
             replies=int(item.get("replies") or 0),
             resent=bool(item.get("resent")),
+            pending_playback=int(item.get("pending_playback") or 0),
         )
+        if item.get("outcome_logged"):
+            self._outcome_ids.add(task.id)
         self._open[task.id] = task
         task.timer = asyncio.create_task(self._expire(task), name="desktop-task-timeout")
         if not task.resent and not task.replies:
             task.retry = asyncio.create_task(self._retry(task), name="desktop-task-retry")
         quiet_left = item.get("quiet_remaining_s")
-        if isinstance(quiet_left, (int, float)) and task.replies:
+        if (
+            isinstance(quiet_left, (int, float))
+            and task.replies
+            and task.pending_playback == 0
+        ):
             self._arm_quiet(task, delay=max(0.0, float(quiet_left)))
+
+    def note_outcome(self, task_id: str) -> None:
+        """This task already has a spoken, cancelled, or timeout outcome line."""
+        if task_id:
+            self._outcome_ids.add(str(task_id))
+
+    def playback_finished(self, task_id: str, *, holding: bool) -> None:
+        """One queued reply finished playing. A real answer then starts the quiet clock.
+
+        A second reply still waiting to play does not. A holding line never does.
+        """
+        task = self._open.get(str(task_id or ""))
+        if task is None or task.done:
+            return
+        if task.pending_playback > 0:
+            task.pending_playback -= 1
+        if holding or task.pending_playback > 0:
+            self._cancel_quiet(task)
+            return
+        self._arm_quiet(task)
 
     def oldest(self) -> _OpenTask | None:
         return self._oldest()
@@ -483,6 +539,7 @@ class DesktopTasks:
             logger.warning("desktop task announcement failed id=%s", task.id)
             said = False
         if said:
+            self.note_outcome(task.id)
             log_desktop_task(task.id, task.started, outcome, waited_ms=task.waited_ms)
             return
         self._unsaid.append(

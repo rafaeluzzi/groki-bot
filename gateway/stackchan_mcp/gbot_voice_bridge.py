@@ -21,7 +21,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 
-from .desktop_tasks import DesktopTasks, log_desktop_hop, log_desktop_task
+from .desktop_tasks import DesktopTasks, is_holding_line, log_desktop_hop, log_desktop_task
 from .voice_output_queue import VoiceOutputQueue
 from .gbot_native_channel import RECONNECT_GRACE_S, WARM_SKIP_S, NativeVoiceChannel
 
@@ -588,8 +588,15 @@ class GbotVoiceBridge:
             self._idle_task.cancel()
         self._idle_task = None
 
-    async def _finish_turn(self):
+    async def _finish_turn(self, slot=None):
         await self._on_turn_complete()
+        # Playback has drained and tts stop has been sent. A real answer
+        # starts the quiet clock only now, after spoken/delivered is logged.
+        if isinstance(slot, dict) and slot.get("settled") == "spoken":
+            self._desktop_tasks.playback_finished(
+                str(slot.get("task_id") or ""),
+                holding=is_holding_line(str(slot.get("say") or "")),
+            )
         self._cancel_idle()
         if (
             self._on_end_conversation
@@ -844,6 +851,7 @@ class GbotVoiceBridge:
         if slot.get("settled"):
             return
         slot["settled"] = "spoken"
+        self._desktop_tasks.note_outcome(str(slot.get("task_id") or ""))
         log_desktop_hop(slot["task_id"], "spoken")
         log_desktop_task(
             slot["task_id"], slot["started"], "delivered", waited_ms=slot["waited_ms"]
@@ -853,6 +861,7 @@ class GbotVoiceBridge:
         if slot.get("settled"):
             return
         slot["settled"] = "cancelled"
+        self._desktop_tasks.note_outcome(str(slot.get("task_id") or ""))
         log_desktop_hop(slot["task_id"], "cancelled")
         log_desktop_task(
             slot["task_id"], slot["started"], "cancelled", waited_ms=slot["waited_ms"]
@@ -860,10 +869,10 @@ class GbotVoiceBridge:
         if not slot.get("resent"):
             self._schedule_resend(slot)
 
-    def _settle_desktop_response(self, response_id, event) -> None:
+    def _settle_desktop_response(self, response_id, event):
         slot = self._desktop_live.pop(response_id, None)
         if slot is None or slot.get("settled"):
-            return
+            return None
         status = (event.get("response") or {}).get("status") if isinstance(event, dict) else None
         cancelled = response_id in self._suppressed or status in {"cancelled", "canceled"}
         audio = self.audio_bytes_by_response.get(response_id, 0) > 0
@@ -871,6 +880,7 @@ class GbotVoiceBridge:
             self._settle_cancelled(slot)
         elif audio and status not in {"failed"}:
             self._settle_spoken(slot)
+        return slot
 
     async def _native_update(self, event, is_user, *, track=False):
         topic = event.get("async_update", {}).get("topic")
@@ -1260,9 +1270,13 @@ class GbotVoiceBridge:
                 if trigger in {"async_update", "server_vad", "response_create"}
                 else "other"
             )
-            if trigger == "async_update" and self._async_sent:
+            # The box reply is the update we just sent. The server often labels
+            # that response trigger=other (13e84dcebc96), so the slot never
+            # settled and the answer never logged spoken. A user barge-in
+            # (server_vad) is not that reply.
+            if self._async_sent and self._active_response and trigger != "server_vad":
                 pending = self._async_sent.pop(0)
-                if pending is not None and self._active_response:
+                if pending is not None:
                     pending["response_id"] = self._active_response
                     self._desktop_live[self._active_response] = pending
             self._response_triggers[self._active_response] = trigger
@@ -1330,10 +1344,11 @@ class GbotVoiceBridge:
                 return
             self._response_progress_at = None
             self._response_in_progress = False
-            self._settle_desktop_response(response_id, event)
+            slot = self._settle_desktop_response(response_id, event)
             if response_id not in self._suppressed:
                 # Order normal completion after its audio without blocking VAD.
-                self._turn_task = self._output.submit(self._finish_turn)
+                # Quiet starts when that playback finishes, not when the reply was queued.
+                self._turn_task = self._output.submit(lambda slot=slot: self._finish_turn(slot))
                 await asyncio.sleep(0)
             await self._flush_pending()
         elif kind == "response.function_call_arguments.done":
