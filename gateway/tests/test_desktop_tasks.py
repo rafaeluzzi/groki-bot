@@ -11,8 +11,10 @@ from stackchan_mcp.desktop_tasks import (
     TIMEOUT_UP_PHRASE,
     DesktopTasks,
     failure_phrase,
+    handoff_already_closed,
     is_holding_line,
     late_phrase,
+    log_desktop_task,
 )
 
 
@@ -39,6 +41,7 @@ def test_holding_lines_stay_short_progress_beats():
     assert is_holding_line("I'm looking up indoor events in Cary for November 14 and 15 now.")
     assert is_holding_line("I'm checking Saturday's forecast for Durham now.")
     assert is_holding_line("I'm pulling Saturday's hourly forecast for Durham now.")
+    assert not is_holding_line("I'm seeing three shows open now.")
     assert not is_holding_line("I'm not seeing any events now.")
     assert not is_holding_line("Durham has a packed weekend, with the free Iron Pour festival.")
     assert not is_holding_line("San Juan's big events this weekend are Wisin at the Coliseo.")
@@ -202,14 +205,57 @@ async def test_quiet_after_a_real_answer_finishes_without_a_failure_phrase():
 
     tasks = _tracker(announce, ready=True, timeout_s=30)
     tasks.quiet_s = 0.05
-    tasks.start("Saturday market")
+    task_id = tasks.start("Saturday market")
     now = int(__import__("time").time() * 1000)
     tasks.accept_reply("e1", "The market is on Saturday morning.", now)
     assert len(tasks._open) == 1
+    assert tasks._open[task_id].quiet is None
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    tasks.playback_finished(task_id, holding=False)
     await asyncio.sleep(0.12)
     assert tasks._open == {}
     assert spoken == []
     assert tasks._finished and tasks._finished[0].request == "Saturday market"
+
+
+def test_a_closed_task_is_not_failed_again_on_session_close(caplog):
+    # 19:15:04 logged outcome=failed for c7516f0be274 (quiet at 19:01:15) and df6e899db105.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    items = [
+        {"id": "c7516f0be274", "start": "t0", "remember": True, "waited_ms": 0},
+        {"id": "df6e899db105", "start": "t1", "outcome_logged": True, "waited_ms": 0},
+        {"id": "still-open", "start": "t2", "waited_ms": 0},
+    ]
+    for item in items:
+        if handoff_already_closed(item):
+            continue
+        log_desktop_task(item["id"], item["start"], "failed", waited_ms=item["waited_ms"])
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("c7516f0be274" in m for m in messages)
+    assert not any("df6e899db105" in m for m in messages)
+    assert any("id=still-open" in m and "outcome=failed" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_queued_answer_stays_open_until_playback_finishes(caplog):
+    # 13e84dcebc96: quiet fired 12s after queued, while the answer was still playing.
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.desktop_tasks")
+    tasks = _tracker(None, timeout_s=30)
+    tasks.quiet_s = 0.05
+    task_id = tasks.start("Asheville forecast")
+    now = int(__import__("time").time() * 1000)
+    tasks.accept_reply("t59s1", "Tuesday in Asheville stays dry.", now)
+    await asyncio.sleep(0.12)
+    assert task_id in tasks._open
+    assert tasks._open[task_id].quiet is None
+    tasks.playback_finished(task_id, holding=False)
+    await asyncio.sleep(0.12)
+    assert task_id not in tasks._open
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(f"id={task_id} hop=quiet" in m for m in messages)
+    exported = tasks.export_for_handoff()
+    assert exported and all(handoff_already_closed(item) for item in exported)
 
 
 @pytest.mark.asyncio
