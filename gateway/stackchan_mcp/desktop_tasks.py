@@ -379,6 +379,18 @@ class DesktopTasks:
             return
         self._arm_quiet(task)
 
+    def playback_cancelled(self, task_id: str) -> None:
+        """A queued reply was cut off. Drop its playback count and do not arm quiet.
+
+        The task stays open for a later reply, or for the 90s timeout.
+        """
+        task = self._open.get(str(task_id or ""))
+        if task is None or task.done:
+            return
+        if task.pending_playback > 0:
+            task.pending_playback -= 1
+        self._cancel_quiet(task)
+
     def oldest(self) -> _OpenTask | None:
         return self._oldest()
 

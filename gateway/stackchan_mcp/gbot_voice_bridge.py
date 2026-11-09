@@ -27,10 +27,6 @@ from .gbot_native_channel import RECONNECT_GRACE_S, WARM_SKIP_S, NativeVoiceChan
 
 logger = logging.getLogger(__name__)
 
-# Koji's follow-up mic aborts an in-flight desktop reply. Wait this long for a
-# real user transcript before saying the cancel was the mic, not the person.
-DESKTOP_RESEND_WAIT_S = 2.0
-
 
 class Pcm16To24:
     """Streaming linear resampler, preserving interpolation across Opus packets."""
@@ -210,8 +206,6 @@ class GbotVoiceBridge:
         )
         self._async_sent: list = []
         self._desktop_live: dict = {}
-        self._resend_slots: list = []
-        self._resend_wait_s = DESKTOP_RESEND_WAIT_S
         self._used_mono = None
         self._warm_task = None
         self.metrics = {
@@ -701,7 +695,6 @@ class GbotVoiceBridge:
                 "started": str(item.get("start") or ""),
                 "waited_ms": int(item.get("waited_ms") or 0),
                 "say": item.get("text") or "",
-                "resent": False,
                 "settled": False,
             }
             return await self._announce_result(item.get("text") or "", slot=slot)
@@ -815,38 +808,6 @@ class GbotVoiceBridge:
     async def _native_from_channel(self, event, is_user):
         await self._native_update(event, is_user, track=True)
 
-    def _note_user_followed(self) -> None:
-        for slot in self._resend_slots:
-            slot["user_followed"] = True
-
-    def _schedule_resend(self, slot: dict) -> None:
-        # TODO(koji): Koji's follow-up mic aborts an in-flight desktop result
-        # (Portal interrupt → response.cancel) before the answer is heard.
-        # Stop opening that mic over an async_update. This one re-send is a stopgap.
-        waiter = asyncio.create_task(self._resend_after(slot), name="desktop-resend")
-        slot["resend_task"] = waiter
-        self._resend_slots.append(slot)
-
-    async def _resend_after(self, slot: dict) -> None:
-        try:
-            await asyncio.sleep(self._resend_wait_s)
-        except asyncio.CancelledError:
-            return
-        if slot.get("user_followed") or slot.get("resent") or self._stopped or not self.running:
-            return
-        slot["resent"] = True
-        await self._announce_result(
-            slot["say"],
-            slot={
-                "task_id": slot["task_id"],
-                "started": slot["started"],
-                "waited_ms": slot["waited_ms"],
-                "say": slot["say"],
-                "resent": True,
-                "settled": False,
-            },
-        )
-
     def _settle_spoken(self, slot: dict) -> None:
         if slot.get("settled"):
             return
@@ -866,8 +827,8 @@ class GbotVoiceBridge:
         log_desktop_task(
             slot["task_id"], slot["started"], "cancelled", waited_ms=slot["waited_ms"]
         )
-        if not slot.get("resent"):
-            self._schedule_resend(slot)
+        # A cut-off reply does not start the quiet clock. The task stays open.
+        self._desktop_tasks.playback_cancelled(str(slot.get("task_id") or ""))
 
     def _settle_desktop_response(self, response_id, event):
         slot = self._desktop_live.pop(response_id, None)
@@ -929,7 +890,6 @@ class GbotVoiceBridge:
                     "started": decision["started"],
                     "waited_ms": decision["waited_ms"],
                     "say": say,
-                    "resent": False,
                     "settled": False,
                 },
             }
@@ -939,7 +899,6 @@ class GbotVoiceBridge:
                 self._desktop_tasks.stash(slot)
             return
         if is_user:
-            self._note_user_followed()
             self._user_epoch += 1
             self._cancel_idle()
             if self._executor:
@@ -1332,8 +1291,6 @@ class GbotVoiceBridge:
                 await self._on_transcript(event)
             text = event.get("transcript", "")
             if kind == "conversation.item.input_audio_transcription.completed":
-                if isinstance(text, str) and text.strip():
-                    self._note_user_followed()
                 if self._executor:
                     await self._executor.observe_user_input(text, finished=True)
             elif self._on_text and text:
@@ -1577,15 +1534,6 @@ class GbotVoiceBridge:
 
     async def stop(self):
         self._stopped = True
-        resends = [
-            slot.get("resend_task")
-            for slot in self._resend_slots
-            if slot.get("resend_task") is not None and not slot["resend_task"].done()
-        ]
-        for task in resends:
-            task.cancel()
-        if resends:
-            await asyncio.gather(*resends, return_exceptions=True)
         await self._desktop_tasks.aclose()
         self._cancel_idle()
         self._pending_updates.clear()
