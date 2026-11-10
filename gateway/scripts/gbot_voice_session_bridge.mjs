@@ -71,18 +71,44 @@ function readInstalledVersionText() {
   });
 }
 
-export function installedClientVersion(read = readInstalledVersionText) {
-  let raw;
-  try { raw = read(); } catch { throw new Error('client_version_unavailable'); }
-  const version = parseClientVersion(raw);
-  if (!version) throw new Error('client_version_unavailable');
-  return version;
+export function createInstalledClientVersion({ stat, read } = {}) {
+  let seenMtime;
+  let cached = null;
+  return function clientVersion() {
+    let mtime;
+    try { mtime = stat(); } catch { throw new Error('client_version_unavailable'); }
+    if (cached !== null && mtime === seenMtime) return cached;
+    let raw;
+    try { raw = read(); } catch { throw new Error('client_version_unavailable'); }
+    const version = parseClientVersion(raw);
+    if (!version) throw new Error('client_version_unavailable');
+    seenMtime = mtime;
+    cached = version;
+    return version;
+  };
 }
 
-function loginRejectedError(status) {
+const installedClientVersionCached = createInstalledClientVersion({
+  stat: () => statSync(APP_PLIST).mtimeMs,
+  read: readInstalledVersionText,
+});
+
+export function installedClientVersion() {
+  return installedClientVersionCached();
+}
+
+const ACCOUNT_FAILURE_REASONS = new Set(['login_rejected', 'client_update_required']);
+
+function accountFailure(status, reason) {
   const error = new Error(`upstream_http_${status}`);
-  error.reason = 'login_rejected';
+  error.reason = reason;
   return error;
+}
+
+function accountFailureReason(response) {
+  const headers = response?.headers;
+  const hint = typeof headers?.get === 'function' ? headers.get('x-automation-failure-hint') : null;
+  return hint === 'SAND_CLIENT_UPDATE_REQUIRED' ? 'client_update_required' : 'login_rejected';
 }
 
 // EnsureSandBox 401/403 waits 5s, then 10, 20, 40, and 60. A success or a
@@ -92,6 +118,7 @@ export function createEnsureBackoff({ now = Date.now, secretsMtime = defaultSecr
   let until = 0;
   let seenMtime = null;
   let lastStatus = 401;
+  let lastReason = 'login_rejected';
   const noteSecrets = () => {
     let mtime = null;
     try { mtime = secretsMtime(); } catch { mtime = null; }
@@ -106,9 +133,10 @@ export function createEnsureBackoff({ now = Date.now, secretsMtime = defaultSecr
       noteSecrets();
       return now() < until;
     },
-    reject(status) {
+    reject(status, reason = 'login_rejected') {
       noteSecrets();
       lastStatus = status;
+      lastReason = reason;
       until = now() + delay;
       delay = Math.min(delay * 2, maxMs);
     },
@@ -117,7 +145,7 @@ export function createEnsureBackoff({ now = Date.now, secretsMtime = defaultSecr
       until = 0;
       noteSecrets();
     },
-    error() { return loginRejectedError(lastStatus); },
+    error() { return accountFailure(lastStatus, lastReason); },
   };
 }
 
@@ -154,11 +182,13 @@ async function accountRequest(method, body, { accountLoader = loadAccount, fetch
   const response = await fetcher(BACKEND + method, { method: 'POST', headers,
     body: payload, redirect: 'error', signal: signal ?? AbortSignal.timeout(20000) });
   if (!response.ok) {
-    // Upstream bodies can contain user content or credentials; never expose them.
-    // 401/403 from this account RPC is a rejected login. 417 stays a hibernated box.
+    // Upstream bodies can contain user content or credentials; never read or log them.
+    // The update hint is a fixed header. Any other 401/403 is a rejected login.
+    // 417 stays a hibernated box.
     if (response.status === 401 || response.status === 403) {
-      if (ensure && gate) gate.reject(response.status);
-      throw loginRejectedError(response.status);
+      const reason = accountFailureReason(response);
+      if (ensure && gate) gate.reject(response.status, reason);
+      throw accountFailure(response.status, reason);
     }
     throw new Error(`upstream_http_${response.status}`);
   }
@@ -739,7 +769,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
     } catch (error) {
       const safe = /^(upstream_http_\d{3}|login_unavailable|login_expired_open_grok_bot|unsupported_storage|client_version_unavailable)$/.test(error.message) ? error.message : 'bridge_request_failed';
       const payload = { ok: false, error: safe };
-      if (error?.reason === 'login_rejected') payload.reason = 'login_rejected';
+      if (ACCOUNT_FAILURE_REASONS.has(error?.reason)) payload.reason = error.reason;
       return send(502, payload);
     }
   });

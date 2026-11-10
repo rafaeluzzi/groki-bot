@@ -513,6 +513,8 @@ class GbotVoiceBridge:
             snapshot = health()
             if isinstance(snapshot, dict) and snapshot.get("reason") == "login_rejected":
                 return "Desktop is down because the Grok Bot login was rejected."
+            if isinstance(snapshot, dict) and snapshot.get("reason") == "client_update_required":
+                return "Desktop is down because Grok Bot on the iMac needs an update."
         return "Desktop tasks are down right now."
 
     def _desktop_failure(self, code, *, refused=False):

@@ -55,7 +55,8 @@ async def helper_failure(response):
     """The helper's ``error`` word and optional ``reason``.
 
     ``upstream_http_429`` is Grok's own status. ``login_rejected`` is a 401/403
-    from the account RPC. A hibernated box stays ``upstream_http_417`` with no
+    from the account RPC. ``client_update_required`` is that same status with
+    the update hint. A hibernated box stays ``upstream_http_417`` with no
     reason. Bodies are not logged.
     """
     try:
@@ -168,8 +169,8 @@ class NativeVoiceChannel:
                     self._error = error
                     self._reason = reason
                 logger.info("Grok native presence on=%s status=%d error=%s", on, response.status, error)
-                if reason == "login_rejected":
-                    raise RuntimeError("login_rejected")
+                if reason in {"login_rejected", "client_update_required"}:
+                    raise RuntimeError(reason)
                 raise RuntimeError("native_presence_unavailable")
             self._reason = None
             logger.info("Grok native presence on=%s status=%d", on, response.status)

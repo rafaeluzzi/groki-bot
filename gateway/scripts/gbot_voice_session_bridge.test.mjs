@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createBridge, accountRpc, createEnsureBackoff, filterNativeEvent, parseClientVersion, validateBody, isRoutineStreamEnd } from './gbot_voice_session_bridge.mjs';
+import { createBridge, accountRpc, createEnsureBackoff, createInstalledClientVersion, filterNativeEvent, parseClientVersion, validateBody, isRoutineStreamEnd } from './gbot_voice_session_bridge.mjs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
 import { mkdtempSync, readFileSync } from 'node:fs';
@@ -87,6 +87,55 @@ test('account RPC 401 and 403 are login_rejected and EnsureSandBox backs off unt
   mtime = 11;
   await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.reason === 'login_rejected');
   assert.equal(calls, 6);
+});
+
+test('the update hint is client_update_required for 401 and 403, and a missing hint stays login_rejected', async () => {
+  const accountLoader = () => ({token: 'FAKE_TEST', machineId: 'FAKE_MACHINE'});
+  const body = {wake: false, supportsAsleepBox: true};
+  const cases = [
+    [401, 'SAND_CLIENT_UPDATE_REQUIRED', 'client_update_required'],
+    [403, 'SAND_CLIENT_UPDATE_REQUIRED', 'client_update_required'],
+    [401, null, 'login_rejected'],
+    [403, null, 'login_rejected'],
+  ];
+  for (const [status, hint, reason] of cases) {
+    let bodyReads = 0;
+    let now = 1_000;
+    let calls = 0;
+    const backoff = createEnsureBackoff({now: () => now, secretsMtime: () => 1, startMs: 5000, maxMs: 60000});
+    const fetcher = async () => {
+      calls++;
+      return {
+        ok: false,
+        status,
+        headers: {get: (name) => name === 'x-automation-failure-hint' ? hint : null},
+        json: () => { bodyReads++; return {secret: 'DO_NOT_LEAK'}; },
+        text: () => { bodyReads++; return 'DO_NOT_LEAK'; },
+      };
+    };
+    const opts = {accountLoader, fetcher, clientVersion: '0.71.2', backoff};
+    await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.message === `upstream_http_${status}` && error.reason === reason);
+    now += 1000;
+    await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.reason === reason);
+    assert.equal(calls, 1);
+    assert.equal(bodyReads, 0);
+  }
+});
+
+test('the installed client version is read again only when the plist mtime changes', () => {
+  let mtime = 10;
+  let reads = 0;
+  const version = createInstalledClientVersion({
+    stat: () => mtime,
+    read: () => { reads++; return reads === 1 ? '0.79.3' : '0.79.4-dev'; },
+  });
+  assert.equal(version(), '0.79.3');
+  assert.equal(version(), '0.79.3');
+  assert.equal(reads, 1);
+  mtime = 11;
+  assert.equal(version(), '0.79.4');
+  assert.equal(version(), '0.79.4');
+  assert.equal(reads, 2);
 });
 
 test('presence response names login_rejected and leaves an asleep box unnamed', async () => {

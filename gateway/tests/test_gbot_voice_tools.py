@@ -722,6 +722,27 @@ async def test_login_rejected_desktop_line_names_the_cause(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_client_update_required_desktop_line_names_the_update(monkeypatch):
+    import json
+
+    b = make(monkeypatch)
+    b._native = SimpleNamespace(
+        ready=False,
+        close=AsyncMock(),
+        health=lambda: {"reason": "client_update_required", "ready": False},
+    )
+    await b._tool({"name": "send_task", "call_id": "update", "arguments": '{"request":"fixture"}'})
+    raw = next(
+        call.args[0]["item"]["output"]
+        for call in b._send.call_args_list
+        if call.args[0]["type"] == "conversation.item.create"
+    )
+    spoken = json.loads(raw)["spoken"]
+    assert spoken == "Desktop is down because Grok Bot on the iMac needs an update."
+    await b.stop()
+
+
+@pytest.mark.asyncio
 async def test_unavailable_send_task_logs_channel_down(monkeypatch, caplog):
     import logging
 
