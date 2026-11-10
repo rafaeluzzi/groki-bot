@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createBridge, accountRpc, filterNativeEvent, validateBody, isRoutineStreamEnd } from './gbot_voice_session_bridge.mjs';
+import { createBridge, accountRpc, createEnsureBackoff, createInstalledClientVersion, filterNativeEvent, parseClientVersion, validateBody, isRoutineStreamEnd } from './gbot_voice_session_bridge.mjs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
 import { mkdtempSync, readFileSync } from 'node:fs';
@@ -40,7 +40,133 @@ test('account RPC admits only fixed methods and never leaks upstream response bo
     assert.equal(url, 'https://api2.cursor.sh/aiserver.v1.GrokBotService/MintSandVoiceCallSecret');
     assert.equal(options.redirect, 'error'); return {ok:false,status:403,json:async()=>({token:'DO_NOT_LEAK'})};
   };
-  await assert.rejects(accountRpc('MintSandVoiceCallSecret', {}, {accountLoader,fetcher}), /^Error: upstream_http_403$/);
+  await assert.rejects(accountRpc('MintSandVoiceCallSecret', {}, {accountLoader, fetcher, clientVersion: '0.79.3'}), /^Error: upstream_http_403$/);
+});
+
+test('account RPC 401 and 403 are login_rejected and EnsureSandBox backs off until success or a new secrets file', async () => {
+  const forbidden = async () => ({ok: false, status: 403, json: async () => ({token: 'DO_NOT_LEAK'})});
+  await assert.rejects(
+    accountRpc('MintSandVoiceCallSecret', {}, {accountLoader: () => ({token: 'FAKE_TEST', machineId: 'FAKE_MACHINE'}), fetcher: forbidden, clientVersion: '0.79.3'}),
+    (error) => error.message === 'upstream_http_403' && error.reason === 'login_rejected',
+  );
+  assert.equal(parseClientVersion('0.79.3'), '0.79.3');
+  assert.equal(parseClientVersion('0.79.3-dev'), '0.79.3');
+  assert.equal(parseClientVersion('0.71.2'), '0.71.2');
+  assert.equal(parseClientVersion('sand'), null);
+  let now = 1_000_000;
+  let mtime = 10;
+  let calls = 0;
+  const backoff = createEnsureBackoff({now: () => now, secretsMtime: () => mtime, startMs: 5000, maxMs: 60000});
+  const accountLoader = () => ({token: 'FAKE_TEST', machineId: 'FAKE_MACHINE'});
+  const fetcher = async (_url, options) => {
+    calls++;
+    assert.equal(options.headers['x-cursor-client-version'], '0.79.3');
+    assert.equal(options.headers['x-cursor-client-version'] === '0.71.2', false);
+    const status = calls === 4 ? 200 : (calls === 3 ? 417 : 401);
+    return {ok: status === 200, status, json: async () => ({ok: true})};
+  };
+  const opts = {accountLoader, fetcher, clientVersion: '0.79.3', backoff};
+  const body = {wake: false, supportsAsleepBox: true};
+  await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.message === 'upstream_http_401' && error.reason === 'login_rejected');
+  assert.equal(calls, 1);
+  now += 4999;
+  await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.reason === 'login_rejected');
+  assert.equal(calls, 1);
+  now += 1;
+  await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.message === 'upstream_http_401' && error.reason === 'login_rejected');
+  assert.equal(calls, 2);
+  // 417 is the asleep box. It is not a rejected login and it does not extend the wait.
+  now += 10000;
+  await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.message === 'upstream_http_417' && error.reason === undefined);
+  assert.equal(calls, 3);
+  await accountRpc('EnsureSandBox', body, opts);
+  assert.equal(calls, 4);
+  await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.reason === 'login_rejected');
+  assert.equal(calls, 5);
+  now += 1000;
+  mtime = 11;
+  await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.reason === 'login_rejected');
+  assert.equal(calls, 6);
+});
+
+test('the update hint is client_update_required for 401 and 403, and a missing hint stays login_rejected', async () => {
+  const accountLoader = () => ({token: 'FAKE_TEST', machineId: 'FAKE_MACHINE'});
+  const body = {wake: false, supportsAsleepBox: true};
+  const cases = [
+    [401, 'SAND_CLIENT_UPDATE_REQUIRED', 'client_update_required'],
+    [403, 'SAND_CLIENT_UPDATE_REQUIRED', 'client_update_required'],
+    [401, null, 'login_rejected'],
+    [403, null, 'login_rejected'],
+  ];
+  for (const [status, hint, reason] of cases) {
+    let bodyReads = 0;
+    let now = 1_000;
+    let calls = 0;
+    const backoff = createEnsureBackoff({now: () => now, secretsMtime: () => 1, startMs: 5000, maxMs: 60000});
+    const fetcher = async () => {
+      calls++;
+      return {
+        ok: false,
+        status,
+        headers: {get: (name) => name === 'x-automation-failure-hint' ? hint : null},
+        json: () => { bodyReads++; return {secret: 'DO_NOT_LEAK'}; },
+        text: () => { bodyReads++; return 'DO_NOT_LEAK'; },
+      };
+    };
+    const opts = {accountLoader, fetcher, clientVersion: '0.71.2', backoff};
+    await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.message === `upstream_http_${status}` && error.reason === reason);
+    now += 1000;
+    await assert.rejects(accountRpc('EnsureSandBox', body, opts), (error) => error.reason === reason);
+    assert.equal(calls, 1);
+    assert.equal(bodyReads, 0);
+  }
+});
+
+test('the installed client version is read again only when the plist mtime changes', () => {
+  let mtime = 10;
+  let reads = 0;
+  const version = createInstalledClientVersion({
+    stat: () => mtime,
+    read: () => { reads++; return reads === 1 ? '0.79.3' : '0.79.4-dev'; },
+  });
+  assert.equal(version(), '0.79.3');
+  assert.equal(version(), '0.79.3');
+  assert.equal(reads, 1);
+  mtime = 11;
+  assert.equal(version(), '0.79.4');
+  assert.equal(version(), '0.79.4');
+  assert.equal(reads, 2);
+});
+
+test('presence response names login_rejected and leaves an asleep box unnamed', async () => {
+  const port = await freePort();
+  let mode = 'login';
+  const sandbox = {
+    callerAuthId: async () => 'owner',
+    presence: async () => {
+      if (mode === 'login') {
+        const error = new Error('upstream_http_401');
+        error.reason = 'login_rejected';
+        throw error;
+      }
+      throw new Error('upstream_http_417');
+    },
+  };
+  const server = createBridge({port, agentId: 'a', desktopEnabled: true, sandbox});
+  await new Promise(r => server.listen(port, '127.0.0.1', r));
+  const post = () => fetch(`http://127.0.0.1:${port}/native/presence`, {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({agentId: 'a', callId: 'call-c', isOnTheLine: true, acceptsOverheard: false}),
+  });
+  try {
+    const denied = await post();
+    assert.equal(denied.status, 502);
+    assert.deepEqual(await denied.json(), {ok: false, error: 'upstream_http_401', reason: 'login_rejected'});
+    mode = 'asleep';
+    const asleep = await post();
+    assert.equal(asleep.status, 502);
+    assert.deepEqual(await asleep.json(), {ok: false, error: 'upstream_http_417'});
+  } finally { await new Promise(r => server.close(r)); }
 });
 
 test('tool invocation requires complete bounded line state', () => {

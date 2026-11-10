@@ -45,16 +45,27 @@ async def close_native_channels(timeout=5.0):
         logger.warning("Grok native hangup on shutdown timed out channels=%d", len(channels))
 
 
-async def helper_error(response):
-    """The helper's ``error`` word (``upstream_http_429`` is Grok's own status), else ``http_<status>``."""
+def _safe_word(value):
+    if isinstance(value, str) and NATIVE_ERROR_RE.fullmatch(value):
+        return value
+    return None
+
+
+async def helper_failure(response):
+    """The helper's ``error`` word and optional ``reason``.
+
+    ``upstream_http_429`` is Grok's own status. ``login_rejected`` is a 401/403
+    from the account RPC. ``client_update_required`` is that same status with
+    the update hint. A hibernated box stays ``upstream_http_417`` with no
+    reason. Bodies are not logged.
+    """
     try:
         body = await response.json(content_type=None)
     except Exception:
         body = None
-    error = body.get("error") if isinstance(body, dict) else None
-    if isinstance(error, str) and NATIVE_ERROR_RE.fullmatch(error):
-        return error
-    return f"http_{response.status}"
+    error = _safe_word(body.get("error") if isinstance(body, dict) else None)
+    reason = _safe_word(body.get("reason") if isinstance(body, dict) else None)
+    return error or f"http_{response.status}", reason
 
 
 def update_event(message, agent_id, call_id):
@@ -133,6 +144,7 @@ class NativeVoiceChannel:
         self._typed_seen = set()
         self._presence_status = None
         self._error = None
+        self._reason = None
         self._ready_mono = None
         self._call_logged = False
         self.connected = asyncio.Event()
@@ -152,11 +164,15 @@ class NativeVoiceChannel:
             if on:
                 self._presence_status = response.status
             if response.status != 200:
-                error = await helper_error(response)
+                error, reason = await helper_failure(response)
                 if on:
                     self._error = error
+                    self._reason = reason
                 logger.info("Grok native presence on=%s status=%d error=%s", on, response.status, error)
+                if reason in {"login_rejected", "client_update_required"}:
+                    raise RuntimeError(reason)
                 raise RuntimeError("native_presence_unavailable")
+            self._reason = None
             logger.info("Grok native presence on=%s status=%d", on, response.status)
             if on and not self._call_logged:
                 self._call_logged = True
@@ -187,6 +203,7 @@ class NativeVoiceChannel:
             "ready": ready,
             "presence_status": self._presence_status,
             "error": None if ready else self._error,
+            "reason": None if ready else self._reason,
         }
 
     async def start(self):
@@ -257,9 +274,10 @@ class NativeVoiceChannel:
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=60),
         ) as response:
             if response.status != 200:
-                self._error = await helper_error(response)
+                self._error, self._reason = await helper_failure(response)
                 raise RuntimeError("native_events_unavailable")
             self._error = None
+            self._reason = None
             self._ready_mono = time.monotonic()
             self.connected.set()
             logger.info("Grok native channel state=ready")

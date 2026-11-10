@@ -1,11 +1,12 @@
 #!/usr/bin/env node
 // SPDX-FileCopyrightText: 2026 Joseph Zhou
 // SPDX-License-Identifier: MIT
-/** Local validation bridge for Grok Bot 0.71.2's existing macOS login.
+/** Local validation bridge for the installed Grok Bot app's existing macOS login.
  * Never persists credentials or refreshes/modifies the client's account state.
+ * The account RPC rejects a client version older than the installed app.
  * Internal APIs are version dependent; expired sessions must be renewed in the app.
  */
-import { readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { pbkdf2Sync, createDecipheriv, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -55,15 +56,118 @@ function checksum(machineId) {
   return bytes.toString('base64url') + machineId;
 }
 
-async function accountRequest(method, body, { accountLoader = loadAccount, fetcher = fetch, signal, streaming = false } = {}) {
+const APP_PLIST = '/Applications/Grok Bot.app/Contents/Info.plist';
+const SECRETS_PATH = () => join(homedir(), 'Library/Application Support/Grok Bot/sand-secrets.json');
+
+// Prod builds send the semver prefix. A prerelease suffix is not part of the header.
+export function parseClientVersion(raw) {
+  const match = /^(\d+\.\d+\.\d+)(?:-.+)?$/.exec(String(raw ?? '').trim());
+  return match ? match[1] : null;
+}
+
+function readInstalledVersionText() {
+  return execFileSync('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', APP_PLIST], {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000,
+  });
+}
+
+export function createInstalledClientVersion({ stat, read } = {}) {
+  let seenMtime;
+  let cached = null;
+  return function clientVersion() {
+    let mtime;
+    try { mtime = stat(); } catch { throw new Error('client_version_unavailable'); }
+    if (cached !== null && mtime === seenMtime) return cached;
+    let raw;
+    try { raw = read(); } catch { throw new Error('client_version_unavailable'); }
+    const version = parseClientVersion(raw);
+    if (!version) throw new Error('client_version_unavailable');
+    seenMtime = mtime;
+    cached = version;
+    return version;
+  };
+}
+
+const installedClientVersionCached = createInstalledClientVersion({
+  stat: () => statSync(APP_PLIST).mtimeMs,
+  read: readInstalledVersionText,
+});
+
+export function installedClientVersion() {
+  return installedClientVersionCached();
+}
+
+const ACCOUNT_FAILURE_REASONS = new Set(['login_rejected', 'client_update_required']);
+
+function accountFailure(status, reason) {
+  const error = new Error(`upstream_http_${status}`);
+  error.reason = reason;
+  return error;
+}
+
+function accountFailureReason(response) {
+  const headers = response?.headers;
+  const hint = typeof headers?.get === 'function' ? headers.get('x-automation-failure-hint') : null;
+  return hint === 'SAND_CLIENT_UPDATE_REQUIRED' ? 'client_update_required' : 'login_rejected';
+}
+
+// EnsureSandBox 401/403 waits 5s, then 10, 20, 40, and 60. A success or a
+// rewritten sand-secrets.json tries again at once. Other failures do not wait.
+export function createEnsureBackoff({ now = Date.now, secretsMtime = defaultSecretsMtime, startMs = 5000, maxMs = 60000 } = {}) {
+  let delay = startMs;
+  let until = 0;
+  let seenMtime = null;
+  let lastStatus = 401;
+  let lastReason = 'login_rejected';
+  const noteSecrets = () => {
+    let mtime = null;
+    try { mtime = secretsMtime(); } catch { mtime = null; }
+    if (seenMtime !== null && mtime !== null && mtime !== seenMtime) {
+      delay = startMs;
+      until = 0;
+    }
+    if (mtime !== null) seenMtime = mtime;
+  };
+  return {
+    blocked() {
+      noteSecrets();
+      return now() < until;
+    },
+    reject(status, reason = 'login_rejected') {
+      noteSecrets();
+      lastStatus = status;
+      lastReason = reason;
+      until = now() + delay;
+      delay = Math.min(delay * 2, maxMs);
+    },
+    succeed() {
+      delay = startMs;
+      until = 0;
+      noteSecrets();
+    },
+    error() { return accountFailure(lastStatus, lastReason); },
+  };
+}
+
+function defaultSecretsMtime() {
+  try { return statSync(SECRETS_PATH()).mtimeMs; } catch { return null; }
+}
+
+const defaultEnsureBackoff = createEnsureBackoff();
+
+async function accountRequest(method, body, { accountLoader = loadAccount, fetcher = fetch, signal, streaming = false, clientVersion, backoff } = {}) {
   if (!Object.values(RPC_ROUTES).includes(method) && method !== 'EnsureSandBox' && method !== 'WatchGrokBotTranscripts') throw new Error('rpc_forbidden');
   if (method === 'EnsureSandBox' && ![JSON.stringify({wake: false, supportsAsleepBox: true}), '{}'].includes(JSON.stringify(body))) throw new Error('rpc_forbidden');
   if (method === 'WatchGrokBotTranscripts' && (!streaming || body.includeUnlistedAgents !== false || body.inlineBodyMaxBytes !== 65536 || body.cursors?.length !== 1 || typeof body.cursors[0].agentId !== 'string' || Object.keys(body.cursors[0]).some(k => !['agentId', 'generation', 'afterUpdatedSeq'].includes(k)) || body.cursors[0].generation !== 0 || body.cursors[0].afterUpdatedSeq !== '0')) throw new Error('rpc_forbidden');
+  const ensure = method === 'EnsureSandBox';
+  const gate = backoff !== undefined ? backoff : (ensure ? defaultEnsureBackoff : null);
+  if (ensure && gate?.blocked()) throw gate.error();
   const account = accountLoader();
+  const version = clientVersion ?? installedClientVersion();
   const headers = {
     authorization: `Bearer ${account.token}`, 'content-type': 'application/json',
     'connect-protocol-version': '1', 'x-cursor-client-type': 'sand',
-    'x-cursor-client-version': '0.71.2', 'x-cursor-client-source': 'sand-desktop',
+    'x-cursor-client-version': version, 'x-cursor-client-source': 'sand-desktop',
     'x-cursor-client-os': 'darwin', 'x-sand-box-namespace': 'prod',
     'x-ghost-mode': 'true', 'x-cursor-checksum': checksum(account.machineId),
     'x-request-id': randomUUID(), 'x-cursor-timezone': Intl.DateTimeFormat().resolvedOptions().timeZone,
@@ -78,9 +182,17 @@ async function accountRequest(method, body, { accountLoader = loadAccount, fetch
   const response = await fetcher(BACKEND + method, { method: 'POST', headers,
     body: payload, redirect: 'error', signal: signal ?? AbortSignal.timeout(20000) });
   if (!response.ok) {
-    // Upstream bodies can contain user content or credentials; never expose them.
+    // Upstream bodies can contain user content or credentials; never read or log them.
+    // The update hint is a fixed header. Any other 401/403 is a rejected login.
+    // 417 stays a hibernated box.
+    if (response.status === 401 || response.status === 403) {
+      const reason = accountFailureReason(response);
+      if (ensure && gate) gate.reject(response.status, reason);
+      throw accountFailure(response.status, reason);
+    }
     throw new Error(`upstream_http_${response.status}`);
   }
+  if (ensure && gate) gate.succeed();
   return response;
 }
 
@@ -441,7 +553,11 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
     const address = req.socket.remoteAddress;
     if (address !== '127.0.0.1' || req.headers.origin !== undefined || req.headers['sec-fetch-site'] && req.headers['sec-fetch-site'] !== 'none' || req.headers.host !== `127.0.0.1:${port}`) return send(403, { ok: false, error: 'local_client_only' });
     const route = `${req.method} ${req.url}`;
-    if (route === 'GET /health') return send(200, { ok: true, source: 'grok-bot-existing-login', clientVersion: '0.71.2', agentId: agentId || null, toolsEnabled, desktopEnabled });
+    if (route === 'GET /health') {
+      let clientVersion = null;
+      try { clientVersion = installedClientVersion(); } catch { clientVersion = null; }
+      return send(200, { ok: true, source: 'grok-bot-existing-login', clientVersion, agentId: agentId || null, toolsEnabled, desktopEnabled });
+    }
     if (route === 'POST /native/warm') {
       if (!desktopEnabled && !toolsEnabled) return send(403, {ok: false, error: 'desktop_disabled'});
       if (warmFlight) return send(200, {ok: true, state: 'in_flight', ms: 0});
@@ -651,8 +767,10 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       }
       return send(200, result);
     } catch (error) {
-      const safe = /^(upstream_http_\d{3}|login_unavailable|login_expired_open_grok_bot|unsupported_storage)$/.test(error.message) ? error.message : 'bridge_request_failed';
-      return send(502, { ok: false, error: safe });
+      const safe = /^(upstream_http_\d{3}|login_unavailable|login_expired_open_grok_bot|unsupported_storage|client_version_unavailable)$/.test(error.message) ? error.message : 'bridge_request_failed';
+      const payload = { ok: false, error: safe };
+      if (ACCOUNT_FAILURE_REASONS.has(error?.reason)) payload.reason = error.reason;
+      return send(502, payload);
     }
   });
   server.hangupActiveCall = hangupActiveCall;
