@@ -189,6 +189,7 @@ async def test_native_presence_and_sse_lifecycle(caplog):
                 "ready": True,
                 "presence_status": 200,
                 "error": None,
+                "reason": None,
             }
             await channel.close()
         assert [item["isOnTheLine"] for item in presence] == [True, False]
@@ -441,6 +442,7 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "ready": False,
                     "presence_status": 502,
                     "error": "upstream_http_429",
+                    "reason": None,
                 }
                 assert not channel.ready
                 http_status, body = await read_health()
@@ -458,6 +460,7 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                         "ready": False,
                         "presence_status": 200,
                         "error": "http_502",
+                        "reason": None,
                     }
                 )
                 http_status, body = await read_health()
@@ -472,6 +475,7 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "ready": True,
                     "presence_status": 200,
                     "error": None,
+                    "reason": None,
                 }
                 http_status, body = await read_health()
                 assert http_status == 200 and body["ok"] is True
@@ -481,9 +485,58 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "ready": True,
                     "presence_status": 200,
                     "error": None,
+                    "reason": None,
                 }
             finally:
                 helper.release.set()
+                await channel.close()
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_login_rejected_is_a_distinct_reason_from_an_asleep_box(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.gbot_native_channel")
+    app = web.Application()
+    mode = {"body": {"ok": False, "error": "upstream_http_401", "reason": "login_rejected"}}
+
+    async def register(request):
+        body = await request.json()
+        if not body.get("isOnTheLine"):
+            return web.json_response({"ok": True})
+        return web.json_response(mode["body"], status=502)
+
+    app.router.add_post("/native/presence", register)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    channel = NativeVoiceChannel(
+        None, f"http://127.0.0.1:{port}", "agent", "call", AsyncMock()
+    )
+    from aiohttp import ClientSession
+
+    try:
+        async with ClientSession() as http:
+            channel._http = http
+            channel._retry_delay = 0.01
+            await channel.start()
+            try:
+                await eventually(lambda: channel.health()["reason"] == "login_rejected")
+                assert channel.health()["error"] == "upstream_http_401"
+                assert channel.health()["state"] == "unavailable"
+                assert "reason=login_rejected" in caplog.text
+                assert "error=upstream_http_401" in caplog.text
+                mode["body"] = {"ok": False, "error": "upstream_http_417"}
+                await eventually(
+                    lambda: channel.health()["error"] == "upstream_http_417"
+                    and channel.health()["reason"] is None
+                )
+                assert "reason=native_presence_unavailable" in caplog.text
+            finally:
                 await channel.close()
     finally:
         await runner.cleanup()

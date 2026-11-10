@@ -506,14 +506,22 @@ class GbotVoiceBridge:
             self._desktop_epoch,
         )
 
-    @staticmethod
-    def _desktop_failure(code, *, refused=False):
+    def _desktop_down_phrase(self):
+        channel = self._native
+        health = getattr(channel, "health", None) if channel is not None else None
+        if callable(health):
+            snapshot = health()
+            if isinstance(snapshot, dict) and snapshot.get("reason") == "login_rejected":
+                return "Desktop is down because the Grok Bot login was rejected."
+        return "Desktop tasks are down right now."
+
+    def _desktop_failure(self, code, *, refused=False):
         if refused:
             return {"relay": "refused", "spoken": "The desktop assistant did not accept that task."}
         return {
             "relay": "unreachable",
             "spoken": (
-                "Desktop tasks are down right now."
+                self._desktop_down_phrase()
                 if code == "native_not_ready"
                 else "The desktop assistant cannot take that task right now."
             ),
@@ -1401,11 +1409,8 @@ class GbotVoiceBridge:
                     self._desktop_tasks.refuse(waited_ms)
                     result = self._desktop_failure("native_not_ready")
                 else:
-                    result = {
-                        "ok": False,
-                        "error": "Desktop tasks are down right now.",
-                        "spoken": "Desktop tasks are down right now.",
-                    }
+                    phrase = self._desktop_down_phrase()
+                    result = {"ok": False, "error": phrase, "spoken": phrase}
             elif name == "send_task":
                 request = arguments.get("request")
                 if (
