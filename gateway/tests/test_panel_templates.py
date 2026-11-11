@@ -3,6 +3,7 @@
 """Webview templates, ttl, and panel taps."""
 
 import logging
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -211,6 +212,21 @@ async def test_live_session_gets_the_tap_and_a_missing_session_does_not(caplog):
     assert live.sent == ['User tapped "Durham" on panel "restaurants".']
     assert "panel_action panel=restaurants action=Durham delivered" in caplog.text
     assert "dropped(debounce)" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_panel_tap_map_drops_entries_older_than_a_few_seconds():
+    live = _Proxy(True)
+    now = time.monotonic()
+    live._panel_taps[("old", "a")] = now - 10
+    live._panel_taps[("recent", "b")] = now - 1
+    live._panel_taps[("restaurants", "Durham")] = now - 0.2
+    tap = {"type": "panel_action", "id": "restaurants", "action": "Durham", "label": "Durham"}
+    await live.handle_panel_action(tap)
+    assert ("old", "a") not in live._panel_taps
+    assert ("recent", "b") in live._panel_taps
+    assert live._panel_taps[("restaurants", "Durham")] >= now
+    assert live.sent == []
 
 
 def test_local_frame_is_not_a_panel_show():

@@ -17,6 +17,9 @@ from .panel_frames import panel_action_delivery
 
 logger = logging.getLogger(__name__)
 
+# Debounce is 0.4s. Anything older than this cannot still be that second tap.
+_PANEL_TAP_KEEP_S = 5.0
+
 
 @dataclass
 class GbotVoiceProxy(GeminiVoiceProxy):
@@ -118,8 +121,10 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             logger.info("panel_action panel=%s action=%s dropped(%s)", panel, action, outcome)
             return
         now = time.monotonic()
-        previous = self._panel_taps.get((panel, action))
-        self._panel_taps[(panel, action)] = now
+        self._prune_panel_taps(now)
+        key = (panel, action)
+        previous = self._panel_taps.get(key)
+        self._panel_taps[key] = now
         if previous is not None and now - previous < 0.4:
             logger.info("panel_action panel=%s action=%s dropped(debounce)", panel, action)
             return
@@ -129,6 +134,12 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             logger.info("panel_action panel=%s action=%s dropped(send_failed)", panel, action)
             return
         logger.info("panel_action panel=%s action=%s delivered", panel, action)
+
+    def _prune_panel_taps(self, now):
+        """Drop debounce keys that can no longer match. Called when a tap is recorded."""
+        stale = [key for key, seen in self._panel_taps.items() if now - seen > _PANEL_TAP_KEEP_S]
+        for key in stale:
+            del self._panel_taps[key]
 
     async def send_device_json(self, message):
         """A typed hand-off arrives as ``listen`` / ``detect`` text. Grok hears that sentence."""
