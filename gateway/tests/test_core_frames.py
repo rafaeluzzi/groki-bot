@@ -230,7 +230,8 @@ def test_core_frames_can_be_turned_off(monkeypatch):
     instructions = bridge._provider_tool_instructions()
     assert "fluid SDF body" not in instructions
     assert "node-mesh" not in instructions
-    assert "core_morph" not in instructions
+    # roles.md names the tool. The call instructions stay out with the flag.
+    assert "call core_morph(name)" not in instructions
 
 
 def test_audio_only_bridge_does_not_declare_core_tools():

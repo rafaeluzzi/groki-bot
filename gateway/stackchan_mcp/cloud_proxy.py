@@ -163,6 +163,16 @@ class CloudProxy:
         await self._wait_until_ready()
         return self.connected
 
+    async def handle_panel_action(self, frame: dict[str, Any]) -> None:
+        """Xiaozhi cloud is not the Grok session. A tap is dropped, not forwarded."""
+        panel = frame.get("id") if isinstance(frame.get("id"), str) else "-"
+        action = frame.get("action") if isinstance(frame.get("action"), str) else "-"
+        logger.info(
+            "panel_action panel=%s action=%s dropped(no_session)",
+            panel[:80],
+            action[:80],
+        )
+
     async def send_device_json(self, message: dict[str, Any]) -> bool:
         """Forward a JSON message from ESP32 to xiaozhi cloud."""
         if not await self.ensure_connected():

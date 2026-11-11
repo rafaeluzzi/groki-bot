@@ -27,8 +27,12 @@ sent, because Koji drops a document it cannot parse and never says so:
   Pause, or Play when ``paused`` is true.
 - ``choice`` takes ``prompt`` (or ``title``/``text``) and 1 to 4 ``actions``
   (or ``options``/``choices``).
-- ``webview`` (``html`` is an alias) needs an ``html`` fragment. Koji does not
-  load URLs.
+- ``webview`` (``html`` is an alias) takes an ``html`` fragment, or
+  ``template`` plus ``data``. Koji does not load URLs. Templates render to a
+  fragment that stays inside the sanitizer. See ``panel_templates.py``.
+- Optional ``ttl_s`` is whole seconds the card stays up. ``0`` stays until
+  dismissed. Omitted uses the kind default on the device (list 45, choice 60,
+  webview 30). ``now_playing`` ignores ``ttl_s`` and does not time out.
 
 Text over Koji's length caps is cut with an ellipsis, and ``<`` in plain text
 becomes ``‹``. Unknown fields are dropped. A rejected document returns a
@@ -38,7 +42,9 @@ Portal does not ack ``type:panel`` today (unlike ``type:core``). The tool
 returns ok after the document is validated and the frame is written. That
 write does not send ``abort`` and does not change the voice session. Inbound
 ``type:panel`` text is not user speech and is not forwarded into the voice
-turn. Device ``panel_action`` delivery to the model is not implemented.
+turn. A device ``panel_action`` (a tap that is not ``dismiss`` or ``local:``)
+is injected as one short user turn when a Grok voice session is live. With
+no session the gateway logs ``dropped(no_session)`` and does not open one.
 
 Set ``STACKCHAN_PANEL_FRAMES=0`` to stop declaring the tools on the gbot path.
 The default is on, same as ``STACKCHAN_CORE_FRAMES``.
@@ -47,10 +53,13 @@ The default is on, same as ``STACKCHAN_CORE_FRAMES``.
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 PANEL_KINDS = ("list", "now_playing", "choice", "webview")
 _KIND_ALIASES = {"html": "webview"}
@@ -98,6 +107,15 @@ _MAX_ACTION_LABEL = 40
 _MAX_URL = 500
 _MAX_HTML = 48000
 _MAX_SECONDS = 172_800
+_MAX_TTL_S = 600
+
+# Device applies these when the document omits ttl_s. now_playing never times out.
+DEFAULT_TTL_S = {
+    "list": 45,
+    "choice": 60,
+    "webview": 30,
+    "now_playing": 0,
+}
 
 _ROW_LABEL_KEYS = ("title", "label", "text", "name")
 _ROW_SUBTITLE_KEYS = ("subtitle", "description", "detail")
@@ -122,8 +140,12 @@ _SHOW_DESCRIPTION = (
     "(optional subtitle); at most 12 are shown. "
     "kind now_playing: title and show (or artist). "
     "kind choice: prompt and 1 to 4 options, each with a label. "
-    "kind webview: an html fragment (no scripts, styles, or remote images; urls are not loaded). "
-    "Use list, now_playing, or choice when they fit. "
+    "kind webview: prefer template and data over raw html. "
+    "Templates: weather, compare, agenda, steps, fact, score, key_points. "
+    'Example: {"kind":"webview","template":"weather","data":{"place":"Durham","temp":"72°","condition":"Mild"}}. '
+    "Optional ttl_s is seconds (0 stays until dismissed). now_playing does not time out. "
+    "A new panel replaces the open one. The same id updates in place. "
+    "Use list for places or rows, choice for 2 to 4 options, a template for a card or table, now_playing for music. "
     "This does not speak audio and does not replace the spoken reply. "
     "ok means the frame was accepted and sent. On an error, fix what the error names."
 )
@@ -140,7 +162,11 @@ PANEL_INSTRUCTIONS = (
     + PANEL_EXAMPLE
     + ". self.panel.show is the same action. "
     "dismiss_panel and self.panel.dismiss close it. "
-    "A webview or html document with an html fragment can be sent the same way when that page is what should appear. "
+    "For a rich card, use kind webview with template and data "
+    "(weather, compare, agenda, steps, fact, score, key_points) instead of raw html. "
+    "A new panel replaces the open one. The same id updates in place. "
+    "ttl_s is optional seconds; 0 stays until dismissed. "
+    "A button tap arrives as a user turn. "
     "A list titled Podcasts I follow is shown A-to-Z by title, the same order as the numbered followed shows. "
     "Skip a blank title. If the podcast tool replaced it with a feed title, use that title in this order. "
     "number N counts from the top of the titled rows. "
@@ -415,11 +441,28 @@ def _choice(source: dict[str, Any], doc: dict[str, Any]) -> int:
 
 
 def _webview(source: dict[str, Any], doc: dict[str, Any]) -> int:
-    html = next((source[key] for key in _HTML_KEYS if isinstance(source.get(key), str)), None)
-    if html is None or not html.strip():
+    template = source.get("template")
+    has_template = isinstance(template, str) and bool(template.strip())
+    html = next((source[key] for key in _HTML_KEYS if isinstance(source.get(key), str) and source.get(key).strip()), None)
+    if has_template and html is not None:
+        raise PanelError("kind webview takes template and data, or html, not both")
+    if has_template:
+        from .panel_templates import render_panel_template
+
+        data = source.get("data", {})
+        if "data" in source and not isinstance(data, dict):
+            raise PanelError("template data must be an object")
+        html = render_panel_template(template.strip(), data if isinstance(data, dict) else {})
+        if not isinstance(source.get("title"), str):
+            label = None
+            if isinstance(data, dict):
+                label, _ = _first(data, ("title", "place"), _MAX_TITLE)
+            if label is not None:
+                doc["title"] = label
+    if html is None or not str(html).strip():
         if any(isinstance(source.get(key), str) for key in _URL_KEYS):
-            raise PanelError("kind webview cannot load a url; send an html fragment in html")
-        raise PanelError("kind webview needs an html fragment in html")
+            raise PanelError("kind webview cannot load a url; send an html fragment in html, or a template and data")
+        raise PanelError("kind webview needs an html fragment in html, or a template and data")
     if len(html) > _MAX_HTML:
         raise PanelError(f"html is longer than {_MAX_HTML} characters")
     title, _ = _first(source, ("title",), _MAX_TITLE)
@@ -427,6 +470,21 @@ def _webview(source: dict[str, Any], doc: dict[str, Any]) -> int:
         doc["title"] = title
     doc["html"] = html
     return 0
+
+
+def _ttl(source: dict[str, Any], kind: str) -> int | None:
+    """Seconds to put on the document, or None to omit the field.
+
+    ``now_playing`` never times out, so a passed ``ttl_s`` is ignored.
+    """
+    if "ttl_s" not in source:
+        return None
+    if kind == "now_playing":
+        return None
+    value = source.get("ttl_s")
+    if isinstance(value, bool) or type(value) is not int or not 0 <= value <= _MAX_TTL_S:
+        raise PanelError(f"ttl_s must be a whole number of seconds from 0 to {_MAX_TTL_S}, or omit it")
+    return value
 
 
 _KIND_BUILDERS = {
@@ -478,6 +536,9 @@ def normalize_panel_document(value: object) -> tuple[dict[str, Any], int]:
         raise PanelError("kind must be list, now_playing, choice, or webview")
     doc: dict[str, Any] = {"version": 1, "kind": kind, "id": ""}
     dropped = _KIND_BUILDERS[kind](source, doc)
+    ttl = _ttl(source, kind)
+    if ttl is not None:
+        doc["ttl_s"] = ttl
     label = doc.get("title") or doc.get("prompt") or kind
     doc["id"] = _id(source.get("id"), _token(label, kind.replace("_", "-")))
     return doc, dropped
@@ -551,6 +612,54 @@ def panel_tool_parameters(name: str) -> dict[str, Any]:
     }
 
 
+def template_name_of(value: object) -> str | None:
+    """The template on a show_panel argument, if the model named one."""
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, dict):
+        return None
+    name = value.get("template")
+    if isinstance(name, str) and name.strip():
+        return name.strip()
+    return None
+
+
+def panel_action_delivery(frame: object, *, session_live: bool) -> tuple[str | None, str]:
+    """Turn a device tap into one user sentence, or a drop reason.
+
+    Local ids (``dismiss``, ``local:``) are not a voice turn. With no live
+    session the reason is ``no_session`` and nothing is opened.
+    """
+    if not isinstance(frame, dict) or frame.get("type") != "panel_action":
+        return None, "not_panel_action"
+    panel = frame.get("id")
+    action = frame.get("action")
+    if not isinstance(panel, str) or _TOKEN_RE.fullmatch(panel) is None:
+        return None, "bad_panel"
+    if not isinstance(action, str) or _TOKEN_RE.fullmatch(action) is None:
+        return None, "bad_action"
+    if action == "dismiss" or action.startswith("local:"):
+        return None, "local"
+    label = frame.get("label", action)
+    if not isinstance(label, str):
+        return None, "bad_label"
+    label = " ".join(label.split())
+    if not label:
+        label = action
+    if len(label) > _MAX_ACTION_LABEL:
+        label = label[: _MAX_ACTION_LABEL - 1].rstrip() + "\u2026"
+    label = label.replace('"', "'")
+    if not session_live:
+        return None, "no_session"
+    return f'User tapped "{label}" on panel "{panel}".', "delivered"
+
+
 def panel_tool_description(name: str) -> str:
     action = panel_action_for_tool(name)
     if action is None:
@@ -602,6 +711,10 @@ def panel_frame_extension(esp32: Any) -> Any:
             if frame.get("dismiss") is True:
                 return {"ok": True, "dismiss": True}
             shown: dict[str, Any] = {"ok": True, "kind": frame["panel"]["kind"]}
+            template = template_name_of(args.get("panel"))
+            if template and frame["panel"].get("kind") == "webview":
+                logger.info("panel template=%s", template)
+                shown["template"] = template
             if dropped:
                 shown["not_shown"] = dropped
             return shown

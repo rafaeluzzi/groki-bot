@@ -97,7 +97,8 @@ def test_panel_instructions_name_the_screen_rules():
     assert "Panels do not replace your spoken reply" in text
     assert "before the tool returns ok" in text
     assert "open-ended follow-up" in text
-    assert "webview or html" in text
+    assert "key_points" in text
+    assert "template and data" in text
     assert "core_draw" not in text
     assert "draw" not in text.lower()
 

@@ -13,6 +13,7 @@ from .desktop_tasks import handoff_already_closed, log_desktop_task
 from .gbot_voice_bridge import GbotVoiceBridge
 from .gemini_voice_proxy import GeminiVoiceProxy
 from .koji_wiki import publish_bridge_presence
+from .panel_frames import panel_action_delivery
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
     reconnect_max_delay_s: float = 30.0
     _health_task: asyncio.Task | None = field(default=None, init=False)
     _desktop_unsaid: list = field(default_factory=list, init=False)
+    _panel_taps: dict = field(default_factory=dict, init=False)
     _health: dict = field(default_factory=lambda: {
         "provider": "gbot_voice", "state": "stopped", "reconnect_attempts": 0,
         "successful_checks": 0, "last_verified_at": None, "last_check_at": None,
@@ -99,8 +101,40 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             self._stopped = False
         return connected
 
+    async def handle_panel_action(self, frame):
+        """Inject one panel tap into the live Grok session, or log why it was dropped.
+
+        Does not open a session. A second tap on the same control inside 0.4s
+        is ``dropped(debounce)``.
+        """
+        panel = frame.get("id") if isinstance(frame, dict) and isinstance(frame.get("id"), str) else "-"
+        action = frame.get("action") if isinstance(frame, dict) and isinstance(frame.get("action"), str) else "-"
+        panel = panel[:80]
+        action = action[:80]
+        send = getattr(self._bridge, "send_text", None) if self._bridge is not None else None
+        live = bool(self.connected and callable(send))
+        text, outcome = panel_action_delivery(frame, session_live=live)
+        if text is None:
+            logger.info("panel_action panel=%s action=%s dropped(%s)", panel, action, outcome)
+            return
+        now = time.monotonic()
+        previous = self._panel_taps.get((panel, action))
+        self._panel_taps[(panel, action)] = now
+        if previous is not None and now - previous < 0.4:
+            logger.info("panel_action panel=%s action=%s dropped(debounce)", panel, action)
+            return
+        try:
+            await send(text)
+        except Exception:
+            logger.info("panel_action panel=%s action=%s dropped(send_failed)", panel, action)
+            return
+        logger.info("panel_action panel=%s action=%s delivered", panel, action)
+
     async def send_device_json(self, message):
         """A typed hand-off arrives as ``listen`` / ``detect`` text. Grok hears that sentence."""
+        if isinstance(message, dict) and message.get("type") == "panel_action":
+            await self.handle_panel_action(message)
+            return True
         if (
             isinstance(message, dict)
             and message.get("type") == "listen"
