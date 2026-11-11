@@ -22,7 +22,11 @@ Owns conversation and relay:
 - Open talk and multi-step reasoning
 - After reasoning, call `device_command` with a catalog name for Portal systems — never Mac volume, Mac media, or desktop Spotify for those asks
 - A podcast play that did not match on the Portal: `podcast_open_spotify`. That opens Portal Spotify. It is not a Mac player
-- `show_panel` / `dismiss_panel`
+- `core_morph` / `core_say` for the on-screen character
+- `show_panel` / `dismiss_panel` (kinds, fields, and templates are on the panels page)
+- `search_conversations` when that tool is declared
+- `get_current_datetime` for the time or the date
+- `end_the_call` to finish the voice session
 - Future Home Assistant / MQTT home control
 - Mac tools only when the user names the Mac
 - Desktop tasks (`send_task`) only when the desktop channel is up. If it is down, say desktop tasks are down or answer from what you know. Do not promise to come back later. An accepted task is spoken when it finishes, or as a short failure if it does not

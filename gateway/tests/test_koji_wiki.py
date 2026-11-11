@@ -70,6 +70,11 @@ def test_seeded_pages_are_loaded_into_login_voice_instructions(monkeypatch):
     assert "two execution seats" in text
     assert "Closed command that matches on-device grammar" in text
     assert "Device command catalog (pointer)" in text
+    assert "template" in text
+    assert "weather" in text
+    assert "core_morph" in text
+    assert "get_current_datetime" in text
+    assert "end_the_call" in text
     assert "Never call set_volume, media_control, open_app" in text
     assert "# Presence" not in text
     assert not any("wiki" in name for name in names)
@@ -204,7 +209,7 @@ async def test_http_manifest_and_page_without_a_server(monkeypatch):
     assert manifest.status == 200
     body = json.loads(manifest.text)
     assert body["version"] == 1
-    assert [page["id"] for page in body["pages"]] == ["roles", "handoff", "presence", "catalog"]
+    assert [page["id"] for page in body["pages"]] == ["roles", "handoff", "panels", "presence", "catalog"]
     assert manifest.headers["ETag"] == body["etag"]
     roles_etag = next(page["etag"] for page in body["pages"] if page["id"] == "roles")
 

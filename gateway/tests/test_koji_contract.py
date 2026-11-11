@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from stackchan_mcp import panel_frames
+from stackchan_mcp.panel_templates import TEMPLATE_NAMES
 from stackchan_mcp.device_commands import (
     DEVICE_COMMAND_ARGS,
     DEVICE_COMMAND_NAMES,
@@ -94,6 +95,8 @@ def test_panel_kinds_pattern_and_limits_match_the_contract():
         "url": panel_frames._MAX_URL,
         "seconds": panel_frames._MAX_SECONDS,
     } == limits
+    assert panel_frames.DEFAULT_TTL_S == {key: int(value) for key, value in PANEL["ttl_s_default"].items()}
+    assert TEMPLATE_NAMES == tuple(PANEL["templates"])
 
 
 @pytest.mark.parametrize("rebuild", PANEL["rebuilds"], ids=lambda r: r["name"])

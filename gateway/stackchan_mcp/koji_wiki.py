@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: MIT
 """Koji role wiki: Markdown pages on disk, plus Portal presence.
 
-The Grok login-voice path loads ``roles`` and ``handoff`` (and the short
-catalog page) from ``gateway/wiki/`` and appends that text the same way other
+The Grok login-voice path loads ``roles``, ``handoff``, the panels page, and
+the short catalog page from ``gateway/wiki/`` and appends that text the same way other
 ``ToolExtension`` instructions are appended. It does not add a tool and it
 does not add another model.
 
@@ -215,7 +215,7 @@ def presence_summary(root: Path | None = None) -> str:
 
 
 def load_instruction_text(root: Path | None = None) -> str:
-    """Roles, handoff, and the catalog pointer, loaded from Markdown on disk."""
+    """Roles, handoff, panels, and the catalog pointer, loaded from Markdown on disk."""
     if not koji_wiki_enabled():
         return ""
     root = wiki_root() if root is None else root
@@ -234,9 +234,10 @@ def load_instruction_text(root: Path | None = None) -> str:
         if page is None or not page.text.strip():
             return ""
         parts.append(page.text.strip())
-    catalog = bundle.pages.get("catalog")
-    if catalog is not None and catalog.text.strip():
-        parts.append(catalog.text.strip())
+    for page_id in ("panels", "catalog"):
+        page = bundle.pages.get(page_id)
+        if page is not None and page.text.strip():
+            parts.append(page.text.strip())
     summary = presence_summary(root)
     if summary:
         parts.append(summary)

@@ -472,6 +472,79 @@ async def test_panel_frame_is_not_forwarded_to_the_voice_session():
 
 
 @pytest.mark.asyncio
+async def test_panel_action_goes_to_the_voice_handler_not_the_cloud():
+    class RecordingProxy:
+        def __init__(self):
+            self.messages = []
+            self.actions = []
+
+        async def start(self, info, hello, send):
+            return True
+
+        async def stop(self):
+            return None
+
+        async def send_device_json(self, message):
+            self.messages.append(message)
+            return True
+
+        async def handle_panel_action(self, frame):
+            self.actions.append(frame)
+
+        async def try_handle_device_mcp(self, message):
+            return False
+
+    proxy = RecordingProxy()
+    mgr = ESP32Manager(cloud_proxy_factory=lambda: proxy)
+    await mgr.start("127.0.0.1", 0)
+    port = mgr._server.sockets[0].getsockname()[1]
+    tap = {"type": "panel_action", "id": "restaurants", "action": "Durham", "label": "Durham"}
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+            await ws.send(json.dumps({
+                "type": "hello",
+                "version": 1,
+                "features": {"mcp": False},
+            }))
+            await asyncio.wait_for(ws.recv(), timeout=5.0)
+            await asyncio.sleep(0.1)
+            await ws.send(json.dumps(tap))
+            await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+            await asyncio.sleep(0.1)
+        assert proxy.actions == [tap]
+        assert proxy.messages == [{"type": "listen", "state": "stop"}]
+    finally:
+        await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_panel_action_without_a_session_is_dropped(caplog):
+    mgr = ESP32Manager()
+    await mgr.start("127.0.0.1", 0)
+    port = mgr._server.sockets[0].getsockname()[1]
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+            await ws.send(json.dumps({
+                "type": "hello",
+                "version": 1,
+                "features": {"mcp": False},
+            }))
+            await asyncio.wait_for(ws.recv(), timeout=5.0)
+            await asyncio.sleep(0.1)
+            with caplog.at_level("INFO"):
+                await ws.send(json.dumps({
+                    "type": "panel_action",
+                    "id": "restaurants",
+                    "action": "Durham",
+                    "label": "Durham",
+                }))
+                await asyncio.sleep(0.1)
+        assert "panel_action panel=restaurants action=Durham dropped(no_session)" in caplog.text
+    finally:
+        await mgr.stop()
+
+
+@pytest.mark.asyncio
 async def test_send_panel_rejects_invalid_frame_without_writing(manager):
     port = manager._test_port
 

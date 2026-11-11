@@ -660,8 +660,37 @@ class ESP32Manager:
 
                 elif msg_type == "panel":
                     # Portal does not ack panels. A panel frame is not user
-                    # speech and must not enter the voice turn. Device
-                    # panel_action delivery to the model is not implemented.
+                    # speech and must not enter the voice turn.
+                    continue
+
+                elif msg_type == "panel_action":
+                    # A tap. The voice proxy injects it, or logs the drop.
+                    # It is not forwarded as a raw cloud message.
+                    panel_id = data.get("id") if isinstance(data.get("id"), str) else "-"
+                    action_id = data.get("action") if isinstance(data.get("action"), str) else "-"
+                    if connection is not self._connection or cloud_proxy is None:
+                        logger.info(
+                            "panel_action panel=%s action=%s dropped(no_session)",
+                            panel_id[:80],
+                            action_id[:80],
+                        )
+                        continue
+                    handler = getattr(cloud_proxy, "handle_panel_action", None)
+                    if not callable(handler):
+                        logger.info(
+                            "panel_action panel=%s action=%s dropped(no_handler)",
+                            panel_id[:80],
+                            action_id[:80],
+                        )
+                        continue
+                    try:
+                        await handler(data)
+                    except Exception:
+                        logger.info(
+                            "panel_action panel=%s action=%s dropped(send_failed)",
+                            panel_id[:80],
+                            action_id[:80],
+                        )
                     continue
 
                 elif msg_type in {"device_command", "device_command_result"}:
