@@ -146,6 +146,8 @@ _SHOW_DESCRIPTION = (
     "Optional ttl_s is seconds (0 stays until dismissed). now_playing does not time out. "
     "A new panel replaces the open one. The same id updates in place. "
     "Use list for places or rows, choice for 2 to 4 options, a template for a card or table, now_playing for music. "
+    "When the person is picking among 2 to 4 options, call kind choice in that same turn. "
+    'Example: {"version":1,"kind":"choice","prompt":"Podcasts or Spotify?","options":["Podcasts","Spotify"]}. '
     "This does not speak audio and does not replace the spoken reply. "
     "ok means the frame was accepted and sent. On an error, fix what the error names."
 )
@@ -164,6 +166,9 @@ PANEL_INSTRUCTIONS = (
     "dismiss_panel and self.panel.dismiss close it. "
     "For a rich card, use kind webview with template and data "
     "(weather, compare, agenda, steps, fact, score, key_points) instead of raw html. "
+    "When the person is picking among 2 to 4 options, call show_panel with kind choice "
+    "in that same turn and speak one short line. "
+    'Example: {"version":1,"kind":"choice","prompt":"Podcasts or Spotify?","options":["Podcasts","Spotify"]}. '
     "A new panel replaces the open one. The same id updates in place. "
     "ttl_s is optional seconds; 0 stays until dismissed. "
     "A button tap arrives as a user turn. "

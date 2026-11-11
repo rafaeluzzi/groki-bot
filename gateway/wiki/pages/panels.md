@@ -11,7 +11,7 @@ A Spotify card can sit under another panel and comes back when that panel closes
 ## Which kind
 
 - Places, shows, episodes, or other rows: `list`
-- Yes/no, or 2 to 4 options: `choice`
+- Yes/no, or 2 to 4 options: `choice`. Call `show_panel` in that same turn and speak one short line. Example: `{"version":1,"kind":"choice","prompt":"Podcasts or Spotify?","options":["Podcasts","Spotify"]}`
 - A fact, table, forecast, score, steps, or bullets: `webview` with a template
 - Music that is playing: `now_playing`
 

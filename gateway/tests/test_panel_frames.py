@@ -99,6 +99,8 @@ def test_panel_instructions_name_the_screen_rules():
     assert "open-ended follow-up" in text
     assert "key_points" in text
     assert "template and data" in text
+    assert '"kind":"choice"' in text
+    assert "Podcasts or Spotify?" in text
     assert "core_draw" not in text
     assert "draw" not in text.lower()
 
