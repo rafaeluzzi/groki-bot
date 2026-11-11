@@ -4,7 +4,7 @@ One panel on the Portal screen, next to the orb. A new `show_panel` replaces wha
 
 `ttl_s` is optional seconds. Omit it for the default. `0` stays until dismissed. Defaults: list 45, choice 60, webview 30. `now_playing` does not time out. A touch restarts the timer. The timer starts when speech stops, so the card is not closed mid-sentence.
 
-A tap that is not `dismiss` or `local:` is a user turn. Answer it by voice. Do not ask the person to repeat the tap.
+A tap that is not `dismiss` or `local:` is a user turn. The panel closes when that tap is sent. Answer it by voice. Do not ask the person to repeat the tap.
 
 A Spotify card can sit under another panel and comes back when that panel closes.
 
