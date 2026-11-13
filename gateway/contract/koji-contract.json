@@ -32,10 +32,11 @@
       "prompt": 160,
       "action_label": 40,
       "url": 500,
+      "data_url": 20000,
       "seconds": 172800
     },
     "ttl_s_default": {"list": 45, "choice": 60, "webview": 30, "now_playing": 0},
-    "templates": ["weather", "compare", "agenda", "steps", "fact", "score", "key_points"],
+    "templates": ["weather", "compare", "agenda", "steps", "fact", "score", "key_points", "chart"],
     "rebuilds": [
       {
         "name": "logged podcast list with label and title",

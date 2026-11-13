@@ -16,7 +16,7 @@ from typing import Any
 
 from .panel_frames import PanelError
 
-TEMPLATE_NAMES = ("weather", "compare", "agenda", "steps", "fact", "score", "key_points")
+TEMPLATE_NAMES = ("weather", "compare", "agenda", "steps", "fact", "score", "key_points", "chart")
 
 _TOKEN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$")
 _DATA_IMAGE_RE = re.compile(
@@ -327,6 +327,37 @@ def _score(data: dict[str, Any]) -> str:
     )
 
 
+def _chart(data: dict[str, Any]) -> str:
+    kind = data.get("type")
+    if kind not in ("bar", "line"):
+        raise PanelError("chart type must be bar or line")
+    labels_raw = data.get("labels")
+    values_raw = data.get("values")
+    if not isinstance(labels_raw, list) or not isinstance(values_raw, list):
+        raise PanelError("chart needs labels and values")
+    if not 1 <= len(labels_raw) <= 8 or len(labels_raw) != len(values_raw):
+        raise PanelError("chart needs 1 to 8 labels and the same number of values")
+    labels: list[str] = []
+    values: list[float] = []
+    for index, (label, value) in enumerate(zip(labels_raw, values_raw), start=1):
+        text = _clip(label, 16)
+        if text is None:
+            raise PanelError(f"chart label {index} needs text")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise PanelError(f"chart value {index} must be a number")
+        labels.append(text)
+        values.append(float(value))
+    from .panel_images import chart_data_url
+
+    src = chart_data_url(kind, labels, values)
+    if src is None:
+        raise PanelError("chart could not be drawn")
+    heading = _title(data)
+    title_html = f"<h1>{_esc(heading)}</h1>" if heading else ""
+    alt = heading or ("Bar chart" if kind == "bar" else "Line chart")
+    return f'{title_html}<img alt="{_esc(alt)}" src="{src}">{_buttons(data, "chart")}'
+
+
 def _key_points(data: dict[str, Any]) -> str:
     points = data.get("points")
     if not isinstance(points, list) or not 1 <= len(points) <= 8:
@@ -350,6 +381,7 @@ _RENDERERS = {
     "fact": _fact,
     "score": _score,
     "key_points": _key_points,
+    "chart": _chart,
 }
 
 
