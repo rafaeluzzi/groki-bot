@@ -134,6 +134,7 @@ class GbotVoiceProxy(GeminiVoiceProxy):
             logger.info("panel_action panel=%s action=%s dropped(send_failed)", panel, action)
             return
         logger.info("panel_action panel=%s action=%s delivered", panel, action)
+        logger.info("panel outcome id=%s result=tapped action=%s", panel, action)
 
     def _prune_panel_taps(self, now):
         """Drop debounce keys that can no longer match. Called when a tap is recorded."""

@@ -17,10 +17,10 @@ A Spotify card can sit under another panel and comes back when that panel closes
 
 ## Fields
 
-- list: `title`, `items` (a string or `{title}` / `{label}`, optional `subtitle`). At most 12.
+- list: `title`, `items` (a string or `{title}` / `{label}`, optional `subtitle`, optional `image` or `art_url` as an `https` picture). At most 12. A picture that cannot be fetched is left off the row.
 - choice: `prompt`, `options` (1 to 4 labels).
 - now_playing: `title` and `show` (or artist). Pause and play stay on the Portal.
-- webview: `template` and `data`, or an `html` fragment. Prefer a template. No scripts, no remote images, no page URLs.
+- webview: `template` and `data`, or an `html` fragment. Prefer a template. No scripts and no page URLs. An `https` image on a fact is fetched for you and inlined. Koji does not load a remote image itself.
 
 ## Templates
 
@@ -39,3 +39,7 @@ fact: `{"kind":"webview","template":"fact","data":{"title":"Durham","text":"A ci
 score: `{"kind":"webview","template":"score","data":{"title":"Final","left":{"name":"Home","score":"2"},"right":{"name":"Away","score":"1"}}}`
 
 key_points: `{"kind":"webview","template":"key_points","data":{"title":"Summary","points":["Bring a coat","Leave by 4"]}}`
+
+chart: `{"kind":"webview","template":"chart","data":{"title":"Week","type":"bar","labels":["Mon","Tue","Wed"],"values":[1,3,2]}}`
+
+`type` is `bar` or `line`. One series, 1 to 8 points. The gateway draws a small PNG. Do not send SVG or HTML for the chart.

@@ -48,6 +48,7 @@ SCORE = {
     "detail": "Full time",
 }
 POINTS = {"title": "Summary", "points": ["Bring a coat", "Leave by 4"]}
+CHART = {"title": "Week", "type": "bar", "labels": ["Mon", "Tue", "Wed"], "values": [1, 3, 2]}
 SAMPLES = {
     "weather": WEATHER,
     "compare": COMPARE,
@@ -56,6 +57,7 @@ SAMPLES = {
     "fact": FACT,
     "score": SCORE,
     "key_points": POINTS,
+    "chart": CHART,
 }
 
 
@@ -69,6 +71,7 @@ def test_each_template_renders_sanitizer_clean_html(name):
     assert dropped == 0
     assert doc["kind"] == "webview"
     assert doc["html"] == html
+    assert doc["template"] == name
     assert "ttl_s" not in doc
     assert koji_fragment_error(doc["html"]) is None
 
@@ -152,7 +155,11 @@ async def test_show_panel_logs_the_template_name(caplog):
             {"panel": {"kind": "webview", "template": "weather", "data": WEATHER}},
         )
     assert result == {"ok": True, "kind": "webview", "template": "weather"}
-    assert "panel template=weather" in caplog.text
+    assert "panel shown id=" in caplog.text
+    assert "kind=webview" in caplog.text
+    assert "template=weather" in caplog.text
+    assert "items=1" in caplog.text
+    assert "images=0" in caplog.text
 
 
 def test_panel_action_sentence_and_local_drop():
@@ -211,6 +218,7 @@ async def test_live_session_gets_the_tap_and_a_missing_session_does_not(caplog):
         await live.handle_panel_action(tap)
     assert live.sent == ['User tapped "Durham" on panel "restaurants".']
     assert "panel_action panel=restaurants action=Durham delivered" in caplog.text
+    assert "panel outcome id=restaurants result=tapped action=Durham" in caplog.text
     assert "dropped(debounce)" in caplog.text
 
 

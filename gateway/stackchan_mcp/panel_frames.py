@@ -141,8 +141,11 @@ _SHOW_DESCRIPTION = (
     "kind now_playing: title and show (or artist). "
     "kind choice: prompt and 1 to 4 options, each with a label. "
     "kind webview: prefer template and data over raw html. "
-    "Templates: weather, compare, agenda, steps, fact, score, key_points. "
+    "Templates: weather, compare, agenda, steps, fact, score, key_points, chart. "
     'Example: {"kind":"webview","template":"weather","data":{"place":"Durham","temp":"72°","condition":"Mild"}}. '
+    'chart: {"kind":"webview","template":"chart","data":{"title":"Week","type":"bar","labels":["Mon","Tue"],"values":[1,3]}}. '
+    "An https image on a list item (image or art_url) or on fact data.image is fetched and shown small. "
+    "A picture that cannot be fetched is left off; the card still shows. "
     "Optional ttl_s is seconds (0 stays until dismissed). now_playing does not time out. "
     "A new panel replaces the open one. The same id updates in place. "
     "Use list for places or rows, choice for 2 to 4 options, a template for a card or table, now_playing for music. "
@@ -165,7 +168,9 @@ PANEL_INSTRUCTIONS = (
     + ". self.panel.show is the same action. "
     "dismiss_panel and self.panel.dismiss close it. "
     "For a rich card, use kind webview with template and data "
-    "(weather, compare, agenda, steps, fact, score, key_points) instead of raw html. "
+    "(weather, compare, agenda, steps, fact, score, key_points, chart) instead of raw html. "
+    "chart takes type bar or line, labels, and values. "
+    "Pass an https image on a list row or a fact when a picture helps. "
     "When the person is picking among 2 to 4 options, call show_panel with kind choice "
     "in that same turn and speak one short line. "
     'Example: {"version":1,"kind":"choice","prompt":"Podcasts or Spotify?","options":["Podcasts","Spotify"]}. '
@@ -303,17 +308,14 @@ def _first(source: dict[str, Any], keys: tuple[str, ...], limit: int) -> tuple[s
 
 
 def _art(source: dict[str, Any]) -> str | None:
+    from .panel_images import data_image_ok, http_image_ok
+
     for key in _ART_KEYS:
         value = source.get(key)
         if not isinstance(value, str):
             continue
         text = value.strip()
-        if (
-            text.startswith(("https://", "http://"))
-            and len(text) <= _MAX_URL
-            and not any(ch.isspace() for ch in text)
-            and "<" not in text
-        ):
+        if data_image_ok(text) or http_image_ok(text, limit=_MAX_URL):
             return text
     return None
 
@@ -446,9 +448,26 @@ def _choice(source: dict[str, Any], doc: dict[str, Any]) -> int:
 
 
 def _webview(source: dict[str, Any], doc: dict[str, Any]) -> int:
+    from .panel_templates import TEMPLATE_NAMES
+
     template = source.get("template")
     has_template = isinstance(template, str) and bool(template.strip())
     html = next((source[key] for key in _HTML_KEYS if isinstance(source.get(key), str) and source.get(key).strip()), None)
+    # A card we already built carries the template name beside the fragment so
+    # the device can log it. The model still may not send html and data together.
+    if has_template and html is not None and "data" not in source:
+        name = template.strip()
+        if name not in TEMPLATE_NAMES:
+            allowed = ", ".join(TEMPLATE_NAMES)
+            raise PanelError(f"template must be one of: {allowed}")
+        if len(html) > _MAX_HTML:
+            raise PanelError(f"html is longer than {_MAX_HTML} characters")
+        doc["template"] = name
+        title, _ = _first(source, ("title",), _MAX_TITLE)
+        if title is not None:
+            doc["title"] = title
+        doc["html"] = html
+        return 0
     if has_template and html is not None:
         raise PanelError("kind webview takes template and data, or html, not both")
     if has_template:
@@ -473,6 +492,8 @@ def _webview(source: dict[str, Any], doc: dict[str, Any]) -> int:
     title, _ = _first(source, ("title",), _MAX_TITLE)
     if title is not None:
         doc["title"] = title
+    if has_template:
+        doc["template"] = template.strip()
     doc["html"] = html
     return 0
 
@@ -687,19 +708,63 @@ def panel_tool_declarations() -> list[dict[str, Any]]:
     ]
 
 
+def measure_panel(document: dict[str, Any]) -> tuple[str, str, str, int, int, int]:
+    """id, kind, template, item count, image count, and JSON byte size.
+
+    The template is ``-`` when the card has none. Image bytes are counted in
+    ``bytes`` and are not returned on their own.
+    """
+    ident = document.get("id")
+    ident = ident if isinstance(ident, str) and ident else "-"
+    kind = document.get("kind")
+    kind = kind if isinstance(kind, str) and kind else "-"
+    template = document.get("template")
+    template = template if isinstance(template, str) and template else "-"
+    if kind == "list":
+        rows = document.get("rows") if isinstance(document.get("rows"), list) else []
+        items = len(rows)
+        images = sum(1 for row in rows if isinstance(row, dict) and row.get("artUrl"))
+    elif kind == "choice":
+        actions = document.get("actions") if isinstance(document.get("actions"), list) else []
+        items = len(actions)
+        images = 0
+    elif kind == "now_playing":
+        items = 1
+        images = 1 if document.get("artUrl") else 0
+    else:
+        items = 1
+        html = document.get("html") if isinstance(document.get("html"), str) else ""
+        images = html.lower().count("<img")
+    size = len(json.dumps(document, ensure_ascii=False).encode("utf-8"))
+    return ident, kind, template, items, images, size
+
+
 def panel_frame_extension(esp32: Any) -> Any:
     """Voice-tool extension that validates a panel and sends one frame.
 
     Ok means the frame was written. Portal does not ack ``type:panel``.
+    Https pictures are fetched and inlined before the frame is built. A
+    picture that fails is omitted and the card is still sent.
     """
+    from .panel_images import cap_panel_payload, inline_panel_argument
     from .voice_tools import ToolExtension, ToolMetadata
 
     declarations = tuple(panel_tool_declarations())
+    open_id = ["-"]
 
     async def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        action = panel_action_for_tool(name)
+        if action == "show" and isinstance(args, dict) and set(args) == {"panel"}:
+            try:
+                panel = await inline_panel_argument(args.get("panel"))
+            except Exception:
+                panel = args.get("panel")
+            args = {"panel": panel}
         frame, reason, dropped = panel_frame_or_error(name, args)
         if frame is None:
             return {"ok": False, "error": f"invalid panel arguments: {reason}", "example": PANEL_EXAMPLE}
+        if frame.get("dismiss") is not True:
+            frame = {"type": "panel", "panel": cap_panel_payload(frame["panel"])}
         send = getattr(esp32, "send_panel", None)
         if not callable(send):
             return {"ok": False, "error": "panel channel unavailable"}
@@ -714,11 +779,23 @@ def panel_frame_extension(esp32: Any) -> Any:
             return {"ok": False, "error": message}
         if isinstance(result, dict) and result.get("ok") is True:
             if frame.get("dismiss") is True:
+                logger.info("panel outcome id=%s result=dismissed-tool", open_id[0])
+                open_id[0] = "-"
                 return {"ok": True, "dismiss": True}
-            shown: dict[str, Any] = {"ok": True, "kind": frame["panel"]["kind"]}
-            template = template_name_of(args.get("panel"))
-            if template and frame["panel"].get("kind") == "webview":
-                logger.info("panel template=%s", template)
+            document = frame["panel"]
+            ident, kind, template, items, images, size = measure_panel(document)
+            logger.info(
+                "panel shown id=%s kind=%s template=%s items=%s images=%s bytes=%s",
+                ident,
+                kind,
+                template,
+                items,
+                images,
+                size,
+            )
+            open_id[0] = ident
+            shown: dict[str, Any] = {"ok": True, "kind": kind}
+            if template != "-" and kind == "webview":
                 shown["template"] = template
             if dropped:
                 shown["not_shown"] = dropped

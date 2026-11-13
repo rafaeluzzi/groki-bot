@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from stackchan_mcp import panel_frames
+from stackchan_mcp.panel_images import MAX_DATA_URL
 from stackchan_mcp.panel_templates import TEMPLATE_NAMES
 from stackchan_mcp.device_commands import (
     DEVICE_COMMAND_ARGS,
@@ -93,6 +94,7 @@ def test_panel_kinds_pattern_and_limits_match_the_contract():
         "prompt": panel_frames._MAX_PROMPT,
         "action_label": panel_frames._MAX_ACTION_LABEL,
         "url": panel_frames._MAX_URL,
+        "data_url": MAX_DATA_URL,
         "seconds": panel_frames._MAX_SECONDS,
     } == limits
     assert panel_frames.DEFAULT_TTL_S == {key: int(value) for key, value in PANEL["ttl_s_default"].items()}
