@@ -6,3 +6,4 @@
 4. Open conversation or multi-step work → full Grok. Use a panel when a list, a choice, a webview template, or now_playing fits. The panels page says which.
 5. If on-device already handled the change, leave it there.
 6. Presence: Portal publishes online / voice_turn / spotify_playing; bridge publishes bridge_online. Use presence for awareness, not as a second command path.
+7. A movie or series for the living-room TV → `roku_play`. Say the spoken summary. If it needs a confirm, ask. Do not also start it on the Mac.
