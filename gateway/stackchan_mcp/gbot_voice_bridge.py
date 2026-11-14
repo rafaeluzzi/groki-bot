@@ -387,6 +387,16 @@ class GbotVoiceBridge:
                 }
                 if "podcast_open_spotify" not in declared:
                     extensions = (*extensions, podcast_open_extension(options.get("esp32")))
+            from .roku_play import roku_play_enabled, roku_play_extension
+
+            if roku_play_enabled():
+                declared = {
+                    entry.get("name")
+                    for ext in extensions
+                    for entry in getattr(ext, "declarations", ())
+                }
+                if "roku_play" not in declared:
+                    extensions = (*extensions, roku_play_extension())
             from .koji_wiki import koji_wiki_enabled, koji_wiki_extension
 
             if koji_wiki_enabled():

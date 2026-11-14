@@ -22,6 +22,7 @@ Owns conversation and relay:
 - Open talk and multi-step reasoning
 - After reasoning, call `device_command` with a catalog name for Portal systems — never Mac volume, Mac media, or desktop Spotify for those asks
 - A podcast play that did not match on the Portal: `podcast_open_spotify`. That opens Portal Spotify. It is not a Mac player
+- A movie or series on the living-room TV: `roku_play`. Say the spoken summary as you call it. Do not also start it on the Mac
 - `core_morph` / `core_say` for the on-screen character
 - `show_panel` / `dismiss_panel` (kinds, fields, and templates are on the panels page)
 - `search_conversations` when that tool is declared

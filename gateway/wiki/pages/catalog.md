@@ -11,6 +11,10 @@ Connectivity: `reconnect_bridge`
 Wire: `{"type":"device_command","name":"...","args":{...}}` → on-device execute → optional `device_command_result`.
 See `android/docs/device-commands.md` and gateway `PORTAL_DEVICE_COMMANDS.md`.
 
+## Living-room TV
+
+`roku_play` takes `title`, and optional `service`, `type` (`movie` or `series`), and `year`. Say the tool's `spoken_summary` as you call it. If `needs_confirm` is `ambiguous`, ask which year and name the two options. If it is `rent`, ask before spending money. The router plays it on the Roku. This does not power the projector and it does not use the Mac.
+
 ## Podcast open
 
 `podcast_open_spotify` takes `show`: a followed title, or `number N`.

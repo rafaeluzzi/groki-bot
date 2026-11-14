@@ -60,6 +60,14 @@ Declared name: `device_command`.
 
 `STACKCHAN_DEVICE_COMMANDS=0` leaves the tool undeclared and sends no `type:device_command` frames. The default is on for the Grok login-voice path.
 
+## Living-room Roku
+
+`roku_play` is a separate login-voice tool. It is not a `device_command` and it does not send a frame to the Portal. The gateway POSTs `{title, service?, type?, year?}` to the router's `POST /api/roku/play`. The router, on the iMac LAN, resolves the title and drives the Roku over ECP. The Portal and the cloud bot do not call the Roku.
+
+Say the result's `spoken_summary` as the tool is called. `needs_confirm: "ambiguous"` means ask which of the two options. `needs_confirm: "rent"` means ask before any purchase. A down router is "the TV lookup is down". Do not start the title on the Mac. This does not power the projector.
+
+`STACKCHAN_ROKU_PLAY=0` leaves the tool undeclared. The default is on. `STACKCHAN_ROUTER_URL` is the router origin (default `http://127.0.0.1:8080`).
+
 ## Restart
 
 The Python gateway writes the frame. The login helper LaunchAgent (`com.stackchan.gbot-voice`) does not forward it, so this change does not need a helper restart.
