@@ -15,6 +15,8 @@ See `android/docs/device-commands.md` and gateway `PORTAL_DEVICE_COMMANDS.md`.
 
 `roku_play` takes `title`, and optional `service`, `type` (`movie` or `series`), and `year`. Say the tool's `spoken_summary` as you call it. If `needs_confirm` is `ambiguous`, ask which year and name the two options. If it is `rent`, ask before spending money. The router plays it on the Roku. This does not power the projector and it does not use the Mac.
 
+`roku_stream` puts the front Chrome tab, or a link, on that TV through the Koji channel. `source` is `chrome` or `url`. A page comes back at once with "Looking for the stream on …". Say `spoken_summary`. If `ok` is false, say the reason. A title on a streaming app stays `roku_play`. `roku_stream_stop` takes it off the TV.
+
 ## Podcast open
 
 `podcast_open_spotify` takes `show`: a followed title, or `number N`.

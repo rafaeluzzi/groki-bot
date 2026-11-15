@@ -397,6 +397,16 @@ class GbotVoiceBridge:
                 }
                 if "roku_play" not in declared:
                     extensions = (*extensions, roku_play_extension())
+            from .roku_stream import roku_stream_enabled, roku_stream_extension
+
+            if roku_stream_enabled():
+                declared = {
+                    entry.get("name")
+                    for ext in extensions
+                    for entry in getattr(ext, "declarations", ())
+                }
+                if "roku_stream" not in declared:
+                    extensions = (*extensions, roku_stream_extension())
             from .koji_wiki import koji_wiki_enabled, koji_wiki_extension
 
             if koji_wiki_enabled():
