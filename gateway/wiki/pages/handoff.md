@@ -7,4 +7,4 @@
 5. If on-device already handled the change, leave it there.
 6. Presence: Portal publishes online / voice_turn / spotify_playing; bridge publishes bridge_online. Use presence for awareness, not as a second command path.
 7. A movie or series for the living-room TV → `roku_play`. Say the spoken summary. If it needs a confirm, ask. Do not also start it on the Mac.
-8. What's in the browser, or a link, on the living-room TV → `roku_stream`. Say the spoken summary. If it fails, say the reason. A title on a streaming app stays `roku_play`.
+8. What's in the browser, or a link, on the living-room TV → `roku_stream`. A page is answered at once. Say the spoken summary. If it fails, say the reason. A title on a streaming app stays `roku_play`.

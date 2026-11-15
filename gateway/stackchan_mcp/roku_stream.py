@@ -7,9 +7,13 @@ A call POSTs ``/api/roku/stream`` or ``/api/roku/stream/stop`` on the router
 yt-dlp, the stream proxy, and ECP. This tool does not call the Roku and it
 does not start anything on the Mac.
 
-``roku_stream`` waits about 25 seconds because a page lookup can be slow.
-Stop waits 8 seconds. The voice executor's own limit sits a little above
-those, so a slow lookup comes back as the router's spoken line.
+A direct file launches before this returns. A page comes back at once with
+"Looking for the stream on <site>…"; the router finishes yt-dlp in the
+background. Both calls wait about 8 seconds, the same as ``roku_play``.
+The voice executor's own limit sits a little above that.
+
+When ``STACKCHAN_TOKEN`` is set, the posts send it as a bearer token. The
+router already requires that secret on these two routes.
 
 Set ``STACKCHAN_ROKU_STREAM=0`` to stop declaring both tools.
 """
@@ -24,13 +28,14 @@ logger = logging.getLogger(__name__)
 
 ROKU_STREAM_TOOL = "roku_stream"
 ROKU_STREAM_STOP_TOOL = "roku_stream_stop"
-STREAM_POST_TIMEOUT_S = 25
+STREAM_POST_TIMEOUT_S = 8
 STOP_POST_TIMEOUT_S = 8
 
 _DESCRIPTION = (
     "Put the video in Uzzi's browser, or a link he names, on the living-room TV "
     "through the Koji channel. source is chrome for the front Chrome tab, or url "
     "with the link. title is optional. Say spoken_summary out loud. "
+    "A page comes back at once, for example Looking for the stream on the site. "
     "If ok is false, say the reason. This is not for a movie or series on Netflix, "
     "Max, or his other TV apps; that is roku_play. Do not play it on the Mac."
 )
@@ -43,7 +48,8 @@ _STOP_DESCRIPTION = (
 ROKU_STREAM_INSTRUCTIONS = (
     "What's in the browser, or a link, on the living-room TV is roku_stream. "
     "source chrome is the front Chrome tab. source url is a link he gave, and url is required then. "
-    "Say spoken_summary out loud as you call it, for example Putting the game on the TV. "
+    "Say spoken_summary out loud as you call it. A direct link is Putting the game on the TV. "
+    "A page is Looking for the stream on the site. "
     "If ok is false, say the reason in the result. Do not explain how the stream works. "
     "A movie or series on Netflix, Prime, Hulu, Disney, Max, Paramount, Apple TV, or YouTube "
     "is roku_play, not roku_stream. "
@@ -62,6 +68,13 @@ def roku_stream_enabled() -> bool:
 def router_origin() -> str:
     raw = os.getenv("STACKCHAN_ROUTER_URL", "http://127.0.0.1:8080").strip()
     return raw.rstrip("/") or "http://127.0.0.1:8080"
+
+
+def router_headers() -> dict[str, str]:
+    token = (os.getenv("STACKCHAN_TOKEN") or os.getenv("BEARER_TOKEN") or "").strip()
+    if not token:
+        return {}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def stream_parameters() -> dict[str, Any]:
@@ -119,7 +132,9 @@ async def _post(path: str, payload: dict[str, Any], timeout_s: float) -> dict[st
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(f"{router_origin()}{path}", json=payload) as response:
+            async with session.post(
+                f"{router_origin()}{path}", json=payload, headers=router_headers()
+            ) as response:
                 body = await response.json(content_type=None)
                 status = response.status
     except Exception:
@@ -174,7 +189,7 @@ def roku_stream_extension() -> Any:
         declarations=declarations,
         dispatch=dispatch,
         metadata={
-            ROKU_STREAM_TOOL: ToolMetadata(True, "roku_stream", 30.0),
+            ROKU_STREAM_TOOL: ToolMetadata(True, "roku_stream", 12.0),
             ROKU_STREAM_STOP_TOOL: ToolMetadata(True, "roku_stream", 12.0),
         },
         instructions=ROKU_STREAM_INSTRUCTIONS,

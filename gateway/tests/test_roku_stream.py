@@ -55,11 +55,11 @@ def test_the_tool_can_be_turned_off(monkeypatch):
     assert roku_stream_enabled() is True
 
 
-def test_timeouts_leave_room_for_a_slow_lookup():
-    assert STREAM_POST_TIMEOUT_S == 25
+def test_timeouts_match_roku_play():
+    assert STREAM_POST_TIMEOUT_S == 8
     assert STOP_POST_TIMEOUT_S == 8
     extension = roku_stream_extension()
-    assert extension.metadata["roku_stream"].timeout_s == 30
+    assert extension.metadata["roku_stream"].timeout_s == 12
     assert extension.metadata["roku_stream_stop"].timeout_s == 12
 
 
@@ -148,18 +148,24 @@ async def test_posts_use_a_long_lookup_and_a_short_stop(monkeypatch):
         async def __aexit__(self, *args):
             return False
 
-        def post(self, url, json=None):
-            seen.append((url, self.timeout.total))
+        def post(self, url, json=None, headers=None):
+            seen.append((url, self.timeout.total, headers))
             return Response()
 
+    monkeypatch.delenv("STACKCHAN_TOKEN", raising=False)
+    monkeypatch.delenv("BEARER_TOKEN", raising=False)
     monkeypatch.setattr("aiohttp.ClientSession", Session)
     result = await post_stream({"source": "url", "url": "https://example.com/a"})
     assert result["spoken_summary"].startswith("That stream is DRM-protected")
     await post_stop()
     assert seen[0][0].endswith("/api/roku/stream")
-    assert seen[0][1] == 25
+    assert seen[0][1] == 8
+    assert seen[0][2] == {}
     assert seen[1][0].endswith("/api/roku/stream/stop")
     assert seen[1][1] == 8
+    monkeypatch.setenv("STACKCHAN_TOKEN", "shared-secret")
+    await post_stream({"source": "chrome"})
+    assert seen[2][2] == {"Authorization": "Bearer shared-secret"}
 
 
 @pytest.mark.asyncio

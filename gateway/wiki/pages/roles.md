@@ -23,7 +23,7 @@ Owns conversation and relay:
 - After reasoning, call `device_command` with a catalog name for Portal systems — never Mac volume, Mac media, or desktop Spotify for those asks
 - A podcast play that did not match on the Portal: `podcast_open_spotify`. That opens Portal Spotify. It is not a Mac player
 - A movie or series on the living-room TV: `roku_play`. Say the spoken summary as you call it. Do not also start it on the Mac
-- A browser tab or a link on that TV: `roku_stream`. Say the spoken summary. If it fails, say the reason. Do not use this for a title on a streaming app
+- A browser tab or a link on that TV: `roku_stream`. A page is answered at once. Say the spoken summary. If it fails, say the reason. Do not use this for a title on a streaming app
 - `core_morph` / `core_say` for the on-screen character
 - `show_panel` / `dismiss_panel` (kinds, fields, and templates are on the panels page)
 - `search_conversations` when that tool is declared
