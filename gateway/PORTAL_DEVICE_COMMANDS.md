@@ -68,6 +68,10 @@ Say the result's `spoken_summary` as the tool is called. `needs_confirm: "ambigu
 
 `STACKCHAN_ROKU_PLAY=0` leaves the tool undeclared. The default is on. `STACKCHAN_ROUTER_URL` is the router origin (default `http://127.0.0.1:8080`).
 
+`roku_stream` puts the front Chrome tab, or a link, on that TV through the sideloaded Koji channel (app id `dev`). It is not a `device_command`. The gateway POSTs `{source: "chrome"|"url", url?, title?}` to `POST /api/roku/stream`. `roku_stream_stop` POSTs `POST /api/roku/stream/stop`. Say `spoken_summary`. If `ok` is false, say the reason. A title on a streaming app stays `roku_play`.
+
+The stream call waits up to 25 seconds because a page may need yt-dlp. Stop waits 8 seconds. `STACKCHAN_ROKU_STREAM=0` leaves both tools undeclared. The default is on. The router origin is the same `STACKCHAN_ROUTER_URL`.
+
 ## Restart
 
 The Python gateway writes the frame. The login helper LaunchAgent (`com.stackchan.gbot-voice`) does not forward it, so this change does not need a helper restart.
