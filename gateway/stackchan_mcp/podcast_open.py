@@ -14,7 +14,6 @@ Set ``STACKCHAN_PODCAST_OPEN=0`` to stop declaring the tool.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import re
@@ -31,14 +30,15 @@ _QUIET = (
 
 _DESCRIPTION = (
     "Open a followed podcast in the Spotify app on the Portal. "
-    "show is the show title, or number N. "
-    "N counts A-to-Z by title, the same order as the followed list. "
+    "show is the show title. "
+    "When the user says a number, pass ordinal; do not turn it into a title. "
+    "ordinal is that visible row when a list is on screen, otherwise the Nth titled show A-to-Z. "
     "When you list followed shows or build a list panel, number the titles A-to-Z from the top "
-    "so number N matches this tool. "
+    "so ordinal N matches this tool. "
     "Pass the words the user said when the title is unclear, including a misheard name. "
-    "On a miss the result lists the numbered titles and tells you to call this tool once more "
-    "with the closest-sounding title, or to ask which show and name 2 or 3 of them. "
-    "Do that before you speak. Do not say the request was not for you. "
+    "Do not call podcast_open_spotify again for this request unless did_you_mean is set; "
+    "then call it once with that title. Otherwise tell the user it isn't followed and offer to follow it. "
+    "Never call this tool to follow a show. "
     "A blank stored title is replaced by its feed title when that title can be read. "
     "A title that is still blank is last and has no number. "
     "A hit sends one type:podcast frame. The Portal says the announce line and opens Spotify. "
@@ -49,15 +49,18 @@ _DESCRIPTION = (
 
 PODCAST_INSTRUCTIONS = (
     "A podcast play, open, or what's-new that did not match on the Portal is yours. "
-    "Call podcast_open_spotify with show set to the title or to number N. "
-    "number N is the Nth titled show A-to-Z, the same order as the followed list. "
+    "Call podcast_open_spotify with show set to the title. "
+    "When the user says a number, pass ordinal; do not turn it into a title. "
+    "Without a list on screen, ordinal is the Nth titled show A-to-Z. "
+    "With a list on screen, ordinal is that visible row. "
     "When you list shows or build a panel, list titled shows A-to-Z and put a number on each row. "
     "Do not open Spotify on the Mac for a Portal podcast. "
     f"{_QUIET} "
     "If the tool says the Portal already said the announce line, do not repeat it. "
-    "If matched is false, call podcast_open_spotify once more with the closest-sounding title "
-    "in call_again before you speak. If there is no single closest title, ask which show and "
-    "name the 2 or 3 candidates. Do not say the request was not for you. "
+    "Do not call podcast_open_spotify again for this request unless did_you_mean is set; "
+    "then call it once with that title. Otherwise tell the user it isn't followed and offer to follow it. "
+    "To follow or unfollow, use podcast_follow and podcast_unfollow. "
+    "Never call podcast_open_spotify to follow. "
     "A blank stored title is not a numbered row. Use the feed title from shows when one is given."
 )
 
@@ -194,30 +197,67 @@ def _titled(shows: list[dict]) -> list[dict]:
     return [show for show in shows if str(show.get("title") or "").strip()]
 
 
-def plan_open(query: str, shows: list) -> dict[str, Any]:
-    """Pick a followed show, or a miss the model can correct.
+def plan_open(
+    query: str,
+    shows: list,
+    *,
+    ordinal: int | None = None,
+    panel: dict | None = None,
+) -> dict[str, Any]:
+    """Pick a followed show, or a miss that does not invite another call.
 
-    Title matches win over an ordinal, so a show named like a number stays a title.
-    ``number N`` uses [followed_order], which is the panel order.
+    An explicit [ordinal] is the visible row when [panel] is set, otherwise
+    the A-to-Z followed list. Title matches win over the words "number N",
+    so a show named like a number stays a title.
     """
     ordered = followed_order(shows)
     titled = _titled(ordered)
-    listed = catalog(ordered)
+    if ordinal is not None:
+        return _plan_ordinal(ordinal, titled, panel)
     text = " ".join((query or "").split())
     if not text:
-        return {"kind": "miss", "result": _miss("Which show?", listed)}
+        return {"kind": "miss", "result": _miss("empty")}
     matches = match_followed(text, titled)
     if len(matches) == 1:
         return {"kind": "open", "title": str(matches[0].get("title") or text)}
     if len(matches) > 1:
-        names = ", ".join(str(show.get("title") or "a show") for show in matches[:3])
-        return {"kind": "ask", "result": _miss(f"Which show? {names}.", listed)}
+        return {"kind": "ask", "result": _miss("ambiguous", query=text)}
     number = ordinal_index(text)
-    if number is None:
-        return {"kind": "miss", "result": _miss("No followed title matched.", listed, query=text, retry=True)}
-    if number > len(titled):
-        return {"kind": "range", "result": _miss(f"There is no show number {number}.", listed)}
-    return {"kind": "open", "title": str(titled[number - 1].get("title") or "")}
+    if number is not None:
+        if number > len(titled):
+            return {"kind": "range", "result": _miss("out_of_range", query=text)}
+        return {"kind": "open", "title": str(titled[number - 1].get("title") or "")}
+    closest = closest_titles(text, titled)
+    hint = closest[0] if len(closest) == 1 else None
+    return {"kind": "miss", "result": _miss("not_followed", query=text, did_you_mean=hint)}
+
+
+def _plan_ordinal(ordinal: int, titled: list[dict], panel: dict | None) -> dict[str, Any]:
+    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+        return {"kind": "range", "result": _miss("out_of_range", query=str(ordinal))}
+    rows = _panel_rows(panel)
+    if rows is not None:
+        chosen = next((row for row in rows if row.get("n") == ordinal), None)
+        if not isinstance(chosen, dict):
+            return {"kind": "range", "result": _miss("out_of_range", query=str(ordinal))}
+        label = " ".join(str(chosen.get("label") or "").split())
+        hits = match_followed(label, titled) if label else []
+        if len(hits) != 1:
+            return {"kind": "miss", "result": _miss("not_followed", query=label)}
+        return {"kind": "open", "title": str(hits[0].get("title") or label)}
+    if ordinal > len(titled):
+        return {"kind": "range", "result": _miss("out_of_range", query=str(ordinal))}
+    return {"kind": "open", "title": str(titled[ordinal - 1].get("title") or "")}
+
+
+def _panel_rows(panel: dict | None) -> list[dict] | None:
+    """None means there is no panel, so ordinal uses the A-to-Z list."""
+    if not isinstance(panel, dict):
+        return None
+    rows = panel.get("rows")
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict)][:12]
 
 
 def podcast_frame(body: dict) -> dict[str, Any] | None:
@@ -286,10 +326,17 @@ def podcast_parameters() -> dict[str, Any]:
         "properties": {
             "show": {
                 "type": "string",
-                "description": "Followed show title, or number N in the Podcasts I follow list.",
+                "description": "Followed show title. Omit this when passing ordinal.",
+            },
+            "ordinal": {
+                "type": "integer",
+                "description": (
+                    "1-based row. The visible row when a list is on screen, "
+                    "otherwise the A-to-Z followed list. "
+                    "Pass this when the user says a number; do not turn the number into a title."
+                ),
             },
         },
-        "required": ["show"],
         "additionalProperties": False,
     }
 
@@ -383,35 +430,16 @@ def closest_titles(query: str, shows: list[dict[str, Any]]) -> list[str]:
     return [title for score, title in scored if score >= max(0.45, top - 0.15)][:3]
 
 
-def _miss(error: str, shows: list[dict[str, Any]], *, query: str = "", retry: bool = False) -> dict[str, Any]:
-    """A miss the model can correct. [shows] is the numbered panel order."""
-    candidates = closest_titles(query, shows) if retry and query.strip() else []
-    call_again = candidates[0] if len(candidates) == 1 and retry else ""
-    if call_again:
-        instruction = (
-            f"No followed title matched. The closest-sounding show is {call_again}. "
-            "Call podcast_open_spotify once more with show set to that exact title. "
-            "Do not speak before that call returns, and do not say the request was not for you."
-        )
-    elif retry:
-        names = ", ".join(candidates[:3]) or "the titles in shows"
-        instruction = (
-            "No followed title matched. Ask which show, and name these: "
-            f"{names}. Do not say the request was not for you."
-        )
-    else:
-        instruction = error
+def _miss(reason: str, *, query: str = "", did_you_mean: str | None = None) -> dict[str, Any]:
+    """A miss. No show list and no invitation to call again, except one did_you_mean."""
     body: dict[str, Any] = {
         "ok": False,
         "matched": False,
-        "error": instruction,
-        "shows": shows,
-        "instruction": instruction,
+        "reason": reason,
+        "query": query,
     }
-    if candidates:
-        body["candidates"] = candidates
-    if call_again:
-        body["call_again"] = call_again
+    if did_you_mean:
+        body["did_you_mean"] = did_you_mean
     return body
 
 
@@ -425,28 +453,36 @@ def _spoken_hit(frame: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def open_show(query: str, shows: list, post_open) -> tuple[dict[str, Any], dict[str, Any] | None]:
+async def open_show(
+    query: str,
+    shows: list,
+    post_open,
+    *,
+    ordinal: int | None = None,
+    panel: dict | None = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Resolve [query] and, on one show, ask the router to open it.
 
     [post_open] takes the chosen title and returns the ``/api/podcasts/open`` body.
     The frame is None when nothing should be sent to the Portal.
     """
-    plan = plan_open(query, shows)
+    plan = plan_open(query, shows, ordinal=ordinal, panel=panel)
     if plan["kind"] != "open":
         return plan["result"], None
     body = await post_open(plan["title"])
     if not isinstance(body, dict):
-        listed = catalog(followed_order(shows))
-        return _miss("I couldn't open that show.", listed), None
+        return {"ok": False, "error": "I couldn't open that show."}, None
     frame = podcast_frame(body)
     if frame is None:
-        message = str(body.get("announce") or body.get("error") or "No followed show matched.")
-        return _miss(message, catalog(followed_order(shows))), None
-    return _spoken_hit(frame), frame
+        return _miss("not_followed", query=str(plan.get("title") or query)), None
+    hit = _spoken_hit(frame)
+    hit["title"] = str(plan["title"])
+    return hit, frame
 
 
 def podcast_open_extension(esp32: Any) -> Any:
     """Voice-tool extension. Ok means the podcast frame was written."""
+    from .podcast_turn import context_panel, shared_guard, turn_key
     from .voice_tools import ToolExtension, ToolMetadata
 
     declarations = tuple(podcast_declarations())
@@ -454,35 +490,58 @@ def podcast_open_extension(esp32: Any) -> Any:
     async def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
         if name != PODCAST_TOOL_NAME:
             return {"ok": False, "error": "unknown podcast tool"}
+        guard = shared_guard(esp32)
+        async with guard.lock:
+            rejection = guard.claim_open(turn_key(esp32))
+            if rejection is not None:
+                return rejection
+            ordinal, show, problem = _open_args(args)
+            if problem is not None:
+                return problem
+            try:
+                shows = await fill_blank_titles(await _get_followed())
+            except Exception:
+                logger.warning("podcast followed list failed")
+                return {"ok": False, "error": "I couldn't reach the podcast list."}
+            try:
+                result, frame = await open_show(
+                    show,
+                    shows,
+                    _post_open,
+                    ordinal=ordinal,
+                    panel=context_panel(esp32),
+                )
+            except Exception:
+                logger.warning("podcast open failed")
+                return {"ok": False, "error": "I couldn't open that show."}
+            if frame is None:
+                return result
+            send = getattr(esp32, "send_podcast", None)
+            if not callable(send):
+                return {"ok": False, "error": "podcast channel unavailable"}
+            try:
+                sent, error = await send(frame)
+            except Exception:
+                return {"ok": False, "error": "podcast frame failed"}
+            if error or not (isinstance(sent, dict) and sent.get("ok") is True):
+                message = "podcast frame failed"
+                if isinstance(error, dict) and isinstance(error.get("message"), str):
+                    message = error["message"]
+                return {"ok": False, "error": message}
+            guard.commit_open(str(result.get("title") or frame.get("showTitle") or show))
+            logger.info("portal frame type=podcast")
+            return result
+
+    def _open_args(args: dict[str, Any]) -> tuple[int | None, str, dict[str, Any] | None]:
+        if "ordinal" in args:
+            ordinal = args.get("ordinal")
+            if isinstance(ordinal, bool) or not isinstance(ordinal, int):
+                return None, "", _miss("out_of_range", query="")
+            return ordinal, "", None
         show = args.get("show")
         if not isinstance(show, str) or not show.strip():
-            return {"ok": False, "error": "show is required"}
-        try:
-            shows = await fill_blank_titles(await _get_followed())
-        except Exception:
-            logger.warning("podcast followed list failed")
-            return {"ok": False, "error": "I couldn't reach the podcast list."}
-        try:
-            result, frame = await open_show(show, shows, _post_open)
-        except Exception:
-            logger.warning("podcast open failed")
-            return {"ok": False, "error": "I couldn't open that show."}
-        if frame is None:
-            return result
-        send = getattr(esp32, "send_podcast", None)
-        if not callable(send):
-            return {"ok": False, "error": "podcast channel unavailable"}
-        try:
-            sent, error = await send(frame)
-        except Exception:
-            return {"ok": False, "error": "podcast frame failed"}
-        if error or not (isinstance(sent, dict) and sent.get("ok") is True):
-            message = "podcast frame failed"
-            if isinstance(error, dict) and isinstance(error.get("message"), str):
-                message = error["message"]
-            return {"ok": False, "error": message}
-        logger.info("portal frame %s", json.dumps(frame, ensure_ascii=False))
-        return result
+            return None, "", _miss("empty")
+        return None, show, None
 
     return ToolExtension(
         declarations=declarations,

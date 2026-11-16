@@ -438,6 +438,8 @@ class ESP32Manager:
         self.on_head_command: Callable[[], None] | None = None
         self.on_device_state: Callable[[str], None] | None = None
         self.on_wake_detected: Callable[[], Awaitable[None]] | None = None
+        # Podcast turn key when the Portal has not sent a context seq.
+        self.listen_starts = 0
 
     @property
     def device_connected(self) -> bool:
@@ -1095,6 +1097,8 @@ class ESP32Manager:
         msg_type = message.get("type", "")
         state = str(message.get("state", "")).lower()
         if msg_type == "listen":
+            if state == "start":
+                self.listen_starts += 1
             if state in {"start", "detect"}:
                 if callback is not None:
                     callback("listening")

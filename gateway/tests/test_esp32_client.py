@@ -68,6 +68,9 @@ async def test_listen_detect_triggers_wake_callback_without_state_callback():
     mgr._observe_device_state({"type": "listen", "state": "detect"})
 
     await asyncio.wait_for(wake_detected.wait(), timeout=1.0)
+    assert mgr.listen_starts == 0
+    mgr._observe_device_state({"type": "listen", "state": "start"})
+    assert mgr.listen_starts == 1
 
 
 @pytest.mark.asyncio

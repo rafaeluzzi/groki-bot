@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Followed-show open: panel order, misheard titles, and the podcast frame."""
 
+import asyncio
 import json
+import logging
 
 import pytest
 
@@ -50,14 +52,11 @@ def test_number_six_is_not_a_title_and_number_two_is_the_second_row():
     assert ordinal_index("play number six") is None
     plan = plan_open("number six", SHOWS)
     assert plan["kind"] == "range"
-    assert "no show number 6" in plan["result"]["error"]
+    assert plan["result"]["reason"] == "out_of_range"
+    assert "shows" not in plan["result"]
+    assert "name these" not in json.dumps(plan["result"]).lower()
     picked = plan_open("number 2", SHOWS)
     assert picked == {"kind": "open", "title": "Planet Money"}
-    assert [row["title"] for row in plan["result"]["shows"]] == [
-        "Lex Fridman Podcast",
-        "Planet Money",
-        "The Daily",
-    ]
 
 
 @pytest.mark.asyncio
@@ -69,11 +68,16 @@ async def test_legs_freeman_misses_and_lists_the_panel_order():
     assert frame is None
     assert result["ok"] is False
     assert result["matched"] is False
-    assert result["call_again"] == "Lex Fridman Podcast"
-    assert "once more" in result["instruction"]
-    assert "not for you" in result["instruction"]
-    assert [row["n"] for row in result["shows"]] == [1, 2, 3]
-    assert result["shows"][0]["title"] == "Lex Fridman Podcast"
+    assert result["reason"] == "not_followed"
+    assert result["did_you_mean"] == "Lex Fridman Podcast"
+    assert "shows" not in result
+    assert "candidates" not in result
+    assert "call_again" not in result
+    assert "name these" not in json.dumps(result).lower()
+    vague, vague_frame = await open_show("zzzzqqqq", SHOWS, post_open)
+    assert vague_frame is None
+    assert vague["reason"] == "not_followed"
+    assert "did_you_mean" not in vague
 
 
 @pytest.mark.asyncio
@@ -124,11 +128,8 @@ def test_a_blank_title_is_last_and_has_no_number():
     assert rows == {"kind": "open", "title": "Planet Money"}
     missed = plan_open("number 3", shows)
     assert missed["kind"] == "range"
-    assert missed["result"]["shows"] == [
-        {"n": 1, "title": "All-In"},
-        {"n": 2, "title": "Planet Money"},
-        {"title": ""},
-    ]
+    assert missed["result"]["reason"] == "out_of_range"
+    assert "shows" not in missed["result"]
 
 
 def test_channel_title_reads_the_first_channel_title():
@@ -188,3 +189,117 @@ def test_a_show_open_keeps_the_enclosure_on_the_frame():
     assert frame["rssEpisode"]["enclosureUrl"] == "https://cdn.example/hf.mp3"
     assert is_podcast_frame(frame)
     assert "query" not in frame["rssEpisode"]["enclosureUrl"]
+
+
+def test_ordinal_uses_the_visible_row_or_the_az_list():
+    panel = {
+        "id": "suggestions",
+        "title": "Podcast-suggestions",
+        "rows": [
+            {"n": 1, "label": "The Journal"},
+            {"n": 2, "label": "Hard Fork"},
+            {"n": 3, "label": "Decoder"},
+        ],
+    }
+    followed = [{"title": "Hard Fork"}, {"title": "Planet Money"}]
+    assert plan_open("", followed, ordinal=2, panel=panel) == {"kind": "open", "title": "Hard Fork"}
+    missed = plan_open("", followed, ordinal=3, panel=panel)
+    assert missed["result"]["reason"] == "not_followed"
+    assert missed["result"]["query"] == "Decoder"
+    assert "shows" not in missed["result"]
+    assert plan_open("", followed, ordinal=9, panel=panel)["result"]["reason"] == "out_of_range"
+    assert plan_open("", followed, ordinal=1)["title"] == "Hard Fork"
+    assert plan_open("", followed, ordinal=2)["title"] == "Planet Money"
+    assert plan_open("", followed, ordinal=4)["result"]["reason"] == "out_of_range"
+
+
+class _Host:
+    def __init__(self):
+        self.frames = []
+        self.listen_starts = 1
+        self.koji_context = None
+
+    async def send_podcast(self, frame):
+        self.frames.append(frame)
+        return {"ok": True}, None
+
+
+def _patch_catalog(monkeypatch, shows):
+    async def followed():
+        return shows
+
+    async def post(title):
+        return {
+            "showId": "x",
+            "showTitle": title,
+            "announce": f"Opening {title} in Spotify.",
+            "openSpotifyUri": "spotify:show:x",
+        }
+
+    monkeypatch.setattr("stackchan_mcp.podcast_open._get_followed", followed)
+    monkeypatch.setattr("stackchan_mcp.podcast_open._post_open", post)
+
+
+@pytest.mark.asyncio
+async def test_one_open_per_turn_and_a_fourth_miss_is_capped(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.podcast_turn")
+    shows = [{"id": str(i), "title": f"Show {i}"} for i in range(6)]
+    _patch_catalog(monkeypatch, shows)
+    host = _Host()
+    host.koji_context = {"seq": 7, "panel": None}
+    extension = podcast_open_extension(host)
+    results = await asyncio.gather(*(extension.dispatch("podcast_open_spotify", {"show": f"Show {i}"}) for i in range(6)))
+    assert len(host.frames) == 1
+    opened = [row for row in results if row.get("ok") is True]
+    blocked = [row for row in results if row.get("reason") == "one_open_per_turn"]
+    assert len(opened) == 1
+    assert len(blocked) == 5
+    assert blocked[0]["opened"] == opened[0]["title"]
+    assert "podcast guard seq=7 reason=one_open_per_turn" in caplog.text
+    for title in (f"Show {i}" for i in range(6)):
+        assert title not in caplog.text
+
+    host.koji_context = {"seq": 8, "panel": None}
+    again = await extension.dispatch("podcast_open_spotify", {"show": "Show 1"})
+    assert again["ok"] is True
+    assert len(host.frames) == 2
+
+    misses = []
+    host.koji_context = {"seq": 9, "panel": None}
+
+    async def no_post(title):
+        misses.append(title)
+        return {}
+
+    monkeypatch.setattr("stackchan_mcp.podcast_open._post_open", no_post)
+    looked = []
+
+    async def count_followed():
+        looked.append(1)
+        return shows
+
+    monkeypatch.setattr("stackchan_mcp.podcast_open._get_followed", count_followed)
+    fresh = podcast_open_extension(host)
+    outcomes = []
+    for _ in range(4):
+        outcomes.append(await fresh.dispatch("podcast_open_spotify", {"show": "not a show"}))
+    assert [row.get("reason") for row in outcomes[:3]] == ["not_followed", "not_followed", "not_followed"]
+    assert outcomes[3]["reason"] == "capped"
+    assert misses == []
+    assert len(looked) == 3
+    assert "podcast guard seq=9 reason=capped" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_listen_starts_reset_the_guard_when_there_is_no_context(monkeypatch):
+    _patch_catalog(monkeypatch, [{"id": "hf", "title": "Hard Fork"}])
+    host = _Host()
+    extension = podcast_open_extension(host)
+    first = await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"})
+    assert first["ok"] is True
+    second = await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"})
+    assert second["reason"] == "one_open_per_turn"
+    host.listen_starts = 2
+    third = await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"})
+    assert third["ok"] is True
+    assert len(host.frames) == 2
