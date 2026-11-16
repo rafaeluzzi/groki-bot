@@ -6,12 +6,17 @@ import json
 import pytest
 
 from stackchan_mcp.podcast_open import (
+    PODCAST_INSTRUCTIONS,
     channel_title,
     fill_blank_titles,
     followed_order,
+    is_podcast_frame,
     open_show,
     ordinal_index,
     plan_open,
+    podcast_declarations,
+    podcast_frame,
+    podcast_open_extension,
 )
 
 
@@ -19,6 +24,19 @@ LEX = {"id": "lex", "title": "Lex Fridman Podcast", "spotifyShowUri": "spotify:s
 DAILY = {"id": "daily", "title": "The Daily", "spotifyShowUri": "spotify:show:daily"}
 PLANET = {"id": "pm", "title": "Planet Money", "spotifyShowUri": "spotify:show:pm"}
 SHOWS = [PLANET, LEX, DAILY]
+
+
+def test_the_tool_tells_the_model_not_to_speak_around_it():
+    description = podcast_declarations()[0]["description"]
+    assert "do not say anything before or after" in description.lower()
+    assert "A-to-Z" in description
+    extension = podcast_open_extension(object())
+    assert "do not say anything before or after" in extension.instructions.lower()
+    assert extension.instructions == PODCAST_INSTRUCTIONS
+    assert "number" in extension.instructions.lower()
+    assert ordinal_index("number three") == 3
+    plan = plan_open("number 2", SHOWS)
+    assert plan == {"kind": "open", "title": "Planet Money"}
 
 
 def test_followed_order_matches_the_router_title_sort():
@@ -73,7 +91,8 @@ async def test_a_corrected_title_sends_one_podcast_frame():
 
     result, frame = await open_show("Lex Fridman", SHOWS, post_open)
     assert result["spoken"] is True
-    assert result["note"].startswith("The Portal already said")
+    assert "do not say anything before or after" in result["note"].lower()
+    assert "do not repeat" in result["note"].lower()
     assert frame["type"] == "podcast"
     assert frame["openSpotifyUri"] == LEX["spotifyShowUri"]
     assert frame["announce"].startswith("Opening Lex Fridman Podcast")
@@ -148,3 +167,24 @@ async def test_an_unreadable_blank_title_stays_unnumbered():
     filled = await fill_blank_titles([{"title": "", "feedUrl": "https://feeds.example/x"}, {"title": "Hard Fork"}], read)
     assert plan_open("number 1", filled)["title"] == "Hard Fork"
     assert plan_open("number 2", filled)["kind"] == "range"
+
+
+def test_a_show_open_keeps_the_enclosure_on_the_frame():
+    body = {
+        "showId": "hf",
+        "showTitle": "Hard Fork",
+        "announce": "I'll open Hard Fork in Spotify. The latest episode is Jensen Huang Is Out at Nvidia.",
+        "openSpotifyUri": "spotify:show:44fllCS2FTFr2x2kjP9xeT",
+        "openKind": "show",
+        "rssEpisode": {
+            "guid": "ep",
+            "title": "Jensen Huang Is Out at Nvidia",
+            "enclosureUrl": "https://cdn.example/hf.mp3",
+            "showTitle": "Hard Fork",
+        },
+    }
+    frame = podcast_frame(body)
+    assert frame["openKind"] == "show"
+    assert frame["rssEpisode"]["enclosureUrl"] == "https://cdn.example/hf.mp3"
+    assert is_podcast_frame(frame)
+    assert "query" not in frame["rssEpisode"]["enclosureUrl"]
