@@ -190,6 +190,8 @@ async def test_native_presence_and_sse_lifecycle(caplog):
                 "presence_status": 200,
                 "error": None,
                 "reason": None,
+                "step": None,
+                "body_kind": None,
             }
             await channel.close()
         assert [item["isOnTheLine"] for item in presence] == [True, False]
@@ -443,6 +445,8 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "presence_status": 502,
                     "error": "upstream_http_429",
                     "reason": None,
+                    "step": None,
+                    "body_kind": None,
                 }
                 assert not channel.ready
                 http_status, body = await read_health()
@@ -461,6 +465,8 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                         "presence_status": 200,
                         "error": "http_502",
                         "reason": None,
+                        "step": None,
+                        "body_kind": None,
                     }
                 )
                 http_status, body = await read_health()
@@ -476,6 +482,8 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "presence_status": 200,
                     "error": None,
                     "reason": None,
+                    "step": None,
+                    "body_kind": None,
                 }
                 http_status, body = await read_health()
                 assert http_status == 200 and body["ok"] is True
@@ -486,6 +494,8 @@ async def test_voice_health_reports_native_502_and_recovers_without_dropping_voi
                     "presence_status": 200,
                     "error": None,
                     "reason": None,
+                    "step": None,
+                    "body_kind": None,
                 }
             finally:
                 helper.release.set()
@@ -536,6 +546,89 @@ async def test_login_rejected_is_a_distinct_reason_from_an_asleep_box(caplog):
                     and channel.health()["reason"] is None
                 )
                 assert "reason=native_presence_unavailable" in caplog.text
+            finally:
+                await channel.close()
+    finally:
+        await runner.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_voice_health_carries_step_and_body_kind(caplog):
+    """A helper 502's step and body_kind reach the log and voice-health. Other text does not."""
+    import logging
+
+    from aiohttp import ClientSession
+
+    from stackchan_mcp.capture_server import create_capture_app
+    from stackchan_mcp.debug_status import DebugStatus
+
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.gbot_native_channel")
+    status = DebugStatus()
+    app = create_capture_app(debug_status=status)
+    mode = {
+        "body": {
+            "ok": False,
+            "error": "upstream_http_404",
+            "step": "presence",
+            "body_kind": "box_unknown_method",
+            "token": "sk-LIVE-9f3c2a-DO-NOT-LEAK",
+        }
+    }
+
+    async def register(request):
+        body = await request.json()
+        if not body.get("isOnTheLine"):
+            return web.json_response({"ok": True})
+        return web.json_response(mode["body"], status=502)
+
+    app.router.add_post("/native/presence", register)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    port = site._server.sockets[0].getsockname()[1]
+    base = f"http://127.0.0.1:{port}"
+
+    async def unused_update(event, is_user):
+        return None
+
+    try:
+        async with ClientSession() as http:
+            channel = NativeVoiceChannel(http, base, "agent", "call", unused_update)
+            channel._retry_delay = 0.01
+            status.voice_health_provider = lambda: {
+                "state": "connected",
+                "native": channel.health(),
+            }
+            await channel.start()
+            try:
+                await eventually(lambda: channel.health()["step"] == "presence")
+                assert channel.health()["error"] == "upstream_http_404"
+                assert channel.health()["body_kind"] == "box_unknown_method"
+                assert channel.health()["reason"] is None
+                assert (
+                    "Grok native presence on=True status=502 error=upstream_http_404 "
+                    "step=presence body_kind=box_unknown_method"
+                ) in caplog.text
+                assert "sk-LIVE-9f3c2a-DO-NOT-LEAK" not in caplog.text
+                async with http.get(base + "/debug/voice-health") as response:
+                    health = await response.json()
+                assert health["native"]["step"] == "presence"
+                assert health["native"]["body_kind"] == "box_unknown_method"
+                assert health["native"]["error"] == "upstream_http_404"
+                mode["body"] = {
+                    "ok": False,
+                    "error": "upstream_http_404",
+                    "step": "not a step",
+                    "body_kind": "box_not_found extra",
+                }
+                await eventually(
+                    lambda: channel.health()["error"] == "upstream_http_404"
+                    and channel.health()["step"] is None
+                    and channel.health()["body_kind"] is None
+                )
+                assert "step=-" in caplog.text
+                assert "body_kind=-" in caplog.text
             finally:
                 await channel.close()
     finally:

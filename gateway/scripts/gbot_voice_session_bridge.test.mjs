@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { createBridge, accountRpc, createEnsureBackoff, createInstalledClientVersion, filterNativeEvent, parseClientVersion, validateBody, isRoutineStreamEnd } from './gbot_voice_session_bridge.mjs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -397,8 +397,11 @@ test('a failed stale hangup is logged and the new call still registers', async (
     assert.equal((await pres('call-old',true)).status,200);
     assert.equal((await pres('call-new',true)).status,200);
     assert.deepEqual(presence,['call-old:true','call-old:false','call-new:true']);
-    assert.deepEqual(logs.filter(e=>e.state==='stale_hangup').map(e=>e.error_class),['upstream_http_502']);
-    assert.match(logs.find(e=>e.state==='stale_hangup').at, /^\d{4}-\d{2}-\d{2}T/);
+    const stale = logs.find(e=>e.state==='stale_hangup');
+    assert.equal(stale.error_class, 'upstream_http_502');
+    assert.equal(stale.http_status, 502);
+    assert.equal(stale.step, 'presence_hangup');
+    assert.match(stale.at, /^\d{4}-\d{2}-\d{2}T/);
   } finally {await new Promise(r=>server.close(r));}
 });
 
@@ -636,4 +639,330 @@ test('warm runs once while another warm is in flight, and the call record answer
     assert.equal((await post('/native/presence', {agentId: 'a', callId: 'call-c', isOnTheLine: true, acceptsOverheard: false})).status, 200);
     assert.equal((await post('/native/call', {agentId: 'a', callId: 'call-c'})).status, 404);
   } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+const SECRET = 'sk-LIVE-9f3c2a-DO-NOT-LEAK';
+
+test('a 404 body is classified without keeping any other text', async () => {
+  const {classifyNotFoundBody} = await import('./gbot_voice_session_bridge.mjs');
+  const unknown = classifyNotFoundBody(`{"message":"unknown gateway method: setVoiceCallPresence","token":"${SECRET}"}`);
+  assert.deepEqual(unknown, {body_kind: 'box_unknown_method', method: 'setVoiceCallPresence'});
+  const prefixed = classifyNotFoundBody(`noise unknown gateway method: EnsureSandBox ${SECRET}`);
+  assert.deepEqual(prefixed, {body_kind: 'box_unknown_method', method: 'EnsureSandBox'});
+  const unsafe = classifyNotFoundBody(`unknown gateway method: Foo-bar ${SECRET}`);
+  assert.deepEqual(unsafe, {body_kind: 'box_unknown_method'});
+  assert.equal(unsafe.method, undefined);
+  const notFound = classifyNotFoundBody(`not found: POST /api/${SECRET}`);
+  assert.deepEqual(notFound, {body_kind: 'box_not_found'});
+  const contained = classifyNotFoundBody(`{"message":"not found: GET /health ${SECRET}"}`);
+  assert.deepEqual(contained, {body_kind: 'box_not_found'});
+  const other = classifyNotFoundBody(`{"error":"missing","token":"${SECRET}"}`);
+  assert.deepEqual(other, {body_kind: 'other'});
+  const late = 'x'.repeat(520) + `unknown gateway method: HiddenMethod ${SECRET}`;
+  assert.deepEqual(classifyNotFoundBody(late), {body_kind: 'other'});
+  const dumped = JSON.stringify({unknown, prefixed, unsafe, notFound, contained, other});
+  assert.equal(dumped.includes(SECRET), false);
+  assert.equal(dumped.includes('Foo-bar'), false);
+  assert.equal(dumped.includes('HiddenMethod'), false);
+});
+
+test('a 403 never reads the upstream body, and a 404 stops after 512 bytes', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const accountLoader = () => ({token: 't', machineId: 'm'});
+  const body = {wake: false, supportsAsleepBox: true};
+  let reads = 0;
+  const forbidden = async () => ({
+    ok: false, status: 403, headers: {get: () => null},
+    body: {getReader() { reads++; }, cancel() { reads++; }},
+    json() { reads++; }, text() { reads++; },
+  });
+  await assert.rejects(accountRpc('EnsureSandBox', body, {
+    accountLoader, fetcher: forbidden, clientVersion: '1.1.0', backoff: createEnsureBackoff({now: () => 1_000, secretsMtime: () => 1}),
+  }), (error) => error.message === 'upstream_http_403' && error.step === 'ensure_sandbox' && error.target_host === 'api2.cursor.sh' && error.body_kind === undefined);
+  assert.equal(reads, 0);
+  let pulled = 0;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (pulled >= 4000) { controller.close(); return; }
+      const chunk = Buffer.alloc(300, 121);
+      pulled += chunk.length;
+      controller.enqueue(chunk);
+    },
+  });
+  const client = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({authId: 'owner', token: 't', machineId: 'm'}),
+    rpc: (method, rpcBody, options) => accountRpc(method, rpcBody, {
+      ...options, clientVersion: '1.1.0', backoff: createEnsureBackoff({now: () => 5_000, secretsMtime: () => 1}),
+    }),
+    fetcher: async () => new Response(stream, {status: 404}),
+  });
+  await assert.rejects(client.presence({agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false}), (error) => {
+    assert.equal(error.step, 'ensure_sandbox');
+    assert.equal(error.body_kind, 'other');
+    assert.equal(error.target_host, 'api2.cursor.sh');
+    assert.equal(JSON.stringify(error).includes(SECRET), false);
+    return true;
+  });
+  assert.ok(pulled < 1000, `read ${pulled} bytes`);
+});
+
+function pres(port, callId, isOnTheLine) {
+  return fetch(`http://127.0.0.1:${port}/native/presence`, {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({agentId: 'a', callId, isOnTheLine, acceptsOverheard: false}),
+  });
+}
+
+test('EnsureSandBox 404 is step ensure_sandbox and the body never reaches the log', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const logs = [];
+  const port = await freePort();
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({token: 't', machineId: 'm', authId: 'owner'}),
+    rpc: (method, body, options) => accountRpc(method, body, {
+      ...options, clientVersion: '1.1.0', backoff: createEnsureBackoff({now: () => 9_000, secretsMtime: () => 1}),
+    }),
+    fetcher: async () => new Response(`{"message":"unknown gateway method: EnsureSandBox","token":"${SECRET}"}`, {status: 404}),
+  });
+  const server = createBridge({port, agentId: 'a', desktopEnabled: true, sandbox, nativeLog: event => logs.push(event)});
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    const response = await pres(port, 'call-c', true);
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {ok: false, error: 'upstream_http_404', step: 'ensure_sandbox', body_kind: 'box_unknown_method'});
+    const failure = logs.find(event => event.state === 'error');
+    assert.equal(failure.source, 'presence');
+    assert.equal(failure.step, 'ensure_sandbox');
+    assert.equal(failure.http_status, 404);
+    assert.equal(failure.target_host, 'api2.cursor.sh');
+    assert.equal(failure.body_kind, 'box_unknown_method');
+    assert.equal(failure.method, 'EnsureSandBox');
+    assert.equal(JSON.stringify(logs).includes(SECRET), false);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('sandbox presence 404 is step presence with body_kind box_not_found', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const logs = [];
+  const port = await freePort();
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async () => ({gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: 'SECRET_TOKEN_VALUE'}),
+    fetcher: async () => new Response(`not found: POST /api/${SECRET}`, {status: 404}),
+  });
+  const server = createBridge({port, agentId: 'a', desktopEnabled: true, sandbox, nativeLog: event => logs.push(event)});
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    const response = await pres(port, 'call-c', true);
+    assert.equal(response.status, 502);
+    assert.deepEqual(await response.json(), {ok: false, error: 'upstream_http_404', step: 'presence', body_kind: 'box_not_found'});
+    const failure = logs.find(event => event.state === 'error');
+    assert.equal(failure.step, 'presence');
+    assert.equal(failure.http_status, 404);
+    assert.equal(failure.target_host, 'pod.cursorvm.com');
+    assert.equal(failure.body_kind, 'box_not_found');
+    assert.equal(failure.method, undefined);
+    const ensured = logs.filter(event => event.state === 'ensure_ok');
+    assert.equal(ensured.length, 1);
+    assert.equal(ensured[0].target_host, 'pod.cursorvm.com');
+    assert.equal(JSON.stringify(logs).includes(SECRET), false);
+    assert.equal(JSON.stringify(logs).includes('SECRET_TOKEN_VALUE'), false);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('a box stream 404 is step box_stream with body_kind other', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const logs = [];
+  const port = await freePort();
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async () => ({gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: 'tok'}),
+    fetcher: async (url) => new URL(url).pathname === '/events'
+      ? new Response(`{"error":"missing","token":"${SECRET}"}`, {status: 404, headers: {'content-type': 'application/json'}})
+      : new Response('', {status: 200}),
+  });
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox,
+    transcript: {async *events() {}}, nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await pres(port, 'call-c', true)).status, 200);
+    const response = await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=call-c`);
+    assert.equal(response.status, 502);
+    const failure = logs.find(event => event.source === 'box' && event.state === 'error');
+    assert.equal(failure.step, 'box_stream');
+    assert.equal(failure.http_status, 404);
+    assert.equal(failure.target_host, 'pod.cursorvm.com');
+    assert.equal(failure.body_kind, 'other');
+    assert.equal(JSON.stringify(logs).includes(SECRET), false);
+    assert.equal(JSON.stringify(await response.json()).includes(SECRET), false);
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
+});
+
+test('a typed stream 404 is step typed_stream and the body stays out of the log', async () => {
+  const {NativeTranscriptClient} = await import('./gbot_voice_session_bridge.mjs');
+  const logs = [];
+  const port = await freePort();
+  const transcript = new NativeTranscriptClient({
+    accountLoader: () => ({token: 't', machineId: 'm'}),
+    clientVersion: '1.1.0',
+    fetcher: async () => new Response(`not found: POST /WatchGrokBotTranscripts ${SECRET}`, {status: 404}),
+  });
+  const sandbox = {
+    presence: async () => {}, callerAuthId: async () => 'owner',
+    openEvents: async (signal) => new Response(new ReadableStream({
+      start(controller) { signal.addEventListener('abort', () => controller.close(), {once: true}); },
+    }), {headers: {'content-type': 'text/event-stream'}}),
+  };
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox, transcript,
+    nativeRetryDelayMs: 20, nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  let reader;
+  try {
+    assert.equal((await pres(port, 'call-c', true)).status, 200);
+    const response = await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=call-c`);
+    reader = response.body.getReader();
+    await reader.read();
+    const started = Date.now();
+    while (!logs.some(event => event.source === 'typed' && event.state === 'error')) {
+      if (Date.now() - started > 1000) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    const failure = logs.find(event => event.source === 'typed' && event.state === 'error');
+    assert.ok(failure);
+    assert.equal(failure.step, 'typed_stream');
+    assert.equal(failure.http_status, 404);
+    assert.equal(failure.target_host, 'api2.cursor.sh');
+    assert.equal(failure.body_kind, 'box_not_found');
+    assert.equal(JSON.stringify(logs).includes(SECRET), false);
+  } finally {
+    await reader?.cancel();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('a 404 hanging up the stored call forgets it, and a 502 or the live call does not', async () => {
+  const {rememberCall} = await import('./gbot_voice_session_bridge.mjs');
+  const logs = [];
+  const seen = [];
+  const dir = mkdtempSync(join(tmpdir(), 'koji-call-'));
+  const callStore = join(dir, 'call.json');
+  rememberCall(callStore, {agentId: 'a', callId: 'call-old', acceptsOverheard: false});
+  const port = await freePort();
+  let failNew = true;
+  const sandbox = {
+    callerAuthId: async () => 'owner',
+    presence: async body => {
+      seen.push(`${body.callId}:${body.isOnTheLine}`);
+      if (!body.isOnTheLine) {
+        throw Object.assign(new Error('upstream_http_404'), {
+          step: 'presence_hangup', body_kind: 'box_not_found', target_host: 'pod.cursorvm.com', method: 'setVoiceCallPresence',
+        });
+      }
+      if (failNew) throw Object.assign(new Error('upstream_http_500'), {step: 'presence', target_host: 'pod.cursorvm.com'});
+    },
+  };
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox, callStore, nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    const failed = await pres(port, 'call-new', true);
+    assert.equal(failed.status, 502);
+    assert.equal(existsSync(callStore), false);
+    const hangup = logs.find(event => event.state === 'stale_hangup');
+    assert.equal(hangup.step, 'presence_hangup');
+    assert.equal(hangup.http_status, 404);
+    assert.equal(hangup.error_class, 'upstream_http_404');
+    assert.equal(hangup.body_kind, 'box_not_found');
+    assert.equal(hangup.target_host, 'pod.cursorvm.com');
+    assert.equal(hangup.method, 'setVoiceCallPresence');
+    failNew = false;
+    assert.equal((await pres(port, 'call-new', true)).status, 200);
+    assert.deepEqual(seen, ['call-old:false', 'call-new:true', 'call-new:true']);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+
+  const kept = join(dir, 'kept.json');
+  rememberCall(kept, {agentId: 'a', callId: 'call-old', acceptsOverheard: false});
+  const port502 = await freePort();
+  const stillThere = createBridge({
+    port: port502, agentId: 'a', desktopEnabled: true, callStore: kept,
+    sandbox: {
+      callerAuthId: async () => 'owner',
+      presence: async body => { if (!body.isOnTheLine) throw new Error('upstream_http_502'); throw new Error('upstream_http_500'); },
+    },
+  });
+  await new Promise(resolve => stillThere.listen(port502, '127.0.0.1', resolve));
+  try {
+    assert.equal((await pres(port502, 'call-new', true)).status, 502);
+    assert.equal(JSON.parse(readFileSync(kept, 'utf8')).callId, 'call-old');
+  } finally { await new Promise(resolve => stillThere.close(resolve)); }
+
+  const livePath = join(dir, 'live.json');
+  const portLive = await freePort();
+  const live = createBridge({
+    port: portLive, agentId: 'a', desktopEnabled: true, callStore: livePath,
+    sandbox: {
+      callerAuthId: async () => 'owner',
+      presence: async body => {
+        if (!body.isOnTheLine) throw Object.assign(new Error('upstream_http_404'), {step: 'presence_hangup', body_kind: 'other', target_host: 'pod.cursorvm.com'});
+      },
+    },
+  });
+  await new Promise(resolve => live.listen(portLive, '127.0.0.1', resolve));
+  try {
+    assert.equal((await pres(portLive, 'call-live', true)).status, 200);
+    const hangup = await pres(portLive, 'call-live', false);
+    assert.equal(hangup.status, 502);
+    assert.deepEqual(await hangup.json(), {ok: false, error: 'upstream_http_404', step: 'presence_hangup', body_kind: 'other'});
+    assert.equal(JSON.parse(readFileSync(livePath, 'utf8')).callId, 'call-live');
+  } finally { await new Promise(resolve => live.close(resolve)); }
+});
+
+test('ensure_ok is logged only when the host or the field names change', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const logs = [];
+  let mode = 'same';
+  const client = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({authId: 'owner'}),
+    log: event => logs.push(event),
+    rpc: async () => {
+      if (mode === 'fields') return {gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: 'SECRET_TOKEN_VALUE', extra: true};
+      if (mode === 'host') return {gatewayUrl: 'https://other.cursorvm.com', gatewayToken: 'SECRET_TOKEN_VALUE'};
+      return {gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: 'SECRET_TOKEN_VALUE', networkToken: 'SECRET_NET'};
+    },
+    fetcher: async () => ({ok: true, status: 200, body: {cancel: async () => {}}}),
+  });
+  const call = {agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false};
+  await client.presence(call);
+  await client.presence(call);
+  client.invalidate();
+  await client.presence(call);
+  assert.equal(logs.length, 1);
+  assert.equal(logs[0].source, 'ensure');
+  assert.equal(logs[0].state, 'ensure_ok');
+  assert.equal(logs[0].target_host, 'pod.cursorvm.com');
+  assert.deepEqual(logs[0].response_fields, ['gatewayToken', 'gatewayUrl', 'networkToken']);
+  client.invalidate();
+  mode = 'fields';
+  await client.presence(call);
+  client.invalidate();
+  mode = 'host';
+  await client.presence(call);
+  assert.equal(logs.length, 3);
+  assert.deepEqual(logs[1].response_fields, ['extra', 'gatewayToken', 'gatewayUrl']);
+  assert.equal(logs[1].target_host, 'pod.cursorvm.com');
+  assert.equal(logs[2].target_host, 'other.cursorvm.com');
+  assert.deepEqual(logs[2].response_fields, ['gatewayToken', 'gatewayUrl']);
+  assert.equal(JSON.stringify(logs).includes('SECRET_TOKEN_VALUE'), false);
+  assert.equal(JSON.stringify(logs).includes('SECRET_NET'), false);
 });

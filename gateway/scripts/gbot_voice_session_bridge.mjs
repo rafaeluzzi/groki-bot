@@ -24,6 +24,77 @@ export const RPC_ROUTES = Object.freeze({
 // gateway client treats that status as "wake and reconnect". A cached URL
 // answers 417 forever until EnsureSandBox runs again.
 const STALE_SANDBOX_STATUS = new Set([401, 403, 404, 410, 417, 502, 503, 504]);
+const STEPS = new Set(['ensure_sandbox', 'presence', 'presence_hangup', 'box_stream', 'typed_stream']);
+const BODY_KINDS = new Set(['box_unknown_method', 'box_not_found', 'other']);
+const BACKEND_HOST = 'api2.cursor.sh';
+const HTTP_METHOD_RE = '(?:GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)';
+const NOT_FOUND_RE = new RegExp('not found:\\s*' + HTTP_METHOD_RE + '\\b');
+// The whole token has to be letters. A prefix of Foo-bar is not a method name.
+const UNKNOWN_METHOD_RE = /unknown gateway method:\s*([^\s"',}]{1,80})/;
+
+function hostnameOf(raw) {
+  try { return new URL(raw).hostname; } catch { return null; }
+}
+
+function safeHost(value) {
+  return typeof value === 'string' && /^[A-Za-z0-9.-]{1,253}$/.test(value) && !value.includes('..') ? value : null;
+}
+
+// A 404 body is classified and discarded. Nothing else from it is kept.
+export function classifyNotFoundBody(chunk) {
+  const bytes = typeof chunk === 'string' ? Buffer.from(chunk) : (chunk instanceof Uint8Array ? Buffer.from(chunk) : Buffer.alloc(0));
+  const text = bytes.subarray(0, 512).toString('utf8');
+  if (text.includes('unknown gateway method:')) {
+    const kind = {body_kind: 'box_unknown_method'};
+    const found = UNKNOWN_METHOD_RE.exec(text);
+    if (found && /^[A-Za-z]{1,60}$/.test(found[1])) kind.method = found[1];
+    return kind;
+  }
+  if (NOT_FOUND_RE.test(text)) return {body_kind: 'box_not_found'};
+  return {body_kind: 'other'};
+}
+
+function withStep(error, step, fields = {}) {
+  if (!error || typeof error !== 'object') return error;
+  if (!STEPS.has(error.step) && STEPS.has(step)) error.step = step;
+  const host = safeHost(fields.target_host);
+  if (!safeHost(error.target_host) && host) error.target_host = host;
+  if (!BODY_KINDS.has(error.body_kind) && BODY_KINDS.has(fields.body_kind)) error.body_kind = fields.body_kind;
+  if (typeof fields.method === 'string' && /^[A-Za-z]{1,60}$/.test(fields.method) && (typeof error.method !== 'string' || !/^[A-Za-z]{1,60}$/.test(error.method))) error.method = fields.method;
+  return error;
+}
+
+async function readNotFoundBody(response) {
+  if (response?.status !== 404) return Buffer.alloc(0);
+  const reader = response.body?.getReader?.();
+  if (!reader) {
+    await Promise.resolve(response.body?.cancel?.()).catch(() => {});
+    return Buffer.alloc(0);
+  }
+  const chunks = [];
+  let total = 0;
+  try {
+    while (total < 512) {
+      const next = await reader.read();
+      if (next.done) break;
+      const bytes = asBytes(next.value);
+      if (!bytes || bytes.byteLength === 0) continue;
+      const take = bytes.subarray(0, 512 - total);
+      chunks.push(Buffer.from(take));
+      total += take.byteLength;
+      if (bytes.byteLength > take.byteLength) break;
+    }
+  } catch { /* an unreadable 404 is body_kind other */ }
+  finally { await reader.cancel().catch(() => {}); }
+  return Buffer.concat(chunks);
+}
+
+async function sandboxHttpError(response, step, targetHost) {
+  const fields = {target_host: targetHost};
+  if (response?.status === 404) Object.assign(fields, classifyNotFoundBody(await readNotFoundBody(response)));
+  else await Promise.resolve(response?.body?.cancel?.()).catch(() => {});
+  return withStep(new Error(`upstream_http_${response.status}`), step, fields);
+}
 
 export function loadAccount() {
   const data = JSON.parse(readFileSync(join(homedir(), 'Library/Application Support/Grok Bot/sand-secrets.json'), 'utf8'));
@@ -99,10 +170,10 @@ export function installedClientVersion() {
 
 const ACCOUNT_FAILURE_REASONS = new Set(['login_rejected', 'client_update_required']);
 
-function accountFailure(status, reason) {
+function accountFailure(status, reason, fields = {}) {
   const error = new Error(`upstream_http_${status}`);
   error.reason = reason;
-  return error;
+  return withStep(error, fields.step, fields);
 }
 
 function accountFailureReason(response) {
@@ -145,7 +216,7 @@ export function createEnsureBackoff({ now = Date.now, secretsMtime = defaultSecr
       until = 0;
       noteSecrets();
     },
-    error() { return accountFailure(lastStatus, lastReason); },
+    error() { return accountFailure(lastStatus, lastReason, {step: 'ensure_sandbox', target_host: BACKEND_HOST}); },
   };
 }
 
@@ -160,6 +231,7 @@ async function accountRequest(method, body, { accountLoader = loadAccount, fetch
   if (method === 'EnsureSandBox' && ![JSON.stringify({wake: false, supportsAsleepBox: true}), '{}'].includes(JSON.stringify(body))) throw new Error('rpc_forbidden');
   if (method === 'WatchGrokBotTranscripts' && (!streaming || body.includeUnlistedAgents !== false || body.inlineBodyMaxBytes !== 65536 || body.cursors?.length !== 1 || typeof body.cursors[0].agentId !== 'string' || Object.keys(body.cursors[0]).some(k => !['agentId', 'generation', 'afterUpdatedSeq'].includes(k)) || body.cursors[0].generation !== 0 || body.cursors[0].afterUpdatedSeq !== '0')) throw new Error('rpc_forbidden');
   const ensure = method === 'EnsureSandBox';
+  const step = ensure ? 'ensure_sandbox' : (method === 'WatchGrokBotTranscripts' ? 'typed_stream' : null);
   const gate = backoff !== undefined ? backoff : (ensure ? defaultEnsureBackoff : null);
   if (ensure && gate?.blocked()) throw gate.error();
   const account = accountLoader();
@@ -182,15 +254,19 @@ async function accountRequest(method, body, { accountLoader = loadAccount, fetch
   const response = await fetcher(BACKEND + method, { method: 'POST', headers,
     body: payload, redirect: 'error', signal: signal ?? AbortSignal.timeout(20000) });
   if (!response.ok) {
-    // Upstream bodies can contain user content or credentials; never read or log them.
+    // Upstream bodies can contain user content or credentials. Never read or log
+    // them, except a 404 on EnsureSandBox or the transcript watch: at most 512
+    // bytes are classified into a fixed body_kind and then discarded.
     // The update hint is a fixed header. Any other 401/403 is a rejected login.
     // 417 stays a hibernated box.
+    const fields = step ? {step, target_host: BACKEND_HOST} : {};
+    if (response.status === 404 && step) Object.assign(fields, classifyNotFoundBody(await readNotFoundBody(response)));
     if (response.status === 401 || response.status === 403) {
       const reason = accountFailureReason(response);
       if (ensure && gate) gate.reject(response.status, reason);
-      throw accountFailure(response.status, reason);
+      throw accountFailure(response.status, reason, fields);
     }
-    throw new Error(`upstream_http_${response.status}`);
+    throw withStep(new Error(`upstream_http_${response.status}`), step, fields);
   }
   if (ensure && gate) gate.succeed();
   return response;
@@ -212,10 +288,26 @@ export function validateSandboxUrl(raw) {
 export class NativeSandboxClient {
   #connection;
   #loading;
-  constructor({rpc = accountRpc, fetcher = fetch, accountLoader = loadAccount, connectMode = 'locate'} = {}) {
+  #log;
+  #lastEnsure;
+  #gatewayHost;
+  constructor({rpc = accountRpc, fetcher = fetch, accountLoader = loadAccount, connectMode = 'locate', log = null} = {}) {
     if (!['locate', 'normal'].includes(connectMode)) throw new Error('invalid_connect_mode');
     this.connectMode = connectMode;
     this.rpc = rpc; this.fetcher = fetcher; this.accountLoader = accountLoader;
+    this.#log = log;
+  }
+  attachLog(log) { this.#log = log; }
+  gatewayHost() { return this.#gatewayHost ?? null; }
+  #noteEnsure(host, fields) {
+    const target = safeHost(host);
+    const names = (Array.isArray(fields) ? fields : []).filter(name => typeof name === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(name));
+    if (!target) return;
+    const signature = target + '\0' + names.join('\n');
+    if (this.#lastEnsure === signature) return;
+    this.#lastEnsure = signature;
+    if (typeof this.#log !== 'function') return;
+    this.#log({source: 'ensure', state: 'ensure_ok', target_host: target, response_fields: names});
   }
   async #connect() {
     if (this.#connection) return this.#connection;
@@ -226,7 +318,11 @@ export class NativeSandboxClient {
       const headers = {authorization: `Bearer ${raw.gatewayToken}`};
       const network = raw.networkToken ?? raw.gatewayHeaders?.['x-anyrun-network-token'];
       if (typeof network === 'string' && network) headers['x-anyrun-network-token'] = network;
-      this.#connection = {baseUrl: validateSandboxUrl(raw.gatewayUrl), headers, authId: account.authId, responseFields: Object.keys(raw).sort()};
+      const responseFields = Object.keys(raw).sort();
+      const baseUrl = validateSandboxUrl(raw.gatewayUrl);
+      this.#connection = {baseUrl, headers, authId: account.authId, responseFields};
+      this.#gatewayHost = hostnameOf(baseUrl);
+      this.#noteEnsure(this.#gatewayHost, responseFields);
       return this.#connection;
     })().finally(() => { this.#loading = undefined; });
     return this.#loading;
@@ -264,8 +360,8 @@ export class NativeSandboxClient {
   async warm() {
     try {
       const health = await this.#fetch('/health', {signal: AbortSignal.timeout(20000)});
+      if (!health.ok) throw await sandboxHttpError(health, 'box_stream', this.#gatewayHost);
       await health.body?.cancel();
-      if (!health.ok) throw new Error(`upstream_http_${health.status}`);
     } catch {
       this.invalidate();
       await this.#connect();
@@ -275,9 +371,14 @@ export class NativeSandboxClient {
     const deadline = new AbortController();
     const timer = setTimeout(() => deadline.abort(), 20000);
     try {
-      const response = await this.#fetch('/events', {headers: {accept: 'text/event-stream'}, signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal});
+      let response;
+      try {
+        response = await this.#fetch('/events', {headers: {accept: 'text/event-stream'}, signal: signal ? AbortSignal.any([signal, deadline.signal]) : deadline.signal});
+      } catch (error) {
+        throw withStep(error, 'box_stream', {target_host: this.#gatewayHost});
+      }
       if (!response.ok || !response.headers.get('content-type')?.toLowerCase().startsWith('text/event-stream')) {
-        await response.body?.cancel(); throw new Error(`upstream_http_${response.status}`);
+        throw await sandboxHttpError(response, 'box_stream', this.#gatewayHost);
       }
       return response;
     } finally { clearTimeout(timer); }
@@ -286,8 +387,8 @@ export class NativeSandboxClient {
     const connection = await this.#connect();
     const health = await this.#fetch('/health', {signal: AbortSignal.timeout(20000)});
     const healthStatus = health.status;
+    if (!health.ok) throw await sandboxHttpError(health, 'box_stream', this.#gatewayHost);
     await health.body?.cancel();
-    if (!health.ok) throw new Error(`upstream_http_${healthStatus}`);
     const events = await this.openEvents();
     const result = {ok: true, responseFields: connection.responseFields, https: true, hostnameAllowed: true, gatewayTokenPresent: true, networkHeaderPresent: Boolean(connection.headers['x-anyrun-network-token']), healthStatus, eventsStatus: events.status, eventStreamContentTypeOk: true};
     // Handshake only. Do not parse/read the initial snapshot or any messages.
@@ -295,20 +396,28 @@ export class NativeSandboxClient {
     return result;
   }
   async presence({agentId, callId, isOnTheLine, acceptsOverheard}) {
-    const response = await this.#fetch('/api/setVoiceCallPresence', {
-      method: 'POST', headers: {'content-type': 'application/json'},
-      body: JSON.stringify({id: agentId, callId, isOnTheLine, acceptsOverheard}), signal: AbortSignal.timeout(20000),
-    });
+    const step = isOnTheLine ? 'presence' : 'presence_hangup';
+    let response;
+    try {
+      response = await this.#fetch('/api/setVoiceCallPresence', {
+        method: 'POST', headers: {'content-type': 'application/json'},
+        body: JSON.stringify({id: agentId, callId, isOnTheLine, acceptsOverheard}), signal: AbortSignal.timeout(20000),
+      });
+    } catch (error) {
+      throw withStep(error, step, {target_host: this.#gatewayHost});
+    }
+    if (!response.ok) throw await sandboxHttpError(response, step, this.#gatewayHost);
     await response.body?.cancel();
-    if (!response.ok) throw new Error(`upstream_http_${response.status}`);
   }
   async callerAuthId() { return (await this.#connect()).authId; }
 }
 
 export class NativeTranscriptClient {
-  constructor({accountLoader = loadAccount, fetcher = fetch} = {}) { this.accountLoader = accountLoader; this.fetcher = fetcher; }
+  constructor({accountLoader = loadAccount, fetcher = fetch, clientVersion} = {}) {
+    this.accountLoader = accountLoader; this.fetcher = fetcher; this.clientVersion = clientVersion;
+  }
   async probe(agentId) {
-    const response = await accountRequest('WatchGrokBotTranscripts', {cursors: [{agentId, generation: 0, afterUpdatedSeq: '0'}], includeUnlistedAgents: false, inlineBodyMaxBytes: 65536}, {accountLoader: this.accountLoader, fetcher: this.fetcher, signal: AbortSignal.timeout(20000), streaming: true});
+    const response = await accountRequest('WatchGrokBotTranscripts', {cursors: [{agentId, generation: 0, afterUpdatedSeq: '0'}], includeUnlistedAgents: false, inlineBodyMaxBytes: 65536}, {accountLoader: this.accountLoader, fetcher: this.fetcher, clientVersion: this.clientVersion, signal: AbortSignal.timeout(20000), streaming: true});
     const ok = response.headers.get('content-type')?.startsWith('application/connect+json') === true;
     await response.body?.cancel();
     return {ok, status: response.status, connectJson: ok};
@@ -317,7 +426,7 @@ export class NativeTranscriptClient {
     // Empty session is the native owner slot. Non-owner sessions require a
     // separately verified metadata binding and are deliberately unsupported.
     if (context.sessionId) throw new Error('session_binding_unavailable');
-    const response = await accountRequest('WatchGrokBotTranscripts', {cursors: [{agentId: context.agentId, generation: 0, afterUpdatedSeq: '0'}], includeUnlistedAgents: false, inlineBodyMaxBytes: 65536}, {accountLoader: this.accountLoader, fetcher: this.fetcher, signal, streaming: true});
+    const response = await accountRequest('WatchGrokBotTranscripts', {cursors: [{agentId: context.agentId, generation: 0, afterUpdatedSeq: '0'}], includeUnlistedAgents: false, inlineBodyMaxBytes: 65536}, {accountLoader: this.accountLoader, fetcher: this.fetcher, clientVersion: this.clientVersion, signal, streaming: true});
     if (!response.headers.get('content-type')?.startsWith('application/connect+json')) { await response.body?.cancel(); throw new Error('native_stream_format'); }
     onOpen(response.status);
     let pending = Buffer.alloc(0);
@@ -485,7 +594,7 @@ function safeErrorMessage(error) {
   return null;
 }
 
-function streamFailure(error, where) {
+function streamFailure(error, where, defaults = {}) {
   const status = /^upstream_http_(\d{3})$/.exec(error?.message ?? '');
   const name = ['Error', 'TypeError', 'AbortError', 'TimeoutError'].includes(error?.name) ? error.name : 'other';
   const failure = {http_status: status ? Number(status[1]) : null, error_class: name};
@@ -494,7 +603,28 @@ function streamFailure(error, where) {
   if (where) failure.frame = where;
   const cause = error?.cause?.code;
   if (typeof cause === 'string' && /^[A-Z0-9_]{1,40}$/.test(cause)) failure.cause = cause;
+  const step = STEPS.has(error?.step) ? error.step : (STEPS.has(defaults.step) ? defaults.step : null);
+  if (step) failure.step = step;
+  const host = safeHost(error?.target_host) || safeHost(defaults.target_host);
+  if (host) failure.target_host = host;
+  if (BODY_KINDS.has(error?.body_kind)) failure.body_kind = error.body_kind;
+  if (typeof error?.method === 'string' && /^[A-Za-z]{1,60}$/.test(error.method)) failure.method = error.method;
   return failure;
+}
+
+function hangupFailure(error) {
+  const status = /^upstream_http_(\d{3})$/.exec(String(error?.message ?? ''));
+  const httpStatus = status ? Number(status[1]) : null;
+  const fields = {
+    http_status: httpStatus,
+    error_class: status ? `upstream_http_${status[1]}` : 'failed',
+    step: STEPS.has(error?.step) ? error.step : 'presence_hangup',
+  };
+  const host = safeHost(error?.target_host);
+  if (host) fields.target_host = host;
+  if (BODY_KINDS.has(error?.body_kind)) fields.body_kind = error.body_kind;
+  if (typeof error?.method === 'string' && /^[A-Za-z]{1,60}$/.test(error.method)) fields.method = error.method;
+  return {httpStatus, fields};
 }
 
 export function loadCall(path) {
@@ -531,6 +661,11 @@ function waitForNativeRetry(milliseconds, signal) {
 export function createBridge({ port = 18771, rpc = accountRpc, agentId = process.env.STACKCHAN_GBOT_VOICE_BOT_ID || process.env.STACKCHAN_GBOT_VOICE_AGENT_ID || process.env.STACKCHAN_TOOL_BOT_ID, toolsEnabled = process.env.STACKCHAN_GBOT_VOICE_TOOLS === '1', desktopEnabled = Boolean(process.env.STACKCHAN_TOOL_BOT?.trim()) || process.env.STACKCHAN_GBOT_VOICE_DESKTOP === '1', sandbox = new NativeSandboxClient({connectMode: 'normal'}), transcript = new NativeTranscriptClient(), nativeRetryDelayMs = 5000, nativeLog = event => console.log(JSON.stringify({event: 'gbot_native_stream', ...event})), sessionId = process.env.STACKCHAN_GBOT_VOICE_SESSION_ID || '', callStore = null } = {}) {
   if (!Number.isFinite(nativeRetryDelayMs) || nativeRetryDelayMs < 10 || nativeRetryDelayMs > 30000) throw new Error('invalid_native_retry_delay');
   const logStream = (source, state, extra = {}) => nativeLog({source, state, at: new Date().toISOString(), ...extra});
+  if (typeof sandbox.attachLog === 'function') {
+    sandbox.attachLog(event => logStream(event.source, event.state, {
+      target_host: event.target_host, response_fields: event.response_fields,
+    }));
+  }
   let activeCall = null;
   let presenceBusy = false;
   let warmFlight = null;
@@ -545,7 +680,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       logStream('presence', 'shutdown_hangup', {http_status: 200, error_class: null});
       forgetCall(callStore);
     } catch (error) {
-      logStream('presence', 'shutdown_hangup', streamFailure(error, 'gbot_voice_session_bridge.mjs:shutdown'));
+      logStream('presence', 'shutdown_hangup', streamFailure(error, 'gbot_voice_session_bridge.mjs:shutdown', {step: 'presence_hangup', target_host: error?.target_host}));
     }
   };
   const server = createServer(async (req, res) => {
@@ -610,7 +745,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
                 controller.abort();
                 break;
               }
-              logStream('typed', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:typed'));
+              logStream('typed', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:typed', {step: 'typed_stream', target_host: error?.target_host || BACKEND_HOST}));
               // A routine socket close is the same clock as the box stream. Don't sit on the 5s timer.
               if (isRoutineStreamEnd(error)) {
                 await waitForNativeRetry(0, controller.signal);
@@ -668,7 +803,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (!controller.signal.aborted) logStream('box', 'eof', {http_status: null, error_class: null});
       } catch (error) {
         if (!controller.signal.aborted) {
-          logStream('box', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:box'));
+          logStream('box', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:box', {step: 'box_stream', target_host: error?.target_host || sandbox.gatewayHost?.()}));
           // undici raises TypeError "terminated" / UND_ERR_SOCKET when the pod closes
           // the SSE socket on its clock. The cached sandbox is still the right one.
           // 417 and the other stale statuses still re-ensure inside #fetch.
@@ -736,9 +871,13 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (stale) {
           try {
             await sandbox.presence({agentId: stale.agentId, callId: stale.callId, isOnTheLine: false, acceptsOverheard: stale.acceptsOverheard});
-            logStream('presence', 'stale_hangup', {http_status: 200, error_class: null});
+            logStream('presence', 'stale_hangup', {http_status: 200, error_class: null, step: 'presence_hangup'});
           } catch (error) {
-            logStream('presence', 'stale_hangup', {http_status: null, error_class: String(error?.message).match(/^upstream_http_\d{3}$/)?.[0] ?? 'failed'});
+            const failure = hangupFailure(error);
+            logStream('presence', 'stale_hangup', failure.fields);
+            // A 404 means this stored call is gone. Stop retrying it. The live
+            // presence call below still has to succeed on its own.
+            if (failure.httpStatus === 404) forgetCall(callStore);
           }
         }
         const authId = await sandbox.callerAuthId();
@@ -770,6 +909,9 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       const safe = /^(upstream_http_\d{3}|login_unavailable|login_expired_open_grok_bot|unsupported_storage|client_version_unavailable)$/.test(error.message) ? error.message : 'bridge_request_failed';
       const payload = { ok: false, error: safe };
       if (ACCOUNT_FAILURE_REASONS.has(error?.reason)) payload.reason = error.reason;
+      if (STEPS.has(error?.step)) payload.step = error.step;
+      if (BODY_KINDS.has(error?.body_kind)) payload.body_kind = error.body_kind;
+      if (nativePresence) logStream('presence', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:presence', {step: 'presence', target_host: error?.target_host}));
       return send(502, payload);
     }
   });

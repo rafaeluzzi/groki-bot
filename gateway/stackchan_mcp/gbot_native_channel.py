@@ -52,20 +52,25 @@ def _safe_word(value):
 
 
 async def helper_failure(response):
-    """The helper's ``error`` word and optional ``reason``.
+    """The helper's ``error`` word plus optional ``reason``, ``step``, and ``body_kind``.
 
     ``upstream_http_429`` is Grok's own status. ``login_rejected`` is a 401/403
     from the account RPC. ``client_update_required`` is that same status with
     the update hint. A hibernated box stays ``upstream_http_417`` with no
-    reason. Bodies are not logged.
+    reason. ``step`` names which request failed. ``body_kind`` is the helper's
+    fixed 404 classification. Bodies are not logged.
     """
     try:
         body = await response.json(content_type=None)
     except Exception:
         body = None
-    error = _safe_word(body.get("error") if isinstance(body, dict) else None)
-    reason = _safe_word(body.get("reason") if isinstance(body, dict) else None)
-    return error or f"http_{response.status}", reason
+    if not isinstance(body, dict):
+        body = {}
+    error = _safe_word(body.get("error"))
+    reason = _safe_word(body.get("reason"))
+    step = _safe_word(body.get("step"))
+    body_kind = _safe_word(body.get("body_kind"))
+    return error or f"http_{response.status}", reason, step, body_kind
 
 
 def update_event(message, agent_id, call_id):
@@ -145,6 +150,8 @@ class NativeVoiceChannel:
         self._presence_status = None
         self._error = None
         self._reason = None
+        self._step = None
+        self._body_kind = None
         self._ready_mono = None
         self._call_logged = False
         self.connected = asyncio.Event()
@@ -164,15 +171,26 @@ class NativeVoiceChannel:
             if on:
                 self._presence_status = response.status
             if response.status != 200:
-                error, reason = await helper_failure(response)
+                error, reason, step, body_kind = await helper_failure(response)
                 if on:
                     self._error = error
                     self._reason = reason
-                logger.info("Grok native presence on=%s status=%d error=%s", on, response.status, error)
+                    self._step = step
+                    self._body_kind = body_kind
+                logger.info(
+                    "Grok native presence on=%s status=%d error=%s step=%s body_kind=%s",
+                    on,
+                    response.status,
+                    error,
+                    step or "-",
+                    body_kind or "-",
+                )
                 if reason in {"login_rejected", "client_update_required"}:
                     raise RuntimeError(reason)
                 raise RuntimeError("native_presence_unavailable")
             self._reason = None
+            self._step = None
+            self._body_kind = None
             logger.info("Grok native presence on=%s status=%d", on, response.status)
             if on and not self._call_logged:
                 self._call_logged = True
@@ -204,6 +222,8 @@ class NativeVoiceChannel:
             "presence_status": self._presence_status,
             "error": None if ready else self._error,
             "reason": None if ready else self._reason,
+            "step": None if ready else self._step,
+            "body_kind": None if ready else self._body_kind,
         }
 
     async def start(self):
@@ -274,10 +294,12 @@ class NativeVoiceChannel:
             timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=60),
         ) as response:
             if response.status != 200:
-                self._error, self._reason = await helper_failure(response)
+                self._error, self._reason, self._step, self._body_kind = await helper_failure(response)
                 raise RuntimeError("native_events_unavailable")
             self._error = None
             self._reason = None
+            self._step = None
+            self._body_kind = None
             self._ready_mono = time.monotonic()
             self.connected.set()
             logger.info("Grok native channel state=ready")
