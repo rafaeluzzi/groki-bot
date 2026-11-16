@@ -24,11 +24,17 @@ logger = logging.getLogger(__name__)
 
 PODCAST_TOOL_NAME = "podcast_open_spotify"
 
+_QUIET = (
+    "Do not say anything before or after this tool. The Portal speaks the announce. "
+    "If you already started a sentence, stop."
+)
+
 _DESCRIPTION = (
     "Open a followed podcast in the Spotify app on the Portal. "
     "show is the show title, or number N. "
-    "N counts from the top of the Podcasts I follow panel. "
-    "That panel and the followed list are both A-to-Z by title, so number 1 is the first title in that order. "
+    "N counts A-to-Z by title, the same order as the followed list. "
+    "When you list followed shows or build a list panel, number the titles A-to-Z from the top "
+    "so number N matches this tool. "
     "Pass the words the user said when the title is unclear, including a misheard name. "
     "On a miss the result lists the numbered titles and tells you to call this tool once more "
     "with the closest-sounding title, or to ask which show and name 2 or 3 of them. "
@@ -36,6 +42,7 @@ _DESCRIPTION = (
     "A blank stored title is replaced by its feed title when that title can be read. "
     "A title that is still blank is last and has no number. "
     "A hit sends one type:podcast frame. The Portal says the announce line and opens Spotify. "
+    f"{_QUIET} "
     "If the result says the Portal already said it, do not repeat it. "
     "Do not open Spotify on the Mac, and do not call Mac media_control or open_app for this."
 )
@@ -43,10 +50,10 @@ _DESCRIPTION = (
 PODCAST_INSTRUCTIONS = (
     "A podcast play, open, or what's-new that did not match on the Portal is yours. "
     "Call podcast_open_spotify with show set to the title or to number N. "
-    "number N is the Nth show in the Podcasts I follow panel, which is A-to-Z by title, "
-    "the same order as the followed list. "
-    "When you show that panel, list the titles in that order from the top. "
+    "number N is the Nth titled show A-to-Z, the same order as the followed list. "
+    "When you list shows or build a panel, list titled shows A-to-Z and put a number on each row. "
     "Do not open Spotify on the Mac for a Portal podcast. "
+    f"{_QUIET} "
     "If the tool says the Portal already said the announce line, do not repeat it. "
     "If matched is false, call podcast_open_spotify once more with the closest-sounding title "
     "in call_again before you speak. If there is no single closest title, ask which show and "
@@ -221,10 +228,27 @@ def podcast_frame(body: dict) -> dict[str, Any] | None:
         "type": "podcast",
         "announce": str(body.get("announce") or ""),
     }
-    for key in ("openSpotifyUri", "openSpotifyUrl"):
+    for key in ("openSpotifyUri", "openSpotifyUrl", "showTitle"):
         value = body.get(key)
         if isinstance(value, str) and value:
             frame[key] = value
+    kind = body.get("openKind")
+    if kind in ("episode", "show"):
+        frame["openKind"] = kind
+    rss = body.get("rssEpisode")
+    if isinstance(rss, dict):
+        enclosure = rss.get("enclosureUrl")
+        if isinstance(enclosure, str) and enclosure:
+            frame["rssEpisode"] = {
+                "guid": str(rss.get("guid") or ""),
+                "title": str(rss.get("title") or ""),
+                "enclosureUrl": enclosure,
+                "showId": str(rss.get("showId") or ""),
+                "showTitle": str(rss.get("showTitle") or body.get("showTitle") or ""),
+            }
+            published = rss.get("published")
+            if isinstance(published, str) and published:
+                frame["rssEpisode"]["published"] = published
     return frame
 
 
@@ -233,13 +257,26 @@ def is_podcast_frame(frame: object) -> bool:
         return False
     if not isinstance(frame.get("announce"), str):
         return False
-    allowed = {"type", "announce", "openSpotifyUri", "openSpotifyUrl"}
+    allowed = {"type", "announce", "openSpotifyUri", "openSpotifyUrl", "openKind", "showTitle", "rssEpisode"}
     if any(key not in allowed for key in frame):
         return False
-    for key in ("openSpotifyUri", "openSpotifyUrl"):
+    for key in ("openSpotifyUri", "openSpotifyUrl", "showTitle"):
         value = frame.get(key)
         if value is not None and not isinstance(value, str):
             return False
+    kind = frame.get("openKind")
+    if kind is not None and kind not in ("episode", "show"):
+        return False
+    rss = frame.get("rssEpisode")
+    if rss is not None:
+        if not isinstance(rss, dict):
+            return False
+        if not isinstance(rss.get("enclosureUrl"), str) or not rss.get("enclosureUrl"):
+            return False
+        for key in ("guid", "title", "showId", "showTitle", "published"):
+            value = rss.get(key)
+            if value is not None and not isinstance(value, str):
+                return False
     return True
 
 
@@ -384,7 +421,7 @@ def _spoken_hit(frame: dict[str, Any]) -> dict[str, Any]:
         "announce": frame.get("announce") or "",
         "openSpotifyUri": frame.get("openSpotifyUri"),
         "spoken": True,
-        "note": "The Portal already said this. Do not repeat it.",
+        "note": f"{_QUIET} The Portal already said this. Do not repeat it.",
     }
 
 
