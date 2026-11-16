@@ -951,6 +951,7 @@ test('ensure_ok is logged only when the host or the field names change', async (
   assert.equal(logs[0].source, 'ensure');
   assert.equal(logs[0].state, 'ensure_ok');
   assert.equal(logs[0].target_host, 'pod.cursorvm.com');
+  assert.equal(logs[0].network_token_source, 'networkToken');
   assert.deepEqual(logs[0].response_fields, ['gatewayToken', 'gatewayUrl', 'networkToken']);
   client.invalidate();
   mode = 'fields';
@@ -962,7 +963,152 @@ test('ensure_ok is logged only when the host or the field names change', async (
   assert.deepEqual(logs[1].response_fields, ['extra', 'gatewayToken', 'gatewayUrl']);
   assert.equal(logs[1].target_host, 'pod.cursorvm.com');
   assert.equal(logs[2].target_host, 'other.cursorvm.com');
+  assert.equal(logs[1].network_token_source, 'none');
+  assert.equal(logs[2].network_token_source, 'none');
   assert.deepEqual(logs[2].response_fields, ['gatewayToken', 'gatewayUrl']);
   assert.equal(JSON.stringify(logs).includes('SECRET_TOKEN_VALUE'), false);
   assert.equal(JSON.stringify(logs).includes('SECRET_NET'), false);
+});
+
+test('the network token is networkToken, then gatewayHeaders, then gatewayPortToken', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const NET = 'NET_SECRET_9f3c';
+  const HDR = 'HDR_SECRET_9f3c';
+  const PORT = 'PORT_SECRET_9f3c';
+  const GATEWAY = 'GW_SECRET_9f3c';
+  const logs = [];
+  const sent = [];
+  let raw;
+  const client = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({authId: 'owner'}),
+    log: event => logs.push(event),
+    rpc: async () => raw,
+    fetcher: async (_url, options) => {
+      sent.push(options.headers['x-anyrun-network-token'] ?? null);
+      return {ok: true, status: 200, body: {cancel: async () => {}}};
+    },
+  });
+  const call = {agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false};
+  const base = {gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: GATEWAY};
+  raw = {...base, networkToken: NET, gatewayHeaders: {'x-anyrun-network-token': HDR}, gatewayPortToken: PORT};
+  await client.presence(call);
+  assert.equal(sent.at(-1), NET);
+  assert.equal(logs.at(-1).network_token_source, 'networkToken');
+  client.invalidate();
+  raw = {...base, networkToken: '', gatewayHeaders: {'x-anyrun-network-token': HDR}, gatewayPortToken: PORT};
+  await client.presence(call);
+  assert.equal(sent.at(-1), HDR);
+  assert.equal(logs.at(-1).network_token_source, 'gatewayHeaders');
+  client.invalidate();
+  raw = {...base, gatewayHeaders: {'x-anyrun-network-token': ''}, gatewayPortToken: PORT};
+  await client.presence(call);
+  assert.equal(sent.at(-1), PORT);
+  assert.equal(logs.at(-1).network_token_source, 'gatewayPortToken');
+  client.invalidate();
+  raw = {...base, networkToken: '', gatewayPortToken: ''};
+  await client.presence(call);
+  assert.equal(sent.at(-1), null);
+  assert.equal(logs.at(-1).state, 'ensure_ok');
+  assert.equal(logs.at(-1).network_token_source, 'none');
+  client.invalidate();
+  await client.presence(call);
+  assert.equal(logs.filter(event => event.network_token_source === 'none').length, 1);
+  const dumped = JSON.stringify(logs);
+  assert.equal(dumped.includes(NET), false);
+  assert.equal(dumped.includes(HDR), false);
+  assert.equal(dumped.includes(PORT), false);
+  assert.equal(dumped.includes(GATEWAY), false);
+});
+
+test('credentialsRefreshAfterSeconds drops the cached sandbox so the port token is read again', async () => {
+  const {NativeSandboxClient} = await import('./gbot_voice_session_bridge.mjs');
+  const timers = [];
+  const sent = [];
+  const logs = [];
+  let token = 'PORT_SECRET_OLD';
+  let refresh = 15;
+  let ensures = 0;
+  const client = new NativeSandboxClient({
+    connectMode: 'normal',
+    accountLoader: () => ({authId: 'owner'}),
+    log: event => logs.push(event),
+    schedule: (fn, ms) => { const handle = {fn, ms, cancelled: false}; timers.push(handle); return handle; },
+    cancelSchedule: handle => { handle.cancelled = true; },
+    rpc: async () => {
+      ensures++;
+      const body = {gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: 'GW_SECRET_9f3c', gatewayPortToken: token};
+      if (refresh !== null) body.credentialsRefreshAfterSeconds = refresh;
+      return body;
+    },
+    fetcher: async (_url, options) => {
+      sent.push(options.headers['x-anyrun-network-token'] ?? null);
+      return {ok: true, status: 200, body: {cancel: async () => {}}};
+    },
+  });
+  const call = {agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false};
+  await client.presence(call);
+  await client.presence(call);
+  assert.equal(ensures, 1);
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, 15000);
+  assert.equal(sent.at(-1), 'PORT_SECRET_OLD');
+  token = 'PORT_SECRET_NEW';
+  timers[0].fn();
+  await client.presence(call);
+  assert.equal(ensures, 2);
+  assert.equal(sent.at(-1), 'PORT_SECRET_NEW');
+  assert.equal(JSON.stringify(logs).includes('PORT_SECRET'), false);
+  assert.equal(JSON.stringify(logs).includes('GW_SECRET'), false);
+  client.invalidate();
+  assert.equal(timers.at(-1).cancelled, true);
+  for (const invalid of [0, -1, Number.NaN, '15', null]) {
+    client.invalidate();
+    refresh = invalid;
+    token = 'PORT_SECRET_IGNORED';
+    const beforeTimers = timers.length;
+    const beforeEnsures = ensures;
+    await client.presence(call);
+    await client.presence(call);
+    assert.equal(ensures, beforeEnsures + 1);
+    assert.equal(timers.length, beforeTimers);
+  }
+});
+
+test('a stored hang-up is forgotten only when the box itself 404s', async () => {
+  const {rememberCall} = await import('./gbot_voice_session_bridge.mjs');
+  const cases = [
+    {step: 'presence_hangup', body_kind: 'box_unknown_method', forget: true},
+    {step: 'presence_hangup', body_kind: 'other', forget: false},
+    {step: 'ensure_sandbox', body_kind: 'box_not_found', forget: false},
+    {step: 'ensure_sandbox', body_kind: 'other', forget: false},
+    {step: 'presence_hangup', body_kind: undefined, forget: false},
+  ];
+  for (const item of cases) {
+    const callStore = join(mkdtempSync(join(tmpdir(), 'koji-call-')), 'call.json');
+    rememberCall(callStore, {agentId: 'a', callId: 'call-old', acceptsOverheard: false});
+    const port = await freePort();
+    const server = createBridge({
+      port, agentId: 'a', desktopEnabled: true, callStore,
+      sandbox: {
+        callerAuthId: async () => 'owner',
+        presence: async body => {
+          if (!body.isOnTheLine) {
+            const error = new Error('upstream_http_404');
+            error.step = item.step;
+            error.target_host = 'pod.cursorvm.com';
+            if (item.body_kind) error.body_kind = item.body_kind;
+            throw error;
+          }
+          throw new Error('upstream_http_500');
+        },
+      },
+    });
+    await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+    try {
+      assert.equal((await pres(port, 'call-new', true)).status, 502);
+      assert.equal(existsSync(callStore), !item.forget);
+      if (!item.forget) assert.equal(JSON.parse(readFileSync(callStore, 'utf8')).callId, 'call-old');
+    } finally { await new Promise(resolve => server.close(resolve)); }
+  }
 });

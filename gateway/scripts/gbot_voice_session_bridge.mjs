@@ -277,6 +277,27 @@ export async function accountRpc(method, body, options = {}) {
   return (await accountRequest(method, body, options)).json();
 }
 
+const NETWORK_TOKEN_SOURCES = new Set(['networkToken', 'gatewayHeaders', 'gatewayPortToken', 'none']);
+
+function networkCredential(raw) {
+  if (typeof raw?.networkToken === 'string' && raw.networkToken) return {value: raw.networkToken, source: 'networkToken'};
+  const header = raw?.gatewayHeaders?.['x-anyrun-network-token'];
+  if (typeof header === 'string' && header) return {value: header, source: 'gatewayHeaders'};
+  if (typeof raw?.gatewayPortToken === 'string' && raw.gatewayPortToken) return {value: raw.gatewayPortToken, source: 'gatewayPortToken'};
+  return {value: '', source: 'none'};
+}
+
+function refreshDelayMs(seconds) {
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return null;
+  return Math.min(seconds * 1000, 2 ** 31 - 1);
+}
+
+function defaultSchedule(fn, ms) {
+  const timer = setTimeout(fn, ms);
+  timer.unref?.();
+  return timer;
+}
+
 export function validateSandboxUrl(raw) {
   const url = new URL(raw);
   const host = url.hostname.toLowerCase();
@@ -291,23 +312,47 @@ export class NativeSandboxClient {
   #log;
   #lastEnsure;
   #gatewayHost;
-  constructor({rpc = accountRpc, fetcher = fetch, accountLoader = loadAccount, connectMode = 'locate', log = null} = {}) {
+  #refreshTimer;
+  #schedule;
+  #cancelSchedule;
+  constructor({rpc = accountRpc, fetcher = fetch, accountLoader = loadAccount, connectMode = 'locate', log = null, schedule = defaultSchedule, cancelSchedule = clearTimeout} = {}) {
     if (!['locate', 'normal'].includes(connectMode)) throw new Error('invalid_connect_mode');
     this.connectMode = connectMode;
     this.rpc = rpc; this.fetcher = fetcher; this.accountLoader = accountLoader;
     this.#log = log;
+    this.#schedule = schedule;
+    this.#cancelSchedule = cancelSchedule;
   }
   attachLog(log) { this.#log = log; }
   gatewayHost() { return this.#gatewayHost ?? null; }
-  #noteEnsure(host, fields) {
+  #noteEnsure(host, fields, tokenSource) {
     const target = safeHost(host);
     const names = (Array.isArray(fields) ? fields : []).filter(name => typeof name === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(name));
+    const source = NETWORK_TOKEN_SOURCES.has(tokenSource) ? tokenSource : 'none';
     if (!target) return;
-    const signature = target + '\0' + names.join('\n');
+    const signature = target + '\0' + names.join('\n') + '\0' + source;
     if (this.#lastEnsure === signature) return;
     this.#lastEnsure = signature;
     if (typeof this.#log !== 'function') return;
-    this.#log({source: 'ensure', state: 'ensure_ok', target_host: target, response_fields: names});
+    this.#log({source: 'ensure', state: 'ensure_ok', target_host: target, response_fields: names, network_token_source: source});
+  }
+  #clearRefresh() {
+    if (this.#refreshTimer === undefined) return;
+    this.#cancelSchedule(this.#refreshTimer);
+    this.#refreshTimer = undefined;
+  }
+  #armRefresh(connection, seconds) {
+    this.#clearRefresh();
+    const ms = refreshDelayMs(seconds);
+    if (ms === null) return;
+    let handle;
+    const fire = () => {
+      if (this.#refreshTimer !== handle) return;
+      this.#refreshTimer = undefined;
+      this.#drop(connection);
+    };
+    handle = this.#schedule(fire, ms);
+    this.#refreshTimer = handle;
   }
   async #connect() {
     if (this.#connection) return this.#connection;
@@ -315,14 +360,15 @@ export class NativeSandboxClient {
       const account = this.accountLoader();
       const raw = await this.rpc('EnsureSandBox', this.connectMode === 'normal' ? {} : {wake: false, supportsAsleepBox: true}, {accountLoader: () => account, fetcher: this.fetcher});
       if (typeof raw.gatewayToken !== 'string' || !raw.gatewayToken) throw new Error('sandbox_connection_unavailable');
+      const credential = networkCredential(raw);
       const headers = {authorization: `Bearer ${raw.gatewayToken}`};
-      const network = raw.networkToken ?? raw.gatewayHeaders?.['x-anyrun-network-token'];
-      if (typeof network === 'string' && network) headers['x-anyrun-network-token'] = network;
+      if (credential.source !== 'none') headers['x-anyrun-network-token'] = credential.value;
       const responseFields = Object.keys(raw).sort();
       const baseUrl = validateSandboxUrl(raw.gatewayUrl);
       this.#connection = {baseUrl, headers, authId: account.authId, responseFields};
       this.#gatewayHost = hostnameOf(baseUrl);
-      this.#noteEnsure(this.#gatewayHost, responseFields);
+      this.#noteEnsure(this.#gatewayHost, responseFields, credential.source);
+      this.#armRefresh(this.#connection, raw.credentialsRefreshAfterSeconds);
       return this.#connection;
     })().finally(() => { this.#loading = undefined; });
     return this.#loading;
@@ -350,10 +396,12 @@ export class NativeSandboxClient {
     return response;
   }
   #drop(connection) {
-    if (this.#connection === connection) this.#connection = undefined;
+    if (this.#connection !== connection) return;
+    this.#connection = undefined;
+    this.#clearRefresh();
   }
   // The box stream died under us. Forget the URL so the next presence wakes a pod.
-  invalidate() { this.#connection = undefined; }
+  invalidate() { this.#connection = undefined; this.#clearRefresh(); }
   // Wake a hibernated pod. /health goes through #fetch, so a 417 still drops the
   // cache and runs EnsureSandBox. Do not open /events: a second stream makes the
   // pod close the one this process is already reading.
@@ -663,7 +711,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
   const logStream = (source, state, extra = {}) => nativeLog({source, state, at: new Date().toISOString(), ...extra});
   if (typeof sandbox.attachLog === 'function') {
     sandbox.attachLog(event => logStream(event.source, event.state, {
-      target_host: event.target_host, response_fields: event.response_fields,
+      target_host: event.target_host, response_fields: event.response_fields, network_token_source: event.network_token_source,
     }));
   }
   let activeCall = null;
@@ -875,9 +923,13 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
           } catch (error) {
             const failure = hangupFailure(error);
             logStream('presence', 'stale_hangup', failure.fields);
-            // A 404 means this stored call is gone. Stop retrying it. The live
-            // presence call below still has to succeed on its own.
-            if (failure.httpStatus === 404) forgetCall(callStore);
+            // Only a box 404 on the hang-up itself means Grok no longer has this
+            // call. An EnsureSandBox failure or an edge 404 (body_kind other)
+            // leaves the stored id, so a later attempt can still hang it up.
+            const boxGone = failure.httpStatus === 404
+              && failure.fields.step === 'presence_hangup'
+              && (failure.fields.body_kind === 'box_not_found' || failure.fields.body_kind === 'box_unknown_method');
+            if (boxGone) forgetCall(callStore);
           }
         }
         const authId = await sandbox.callerAuthId();
