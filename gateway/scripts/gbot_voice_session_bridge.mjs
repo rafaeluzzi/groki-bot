@@ -277,14 +277,18 @@ export async function accountRpc(method, body, options = {}) {
   return (await accountRequest(method, body, options)).json();
 }
 
-const NETWORK_TOKEN_SOURCES = new Set(['networkToken', 'gatewayHeaders', 'gatewayPortToken', 'none']);
+const PORT_HEADERS = new Set(['network_token', 'gateway_port_token', 'none']);
 
-function networkCredential(raw) {
-  if (typeof raw?.networkToken === 'string' && raw.networkToken) return {value: raw.networkToken, source: 'networkToken'};
-  const header = raw?.gatewayHeaders?.['x-anyrun-network-token'];
-  if (typeof header === 'string' && header) return {value: header, source: 'gatewayHeaders'};
-  if (typeof raw?.gatewayPortToken === 'string' && raw.gatewayPortToken) return {value: raw.gatewayPortToken, source: 'gatewayPortToken'};
-  return {value: '', source: 'none'};
+// A non-empty networkToken is the legacy header. The current EnsureSandBox
+// response leaves that empty and sends gatewayPortToken on a different header.
+function sandboxPortHeader(raw) {
+  if (typeof raw?.networkToken === 'string' && raw.networkToken) {
+    return {name: 'x-anyrun-network-token', value: raw.networkToken, port_header: 'network_token'};
+  }
+  if (typeof raw?.gatewayPortToken === 'string' && raw.gatewayPortToken) {
+    return {name: 'x-anyrun-port-token', value: raw.gatewayPortToken, port_header: 'gateway_port_token'};
+  }
+  return {name: '', value: '', port_header: 'none'};
 }
 
 function refreshDelayMs(seconds) {
@@ -328,13 +332,13 @@ export class NativeSandboxClient {
   #noteEnsure(host, fields, tokenSource) {
     const target = safeHost(host);
     const names = (Array.isArray(fields) ? fields : []).filter(name => typeof name === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(name));
-    const source = NETWORK_TOKEN_SOURCES.has(tokenSource) ? tokenSource : 'none';
+    const portHeader = PORT_HEADERS.has(tokenSource) ? tokenSource : 'none';
     if (!target) return;
-    const signature = target + '\0' + names.join('\n') + '\0' + source;
+    const signature = target + '\0' + names.join('\n') + '\0' + portHeader;
     if (this.#lastEnsure === signature) return;
     this.#lastEnsure = signature;
     if (typeof this.#log !== 'function') return;
-    this.#log({source: 'ensure', state: 'ensure_ok', target_host: target, response_fields: names, network_token_source: source});
+    this.#log({source: 'ensure', state: 'ensure_ok', target_host: target, response_fields: names, port_header: portHeader});
   }
   #clearRefresh() {
     if (this.#refreshTimer === undefined) return;
@@ -360,14 +364,18 @@ export class NativeSandboxClient {
       const account = this.accountLoader();
       const raw = await this.rpc('EnsureSandBox', this.connectMode === 'normal' ? {} : {wake: false, supportsAsleepBox: true}, {accountLoader: () => account, fetcher: this.fetcher});
       if (typeof raw.gatewayToken !== 'string' || !raw.gatewayToken) throw new Error('sandbox_connection_unavailable');
-      const credential = networkCredential(raw);
+      const port = sandboxPortHeader(raw);
+      // authorization stays the gateway token. TODO: if presence still 404s, the
+      // app's next step is an account-token wrap for this gateway base URL: set
+      // authorization to "<scheme> <accountAccessToken>" and move gatewayToken
+      // into x-sand-gateway-token, refreshing before the access token expires.
       const headers = {authorization: `Bearer ${raw.gatewayToken}`};
-      if (credential.source !== 'none') headers['x-anyrun-network-token'] = credential.value;
+      if (port.port_header !== 'none') headers[port.name] = port.value;
       const responseFields = Object.keys(raw).sort();
       const baseUrl = validateSandboxUrl(raw.gatewayUrl);
       this.#connection = {baseUrl, headers, authId: account.authId, responseFields};
       this.#gatewayHost = hostnameOf(baseUrl);
-      this.#noteEnsure(this.#gatewayHost, responseFields, credential.source);
+      this.#noteEnsure(this.#gatewayHost, responseFields, port.port_header);
       this.#armRefresh(this.#connection, raw.credentialsRefreshAfterSeconds);
       return this.#connection;
     })().finally(() => { this.#loading = undefined; });
@@ -711,7 +719,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
   const logStream = (source, state, extra = {}) => nativeLog({source, state, at: new Date().toISOString(), ...extra});
   if (typeof sandbox.attachLog === 'function') {
     sandbox.attachLog(event => logStream(event.source, event.state, {
-      target_host: event.target_host, response_fields: event.response_fields, network_token_source: event.network_token_source,
+      target_host: event.target_host, response_fields: event.response_fields, port_header: event.port_header,
     }));
   }
   let activeCall = null;
