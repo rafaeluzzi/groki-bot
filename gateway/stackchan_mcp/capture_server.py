@@ -155,18 +155,21 @@ def _native_health(health: dict) -> dict:
     if type(status) is not int:
         status = None
     ready = native.get("ready") is True and native.get("state") == "ready"
-    error = native.get("error")
-    if ready or not isinstance(error, str) or not NATIVE_ERROR_RE.fullmatch(error):
-        error = None
-    reason = native.get("reason")
-    if ready or not isinstance(reason, str) or not NATIVE_ERROR_RE.fullmatch(reason):
-        reason = None
+
+    def word(key):
+        value = native.get(key)
+        if ready or not isinstance(value, str) or not NATIVE_ERROR_RE.fullmatch(value):
+            return None
+        return value
+
     return {
         "state": "ready" if ready else "unavailable",
         "ready": ready,
         "presence_status": status,
-        "error": error,
-        "reason": reason,
+        "error": word("error"),
+        "reason": word("reason"),
+        "step": word("step"),
+        "body_kind": word("body_kind"),
     }
 
 
