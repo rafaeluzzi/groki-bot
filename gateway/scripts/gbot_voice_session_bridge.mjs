@@ -6,11 +6,11 @@
  * The account RPC rejects a client version older than the installed app.
  * Internal APIs are version dependent; expired sessions must be renewed in the app.
  */
-import { readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { pbkdf2Sync, createDecipheriv, randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createServer } from 'node:http';
 
@@ -278,6 +278,8 @@ export async function accountRpc(method, body, options = {}) {
 }
 
 const PORT_HEADERS = new Set(['network_token', 'gateway_port_token', 'none']);
+const FIELD_NAME_RE = /^[A-Za-z0-9_]{1,64}$/;
+const DRIFT_STEPS = new Set(['presence', 'presence_hangup', 'box_stream', 'typed_stream']);
 
 // A non-empty networkToken is the legacy header. The current EnsureSandBox
 // response leaves that empty and sends gatewayPortToken on a different header.
@@ -294,6 +296,57 @@ function sandboxPortHeader(raw) {
 function refreshDelayMs(seconds) {
   if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) return null;
   return Math.min(seconds * 1000, 2 ** 31 - 1);
+}
+
+// Names only. A token, header, or gateway URL must never land in this file or the diff log.
+function safeFieldNames(fields) {
+  if (!Array.isArray(fields)) return null;
+  const names = [];
+  for (const name of fields) {
+    if (typeof name !== 'string' || !FIELD_NAME_RE.test(name)) return null;
+    names.push(name);
+  }
+  return names.sort();
+}
+
+function diffFieldNames(baseline, current) {
+  const previous = new Set(baseline);
+  const next = new Set(current);
+  return {
+    added: current.filter(name => !previous.has(name)),
+    removed: baseline.filter(name => !next.has(name)),
+  };
+}
+
+function readEnsureBaseline(path) {
+  if (!path) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(path, 'utf8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const fields = safeFieldNames(parsed.fields);
+    if (!fields || !PORT_HEADERS.has(parsed.port_header)) return null;
+    return {fields, port_header: parsed.port_header};
+  } catch {
+    return null;
+  }
+}
+
+function writeEnsureBaseline(path, record) {
+  const dir = dirname(path);
+  mkdirSync(dir, {recursive: true});
+  const tmp = join(dir, `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
+  writeFileSync(tmp, JSON.stringify({
+    fields: record.fields,
+    recorded_at: new Date().toISOString(),
+    port_header: record.port_header,
+  }), {mode: 0o600});
+  try {
+    renameSync(tmp, path);
+    chmodSync(path, 0o600);
+  } catch (error) {
+    try { unlinkSync(tmp); } catch { /* the temp file is already gone */ }
+    throw error;
+  }
 }
 
 function defaultSchedule(fn, ms) {
@@ -319,26 +372,73 @@ export class NativeSandboxClient {
   #refreshTimer;
   #schedule;
   #cancelSchedule;
-  constructor({rpc = accountRpc, fetcher = fetch, accountLoader = loadAccount, connectMode = 'locate', log = null, schedule = defaultSchedule, cancelSchedule = clearTimeout} = {}) {
+  #ensureFieldsPath;
+  #baselineLoaded = false;
+  #baseline = null;
+  #lastDiff;
+  #shape;
+  constructor({rpc = accountRpc, fetcher = fetch, accountLoader = loadAccount, connectMode = 'locate', log = null, schedule = defaultSchedule, cancelSchedule = clearTimeout, ensureFieldsPath = null} = {}) {
     if (!['locate', 'normal'].includes(connectMode)) throw new Error('invalid_connect_mode');
     this.connectMode = connectMode;
     this.rpc = rpc; this.fetcher = fetcher; this.accountLoader = accountLoader;
     this.#log = log;
     this.#schedule = schedule;
     this.#cancelSchedule = cancelSchedule;
+    this.#ensureFieldsPath = ensureFieldsPath;
   }
   attachLog(log) { this.#log = log; }
   gatewayHost() { return this.#gatewayHost ?? null; }
+  // Missing, unreadable, or not a list of field names: no baseline, so nothing is called a change.
+  #readBaseline() {
+    if (this.#baselineLoaded) return this.#baseline;
+    this.#baselineLoaded = true;
+    this.#baseline = readEnsureBaseline(this.#ensureFieldsPath);
+    return this.#baseline;
+  }
   #noteEnsure(host, fields, tokenSource) {
     const target = safeHost(host);
-    const names = (Array.isArray(fields) ? fields : []).filter(name => typeof name === 'string' && /^[A-Za-z0-9_]{1,64}$/.test(name));
+    const names = (Array.isArray(fields) ? fields : []).filter(name => typeof name === 'string' && FIELD_NAME_RE.test(name));
     const portHeader = PORT_HEADERS.has(tokenSource) ? tokenSource : 'none';
+    this.#shape = {fields: names, port_header: portHeader};
     if (!target) return;
     const signature = target + '\0' + names.join('\n') + '\0' + portHeader;
     if (this.#lastEnsure === signature) return;
     this.#lastEnsure = signature;
+    if (typeof this.#log === 'function') {
+      this.#log({source: 'ensure', state: 'ensure_ok', target_host: target, response_fields: names, port_header: portHeader});
+    }
+    this.#noteFieldDrift(names, portHeader);
+  }
+  #noteFieldDrift(names, portHeader) {
+    const baseline = this.#readBaseline();
+    if (!baseline) return;
+    const {added, removed} = diffFieldNames(baseline.fields, names);
+    if (added.length === 0 && removed.length === 0) {
+      this.#lastDiff = undefined;
+      return;
+    }
+    const signature = added.join('\n') + '\0' + removed.join('\n') + '\0' + portHeader;
+    if (this.#lastDiff === signature) return;
+    this.#lastDiff = signature;
     if (typeof this.#log !== 'function') return;
-    this.#log({source: 'ensure', state: 'ensure_ok', target_host: target, response_fields: names, port_header: portHeader});
+    this.#log({source: 'ensure', state: 'fields_changed', added, removed, port_header: portHeader});
+  }
+  // True when this connection's field names differ from the last call_start list.
+  fieldsChanged() {
+    const baseline = this.#readBaseline();
+    if (!baseline || !this.#shape) return false;
+    const {added, removed} = diffFieldNames(baseline.fields, this.#shape.fields);
+    return added.length > 0 || removed.length > 0;
+  }
+  // Known good is the list that was followed by call_start on this connection.
+  recordKnownGood() {
+    if (!this.#ensureFieldsPath || !this.#shape) return;
+    const record = {fields: this.#shape.fields, port_header: this.#shape.port_header};
+    try { writeEnsureBaseline(this.#ensureFieldsPath, record); }
+    catch { return; }
+    this.#baseline = {fields: record.fields.slice(), port_header: record.port_header};
+    this.#baselineLoaded = true;
+    this.#lastDiff = undefined;
   }
   #clearRefresh() {
     if (this.#refreshTimer === undefined) return;
@@ -668,6 +768,25 @@ function streamFailure(error, where, defaults = {}) {
   return failure;
 }
 
+function markFieldsChanged(sandbox, failure) {
+  if (!failure || typeof failure !== 'object') return failure;
+  const status = failure.http_status;
+  if (typeof status !== 'number' || status < 400 || status > 599) return failure;
+  if (!DRIFT_STEPS.has(failure.step)) return failure;
+  if (sandbox?.fieldsChanged?.()) failure.fields_changed = true;
+  return failure;
+}
+
+function ensureLogExtra(event) {
+  const extra = {};
+  if (typeof event.target_host === 'string') extra.target_host = event.target_host;
+  if (Array.isArray(event.response_fields)) extra.response_fields = event.response_fields;
+  if (typeof event.port_header === 'string') extra.port_header = event.port_header;
+  if (Array.isArray(event.added)) extra.added = event.added;
+  if (Array.isArray(event.removed)) extra.removed = event.removed;
+  return extra;
+}
+
 function hangupFailure(error) {
   const status = /^upstream_http_(\d{3})$/.exec(String(error?.message ?? ''));
   const httpStatus = status ? Number(status[1]) : null;
@@ -714,13 +833,11 @@ function waitForNativeRetry(milliseconds, signal) {
   });
 }
 
-export function createBridge({ port = 18771, rpc = accountRpc, agentId = process.env.STACKCHAN_GBOT_VOICE_BOT_ID || process.env.STACKCHAN_GBOT_VOICE_AGENT_ID || process.env.STACKCHAN_TOOL_BOT_ID, toolsEnabled = process.env.STACKCHAN_GBOT_VOICE_TOOLS === '1', desktopEnabled = Boolean(process.env.STACKCHAN_TOOL_BOT?.trim()) || process.env.STACKCHAN_GBOT_VOICE_DESKTOP === '1', sandbox = new NativeSandboxClient({connectMode: 'normal'}), transcript = new NativeTranscriptClient(), nativeRetryDelayMs = 5000, nativeLog = event => console.log(JSON.stringify({event: 'gbot_native_stream', ...event})), sessionId = process.env.STACKCHAN_GBOT_VOICE_SESSION_ID || '', callStore = null } = {}) {
+export function createBridge({ port = 18771, rpc = accountRpc, agentId = process.env.STACKCHAN_GBOT_VOICE_BOT_ID || process.env.STACKCHAN_GBOT_VOICE_AGENT_ID || process.env.STACKCHAN_TOOL_BOT_ID, toolsEnabled = process.env.STACKCHAN_GBOT_VOICE_TOOLS === '1', desktopEnabled = Boolean(process.env.STACKCHAN_TOOL_BOT?.trim()) || process.env.STACKCHAN_GBOT_VOICE_DESKTOP === '1', ensureFieldsPath = null, sandbox = new NativeSandboxClient({connectMode: 'normal', ensureFieldsPath}), transcript = new NativeTranscriptClient(), nativeRetryDelayMs = 5000, nativeLog = event => console.log(JSON.stringify({event: 'gbot_native_stream', ...event})), sessionId = process.env.STACKCHAN_GBOT_VOICE_SESSION_ID || '', callStore = null } = {}) {
   if (!Number.isFinite(nativeRetryDelayMs) || nativeRetryDelayMs < 10 || nativeRetryDelayMs > 30000) throw new Error('invalid_native_retry_delay');
   const logStream = (source, state, extra = {}) => nativeLog({source, state, at: new Date().toISOString(), ...extra});
   if (typeof sandbox.attachLog === 'function') {
-    sandbox.attachLog(event => logStream(event.source, event.state, {
-      target_host: event.target_host, response_fields: event.response_fields, port_header: event.port_header,
-    }));
+    sandbox.attachLog(event => logStream(event.source, event.state, ensureLogExtra(event)));
   }
   let activeCall = null;
   let presenceBusy = false;
@@ -736,7 +853,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       logStream('presence', 'shutdown_hangup', {http_status: 200, error_class: null});
       forgetCall(callStore);
     } catch (error) {
-      logStream('presence', 'shutdown_hangup', streamFailure(error, 'gbot_voice_session_bridge.mjs:shutdown', {step: 'presence_hangup', target_host: error?.target_host}));
+      logStream('presence', 'shutdown_hangup', markFieldsChanged(sandbox, streamFailure(error, 'gbot_voice_session_bridge.mjs:shutdown', {step: 'presence_hangup', target_host: error?.target_host})));
     }
   };
   const server = createServer(async (req, res) => {
@@ -801,7 +918,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
                 controller.abort();
                 break;
               }
-              logStream('typed', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:typed', {step: 'typed_stream', target_host: error?.target_host || BACKEND_HOST}));
+              logStream('typed', 'error', markFieldsChanged(sandbox, streamFailure(error, 'gbot_voice_session_bridge.mjs:typed', {step: 'typed_stream', target_host: error?.target_host || BACKEND_HOST})));
               // A routine socket close is the same clock as the box stream. Don't sit on the 5s timer.
               if (isRoutineStreamEnd(error)) {
                 await waitForNativeRetry(0, controller.signal);
@@ -859,7 +976,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
         if (!controller.signal.aborted) logStream('box', 'eof', {http_status: null, error_class: null});
       } catch (error) {
         if (!controller.signal.aborted) {
-          logStream('box', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:box', {step: 'box_stream', target_host: error?.target_host || sandbox.gatewayHost?.()}));
+          logStream('box', 'error', markFieldsChanged(sandbox, streamFailure(error, 'gbot_voice_session_bridge.mjs:box', {step: 'box_stream', target_host: error?.target_host || sandbox.gatewayHost?.()})));
           // undici raises TypeError "terminated" / UND_ERR_SOCKET when the pod closes
           // the SSE socket on its clock. The cached sandbox is still the right one.
           // 417 and the other stale statuses still re-ensure inside #fetch.
@@ -930,7 +1047,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
             logStream('presence', 'stale_hangup', {http_status: 200, error_class: null, step: 'presence_hangup'});
           } catch (error) {
             const failure = hangupFailure(error);
-            logStream('presence', 'stale_hangup', failure.fields);
+            logStream('presence', 'stale_hangup', markFieldsChanged(sandbox, failure.fields));
             // Only a box 404 on the hang-up itself means Grok no longer has this
             // call. An EnsureSandBox failure or an edge 404 (body_kind other)
             // leaves the stored id, so a later attempt can still hang it up.
@@ -946,6 +1063,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
           if (!activeCall) {
             activeCall = {agentId, callId: body.callId, acceptsOverheard: body.acceptsOverheard, sessionId, authId, sinceMs: Date.now(), seen: new Set()};
             logStream('presence', 'call_start', {call_id: body.callId});
+            sandbox.recordKnownGood?.();
           } else activeCall.acceptsOverheard = body.acceptsOverheard;
           rememberCall(callStore, activeCall);
         } else {
@@ -971,7 +1089,7 @@ export function createBridge({ port = 18771, rpc = accountRpc, agentId = process
       if (ACCOUNT_FAILURE_REASONS.has(error?.reason)) payload.reason = error.reason;
       if (STEPS.has(error?.step)) payload.step = error.step;
       if (BODY_KINDS.has(error?.body_kind)) payload.body_kind = error.body_kind;
-      if (nativePresence) logStream('presence', 'error', streamFailure(error, 'gbot_voice_session_bridge.mjs:presence', {step: 'presence', target_host: error?.target_host}));
+      if (nativePresence) logStream('presence', 'error', markFieldsChanged(sandbox, streamFailure(error, 'gbot_voice_session_bridge.mjs:presence', {step: 'presence', target_host: error?.target_host})));
       return send(502, payload);
     }
   });
@@ -983,7 +1101,8 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
   const port = Number(process.env.GBOT_VOICE_BRIDGE_PORT || 18771);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) throw new Error('invalid_port');
   const callStore = join(homedir(), 'Library', 'Logs', 'groki-native-call.json');
-  const server = createBridge({ port, callStore });
+  const ensureFieldsPath = join(homedir(), 'Library', 'Logs', 'groki-native-ensure-fields.json');
+  const server = createBridge({ port, callStore, ensureFieldsPath });
   server.requestTimeout = 25000;
   let shuttingDown = false;
   const shutdown = () => {

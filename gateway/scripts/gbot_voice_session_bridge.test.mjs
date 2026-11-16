@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createBridge, accountRpc, createEnsureBackoff, createInstalledClientVersion, filterNativeEvent, parseClientVersion, validateBody, isRoutineStreamEnd } from './gbot_voice_session_bridge.mjs';
+import { createBridge, accountRpc, createEnsureBackoff, createInstalledClientVersion, filterNativeEvent, parseClientVersion, validateBody, isRoutineStreamEnd, NativeSandboxClient } from './gbot_voice_session_bridge.mjs';
 import { createServer } from 'node:net';
 import { request } from 'node:http';
-import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -1113,4 +1113,374 @@ test('a stored hang-up is forgotten only when the box itself 404s', async () => 
       if (!item.forget) assert.equal(JSON.parse(readFileSync(callStore, 'utf8')).callId, 'call-old');
     } finally { await new Promise(resolve => server.close(resolve)); }
   }
+});
+
+const FIELD_SECRET = 'GW_SECRET_watch_9f3c';
+const FIELD_PORT_SECRET = 'PORT_SECRET_watch_9f3c';
+
+function fieldsPath(dir) {
+  return join(dir, 'groki-native-ensure-fields.json');
+}
+
+function seedFields(path, fields, portHeader = 'none') {
+  writeFileSync(path, JSON.stringify({fields, recorded_at: '2026-11-16T00:00:00.000Z', port_header: portHeader}));
+}
+
+function httpStatus(status) {
+  return {ok: status >= 200 && status < 300, status, body: {cancel: async () => {}}};
+}
+
+function postPresence(port, callId, isOnTheLine = true) {
+  return fetch(`http://127.0.0.1:${port}/native/presence`, {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({agentId: 'a', callId, isOnTheLine, acceptsOverheard: false}),
+  });
+}
+
+function assertNoSecrets(text) {
+  assert.equal(text.includes(FIELD_SECRET), false);
+  assert.equal(text.includes(FIELD_PORT_SECRET), false);
+  assert.equal(text.includes('https://'), false);
+}
+
+test('a missing field baseline logs no diff, and the first call_start writes it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const path = fieldsPath(dir);
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: path,
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async () => ({gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET, networkToken: 'NET_SECRET_watch'}),
+    fetcher: async () => httpStatus(200),
+  });
+  const port = await freePort();
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox,
+    nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await postPresence(port, 'call-c')).status, 200);
+    assert.equal(logs.some(event => event.state === 'fields_changed'), false);
+    assert.ok(logs.some(event => event.state === 'call_start' && event.call_id === 'call-c'));
+    const saved = JSON.parse(readFileSync(path, 'utf8'));
+    assert.deepEqual(saved.fields, ['gatewayToken', 'gatewayUrl', 'networkToken']);
+    assert.equal(saved.port_header, 'network_token');
+    assert.match(saved.recorded_at, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.equal(readdirSync(dir).some(name => name.includes('.tmp')), false);
+    const text = readFileSync(path, 'utf8');
+    assertNoSecrets(text);
+    assert.equal(text.includes('NET_SECRET_watch'), false);
+    assert.equal(text.includes('pod.cursorvm.com'), false);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('identical EnsureSandBox fields log no diff and do not mark the error', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const path = fieldsPath(dir);
+  seedFields(path, ['gatewayToken', 'gatewayUrl'], 'none');
+  const before = readFileSync(path, 'utf8');
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: path,
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async () => ({gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET}),
+    fetcher: async () => httpStatus(404),
+  });
+  const port = await freePort();
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox,
+    nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await postPresence(port, 'call-c')).status, 502);
+    assert.equal(logs.some(event => event.state === 'fields_changed'), false);
+    const error = logs.find(event => event.source === 'presence' && event.state === 'error');
+    assert.equal(error.http_status, 404);
+    assert.equal(error.step, 'presence');
+    assert.equal(error.fields_changed, undefined);
+    assert.equal(readFileSync(path, 'utf8'), before);
+    assertNoSecrets(JSON.stringify(logs));
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('an added EnsureSandBox field is logged and marks the presence error', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const path = fieldsPath(dir);
+  seedFields(path, ['gatewayPortToken', 'gatewayToken', 'gatewayUrl'], 'gateway_port_token');
+  const before = readFileSync(path, 'utf8');
+  let failEnsure = false;
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: path,
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async () => {
+      if (failEnsure) throw Object.assign(new Error('upstream_http_404'), {step: 'ensure_sandbox', target_host: 'api2.cursor.sh'});
+      return {gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET, gatewayPortToken: FIELD_PORT_SECRET, extra: true};
+    },
+    fetcher: async () => httpStatus(404),
+  });
+  const port = await freePort();
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox,
+    nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await postPresence(port, 'call-c')).status, 502);
+    const diffs = logs.filter(event => event.state === 'fields_changed');
+    assert.equal(diffs.length, 1);
+    assert.equal(diffs[0].source, 'ensure');
+    assert.deepEqual(diffs[0].added, ['extra']);
+    assert.deepEqual(diffs[0].removed, []);
+    assert.equal(diffs[0].port_header, 'gateway_port_token');
+    const error = logs.find(event => event.source === 'presence' && event.state === 'error');
+    assert.equal(error.fields_changed, true);
+    assert.equal(error.step, 'presence');
+    assert.equal(readFileSync(path, 'utf8'), before);
+    failEnsure = true;
+    sandbox.invalidate();
+    assert.equal((await postPresence(port, 'call-c')).status, 502);
+    const ensureError = logs.filter(event => event.source === 'presence' && event.state === 'error').at(-1);
+    assert.equal(ensureError.step, 'ensure_sandbox');
+    assert.equal(ensureError.fields_changed, undefined);
+    assert.equal(logs.filter(event => event.state === 'fields_changed').length, 1);
+    assertNoSecrets(JSON.stringify(logs));
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('a removed EnsureSandBox field is logged', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const path = fieldsPath(dir);
+  seedFields(path, ['extra', 'gatewayToken', 'gatewayUrl', 'networkToken'], 'network_token');
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: path,
+    accountLoader: () => ({authId: 'owner'}),
+    log: event => logs.push(event),
+    rpc: async () => ({gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET}),
+    fetcher: async () => httpStatus(200),
+  });
+  await sandbox.presence({agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false});
+  const diffs = logs.filter(event => event.state === 'fields_changed');
+  assert.equal(diffs.length, 1);
+  assert.deepEqual(diffs[0].added, []);
+  assert.deepEqual(diffs[0].removed, ['extra', 'networkToken']);
+  assert.equal(diffs[0].port_header, 'none');
+  assert.equal(existsSync(path), true);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).recorded_at, '2026-11-16T00:00:00.000Z');
+  assertNoSecrets(JSON.stringify(logs));
+});
+
+test('the same field diff is logged once across a retry that changes host', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const path = fieldsPath(dir);
+  seedFields(path, ['gatewayToken', 'gatewayUrl'], 'none');
+  let ensures = 0;
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: path,
+    accountLoader: () => ({authId: 'owner'}),
+    log: event => logs.push(event),
+    rpc: async () => {
+      ensures++;
+      const host = ensures === 1 ? 'pod.cursorvm.com' : 'other.cursorvm.com';
+      return {gatewayUrl: `https://${host}`, gatewayToken: FIELD_SECRET, extra: true};
+    },
+    fetcher: async () => httpStatus(404),
+  });
+  await assert.rejects(
+    sandbox.presence({agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false}),
+    error => error.message === 'upstream_http_404',
+  );
+  assert.equal(ensures, 2);
+  assert.equal(logs.filter(event => event.state === 'ensure_ok').length, 2);
+  const diffs = logs.filter(event => event.state === 'fields_changed');
+  assert.equal(diffs.length, 1);
+  assert.deepEqual(diffs[0].added, ['extra']);
+  assert.deepEqual(diffs[0].removed, []);
+  sandbox.invalidate();
+  ensures = 0;
+  await assert.rejects(
+    sandbox.presence({agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false}),
+    error => error.message === 'upstream_http_404',
+  );
+  assert.equal(logs.filter(event => event.state === 'fields_changed').length, 1);
+});
+
+test('the field baseline is written on call_start and not on a later presence', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const path = fieldsPath(dir);
+  seedFields(path, ['gatewayPortToken', 'gatewayToken', 'gatewayUrl'], 'gateway_port_token');
+  let status = 404;
+  let extra = true;
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: path,
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async () => {
+      const body = {gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET, gatewayPortToken: FIELD_PORT_SECRET};
+      if (extra) body.extra = true;
+      return body;
+    },
+    fetcher: async () => httpStatus(status),
+  });
+  const port = await freePort();
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox,
+    nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await postPresence(port, 'call-c')).status, 502);
+    assert.equal(JSON.parse(readFileSync(path, 'utf8')).recorded_at, '2026-11-16T00:00:00.000Z');
+    status = 200;
+    assert.equal((await postPresence(port, 'call-c')).status, 200);
+    assert.ok(logs.some(event => event.state === 'call_start'));
+    const saved = readFileSync(path, 'utf8');
+    const parsed = JSON.parse(saved);
+    assert.deepEqual(parsed.fields, ['extra', 'gatewayPortToken', 'gatewayToken', 'gatewayUrl']);
+    assert.equal(parsed.port_header, 'gateway_port_token');
+    assert.notEqual(parsed.recorded_at, '2026-11-16T00:00:00.000Z');
+    assert.equal(statSync(path).mode & 0o777, 0o600);
+    assertNoSecrets(saved);
+    extra = false;
+    sandbox.invalidate();
+    assert.equal((await postPresence(port, 'call-c')).status, 200);
+    assert.equal(readFileSync(path, 'utf8'), saved);
+    assert.equal(logs.filter(event => event.state === 'call_start').length, 1);
+    const removed = logs.filter(event => event.state === 'fields_changed' && event.removed.includes('extra'));
+    assert.equal(removed.length, 1);
+    extra = true;
+    sandbox.invalidate();
+    assert.equal((await postPresence(port, 'call-c')).status, 200);
+    assert.equal(readFileSync(path, 'utf8'), saved);
+    assert.equal(logs.filter(event => event.state === 'fields_changed' && event.removed.length === 0 && event.added.length === 0).length, 0);
+    extra = false;
+    sandbox.invalidate();
+    assert.equal((await postPresence(port, 'call-c')).status, 200);
+    assert.equal(readFileSync(path, 'utf8'), saved);
+    assert.equal(logs.filter(event => event.state === 'fields_changed' && event.removed.includes('extra')).length, 2);
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('a corrupted field baseline is no baseline until call_start replaces it', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const broken = fieldsPath(dir);
+  writeFileSync(broken, '{');
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: broken,
+    accountLoader: () => ({authId: 'owner'}),
+    log: event => logs.push(event),
+    rpc: async () => ({gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET, extra: true}),
+    fetcher: async () => httpStatus(200),
+  });
+  await sandbox.presence({agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false});
+  assert.equal(logs.some(event => event.state === 'fields_changed'), false);
+  assert.equal(readFileSync(broken, 'utf8'), '{');
+
+  const badName = join(dir, 'bad.json');
+  writeFileSync(badName, JSON.stringify({fields: ['gatewayToken', 'not a name'], port_header: 'none'}));
+  const badLogs = [];
+  const bad = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: badName,
+    accountLoader: () => ({authId: 'owner'}),
+    log: event => badLogs.push(event),
+    rpc: async () => ({gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET, extra: true}),
+    fetcher: async () => httpStatus(200),
+  });
+  await bad.presence({agentId: 'a', callId: 'c', isOnTheLine: true, acceptsOverheard: false});
+  assert.equal(badLogs.some(event => event.state === 'fields_changed'), false);
+  assert.equal(JSON.parse(readFileSync(badName, 'utf8')).fields[1], 'not a name');
+
+  const port = await freePort();
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox,
+    nativeLog: event => logs.push(event),
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await postPresence(port, 'call-c')).status, 200);
+    assert.equal(logs.some(event => event.state === 'fields_changed'), false);
+    const saved = JSON.parse(readFileSync(broken, 'utf8'));
+    assert.deepEqual(saved.fields, ['extra', 'gatewayToken', 'gatewayUrl']);
+    assert.equal(saved.port_header, 'none');
+    assert.equal(statSync(broken).mode & 0o777, 0o600);
+    assertNoSecrets(readFileSync(broken, 'utf8'));
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+test('a drifted field list marks box and typed HTTP failures', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'koji-fields-'));
+  const path = fieldsPath(dir);
+  seedFields(path, ['gatewayToken', 'gatewayUrl'], 'none');
+  let shape = 'same';
+  let eventsStatus = 500;
+  const logs = [];
+  const sandbox = new NativeSandboxClient({
+    connectMode: 'normal',
+    ensureFieldsPath: path,
+    accountLoader: () => ({authId: 'owner'}),
+    rpc: async () => {
+      const body = {gatewayUrl: 'https://pod.cursorvm.com', gatewayToken: FIELD_SECRET};
+      if (shape === 'drift') body.extra = true;
+      return body;
+    },
+    fetcher: async (url) => {
+      if (String(url).endsWith('/events')) {
+        if (eventsStatus !== 200) return httpStatus(eventsStatus);
+        return {
+          ok: true, status: 200,
+          headers: {get: name => String(name).toLowerCase() === 'content-type' ? 'text/event-stream' : null},
+          body: {getReader: () => ({
+            read: async () => {
+              await new Promise(resolve => setTimeout(resolve, 80));
+              return {done: true};
+            },
+            releaseLock() {},
+            cancel: async () => {},
+          })},
+        };
+      }
+      return httpStatus(200);
+    },
+  });
+  const port = await freePort();
+  const server = createBridge({
+    port, agentId: 'a', desktopEnabled: true, sandbox,
+    nativeLog: event => logs.push(event),
+    nativeRetryDelayMs: 10,
+    transcript: {async *events() { throw new Error('upstream_http_500'); }},
+  });
+  await new Promise(resolve => server.listen(port, '127.0.0.1', resolve));
+  try {
+    assert.equal((await postPresence(port, 'call-c')).status, 200);
+    shape = 'drift';
+    sandbox.invalidate();
+    const boxResponse = await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=call-c`);
+    assert.equal(boxResponse.status, 502);
+    const box = logs.find(event => event.source === 'box' && event.state === 'error');
+    assert.equal(box.http_status, 500);
+    assert.equal(box.step, 'box_stream');
+    assert.equal(box.fields_changed, true);
+    eventsStatus = 200;
+    const typedResponse = await fetch(`http://127.0.0.1:${port}/native/events?agentId=a&callId=call-c`);
+    await typedResponse.text();
+    const typedErrors = logs.filter(event => event.source === 'typed' && event.state === 'error');
+    assert.ok(typedErrors.length >= 1);
+    assert.ok(typedErrors.every(event => event.http_status === 500 && event.step === 'typed_stream' && event.fields_changed === true));
+    assert.equal(logs.filter(event => event.state === 'fields_changed').length, 1);
+    assertNoSecrets(JSON.stringify(logs));
+  } finally { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }
 });
