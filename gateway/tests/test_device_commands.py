@@ -47,6 +47,30 @@ def test_command_names_and_mac_tools_are_not_the_tool(name):
     assert device_command_for_tool(name) is None
 
 
+def test_one_voice_instructions_stay_off_until_the_device_asks():
+    from types import SimpleNamespace
+
+    quiet = device_command_extension(SimpleNamespace(one_voice=False))
+    assert quiet.instructions_for() == DEVICE_COMMAND_INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_one_voice_device_result_includes_the_local_attempt():
+    class Device:
+        one_voice = True
+        koji_context = {"local_attempt": {"name": "pause", "detail": "nothing playing"}}
+
+        async def send_device_command(self, frame):
+            return {"ok": True, "confirmed": True, "detail": "paused"}, None
+
+    voiced = device_command_extension(Device())
+    assert "The Portal does not speak" in voiced.instructions_for()
+    result = await voiced.dispatch("device_command", {"name": "media_pause", "args": {}})
+    assert result["local_attempt"]["name"] == "pause"
+    assert result["local_attempt"]["detail"] == "nothing playing"
+    assert "nothing playing" not in voiced.instructions_for()
+
+
 def test_instructions_keep_portal_controls_off_the_mac():
     text = DEVICE_COMMAND_INSTRUCTIONS
     assert "stay on this device" in text

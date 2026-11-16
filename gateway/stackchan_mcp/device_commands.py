@@ -110,6 +110,35 @@ _DESCRIPTION = (
     "This does not speak audio."
 )
 
+_DESCRIPTION_ONE_VOICE = (
+    "Send one named system command to the connected Portal. "
+    "Call the tool before speaking. After it returns, say one short line. The Portal does not speak. "
+    "A tick on the Portal means the command landed. "
+    "If confirmed is false, say you are not sure it landed. "
+    "If local_attempt is set, the Portal already tried and could not. Say that detail and do not send it again. "
+    "name is one of: "
+    + ", ".join(DEVICE_COMMAND_NAMES)
+    + ". "
+    "set_volume_percent and set_brightness_percent need args.percent, an integer from 0 to 100. "
+    "Do not call Mac set_volume, media_control, or open_app for Portal volume, brightness, media, or apps."
+)
+
+DEVICE_COMMAND_INSTRUCTIONS_ONE_VOICE = (
+    "You are the only voice. The Portal does not speak. "
+    "Call device_command before speaking. After it returns, say one short line. "
+    "Portal volume, brightness, media, and apps stay on this device. "
+    "Never call set_volume, media_control, open_app, or any other Mac tool for those. "
+    "Do not change desktop Spotify or the Mac output volume for a Portal request. "
+    "A request that names the Mac is the Mac tool. "
+    "name is one of: "
+    + ", ".join(DEVICE_COMMAND_NAMES)
+    + ". "
+    'A request such as 50% is set_volume_percent with args {"percent": 50}. '
+    "If confirmed is false, say you are not sure it landed. "
+    "If local_attempt is set, say that detail and do not send the same command again. "
+    "get_volume returns reading on_device and no volume number; do not invent one."
+)
+
 DEVICE_COMMAND_INSTRUCTIONS = (
     "Portal system controls stay on this device. Volume, brightness, media transport, "
     "and opening an app on the Portal are not Mac desktop actions. "
@@ -279,19 +308,20 @@ def device_command_parameters(name: str) -> dict[str, Any]:
     }
 
 
-def device_command_description(name: str) -> str:
+def device_command_description(name: str, *, one_voice: bool = False) -> str:
     if device_command_for_tool(name) is None:
         raise ValueError("not a device command tool")
+    text = _DESCRIPTION_ONE_VOICE if one_voice else _DESCRIPTION
     if name != "device_command":
-        return "Alias of device_command. " + _DESCRIPTION
-    return _DESCRIPTION
+        return "Alias of device_command. " + text
+    return text
 
 
-def device_command_declarations() -> list[dict[str, Any]]:
+def device_command_declarations(*, one_voice: bool = False) -> list[dict[str, Any]]:
     return [
         {
             "name": declared,
-            "description": device_command_description(declared),
+            "description": device_command_description(declared, one_voice=one_voice),
             "parameters": device_command_parameters(declared),
         }
         for declared in DEVICE_COMMAND_DECLARED_NAMES
@@ -305,6 +335,9 @@ def device_command_extension(esp32: Any) -> Any:
     ``get_volume`` does not wait for ``device_command_result``.
     """
     from .voice_tools import ToolExtension, ToolMetadata
+
+    def voiced() -> bool:
+        return getattr(esp32, "one_voice", False) is True
 
     declarations = tuple(device_command_declarations())
 
@@ -336,6 +369,14 @@ def device_command_extension(esp32: Any) -> Any:
                     payload["detail"] = result["detail"]
             if frame["name"] == "get_volume" and confirmed is None:
                 payload["reading"] = "on_device"
+            if voiced():
+                context = getattr(esp32, "koji_context", None)
+                attempt = context.get("local_attempt") if isinstance(context, dict) else None
+                if isinstance(attempt, dict):
+                    payload["local_attempt"] = {
+                        "name": attempt.get("name"),
+                        "detail": attempt.get("detail"),
+                    }
             return payload
         return {"ok": False, "error": "device command frame rejected"}
 
@@ -346,4 +387,6 @@ def device_command_extension(esp32: Any) -> Any:
             name: ToolMetadata(True, "portal_device", 5.0) for name in DEVICE_COMMAND_DECLARED_NAMES
         },
         instructions=DEVICE_COMMAND_INSTRUCTIONS,
+        instructions_for=lambda: DEVICE_COMMAND_INSTRUCTIONS_ONE_VOICE if voiced() else DEVICE_COMMAND_INSTRUCTIONS,
+        declarations_for=lambda: tuple(device_command_declarations(one_voice=voiced())),
     )

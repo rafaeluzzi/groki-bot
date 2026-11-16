@@ -704,6 +704,8 @@ class ToolExtension:
     instructions: str = ""
     bind_result: Callable[[Callable[[str], Awaitable[bool]]], None] | None = None
     on_user_input: Callable[[str, bool], Any] | None = None
+    instructions_for: Callable[[], str] | None = None
+    declarations_for: Callable[[], tuple[dict[str, Any], ...]] | None = None
 
 
 class VoiceToolExecutor:
@@ -777,7 +779,11 @@ class VoiceToolExecutor:
             *(
                 entry
                 for extension in self._extensions
-                for entry in extension.declarations
+                for entry in (
+                    extension.declarations_for()
+                    if extension.declarations_for is not None
+                    else extension.declarations
+                )
             ),
         ]
 
@@ -805,9 +811,13 @@ class VoiceToolExecutor:
             [
                 base,
                 *(
-                    extension.instructions
+                    (
+                        extension.instructions_for()
+                        if extension.instructions_for is not None
+                        else extension.instructions
+                    )
                     for extension in self._extensions
-                    if extension.instructions
+                    if extension.instructions or extension.instructions_for is not None
                 ),
             ]
         )

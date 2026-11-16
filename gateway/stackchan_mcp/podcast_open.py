@@ -47,6 +47,34 @@ _DESCRIPTION = (
     "Do not open Spotify on the Mac, and do not call Mac media_control or open_app for this."
 )
 
+_QUIET_ONE_VOICE = (
+    "Call the tool before speaking. After it returns, say one short line from say. "
+    "The Portal does not speak."
+)
+
+_DESCRIPTION_ONE_VOICE = (
+    "Open one followed podcast on the Portal. "
+    "show is the show title. "
+    "When the user says a number, pass ordinal; do not turn it into a title. "
+    "ordinal is that visible row when a list is on screen, otherwise the Nth titled show A-to-Z. "
+    "Do not call podcast_open_spotify again for this request unless did_you_mean is set; "
+    "then call it once with that title. Otherwise tell the user it isn't followed and offer to follow it. "
+    "Never call this tool to follow a show. "
+    "One open per turn. "
+    f"{_QUIET_ONE_VOICE}"
+)
+
+PODCAST_INSTRUCTIONS_ONE_VOICE = (
+    "You are the only voice. The Portal does not speak. "
+    "Call podcast_open_spotify before speaking. After it returns, say one short line from say. "
+    "When the user says a number, pass ordinal; do not turn it into a title. "
+    "Do not call podcast_open_spotify again for this request unless did_you_mean is set; "
+    "then call it once with that title. Otherwise tell the user it isn't followed and offer to follow it. "
+    "To follow or unfollow, use podcast_follow and podcast_unfollow. "
+    "Never call podcast_open_spotify to follow. "
+    "One open per turn. If the result says one_open_per_turn, say the show that already opened."
+)
+
 PODCAST_INSTRUCTIONS = (
     "A podcast play, open, or what's-new that did not match on the Portal is yours. "
     "Call podcast_open_spotify with show set to the title. "
@@ -357,11 +385,11 @@ def podcast_parameters() -> dict[str, Any]:
     }
 
 
-def podcast_declarations() -> list[dict[str, Any]]:
+def podcast_declarations(*, one_voice: bool = False) -> list[dict[str, Any]]:
     return [
         {
             "name": PODCAST_TOOL_NAME,
-            "description": _DESCRIPTION,
+            "description": _DESCRIPTION_ONE_VOICE if one_voice else _DESCRIPTION,
             "parameters": podcast_parameters(),
         }
     ]
@@ -579,12 +607,17 @@ def podcast_open_extension(esp32: Any) -> Any:
         except Exception:
             return
 
+    def voiced() -> bool:
+        return getattr(esp32, "one_voice", False) is True
+
     return ToolExtension(
         declarations=declarations,
         dispatch=dispatch,
         metadata={PODCAST_TOOL_NAME: ToolMetadata(True, "portal_podcast", 30.0)},
         instructions=PODCAST_INSTRUCTIONS,
         bind_result=bind,
+        instructions_for=lambda: PODCAST_INSTRUCTIONS_ONE_VOICE if voiced() else PODCAST_INSTRUCTIONS,
+        declarations_for=lambda: tuple(podcast_declarations(one_voice=voiced())),
     )
 
 

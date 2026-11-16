@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 FOLLOW_TOOL = "podcast_follow"
 UNFOLLOW_TOOL = "podcast_unfollow"
 
+FOLLOW_INSTRUCTIONS_ONE_VOICE = (
+    "Call podcast_follow or podcast_unfollow before speaking. "
+    "After it returns, say one short line. The Portal does not speak and nothing opens. "
+    "podcast_follow takes shows, a list of one to eight titles, or from_screen true "
+    "to follow the labels on the list that is up. "
+    "One podcast_follow per turn. A second call returns already_handled. "
+    "A show followed this way may have no Spotify link, so it plays from the public RSS feed."
+)
+
 FOLLOW_INSTRUCTIONS = (
     "To follow or unfollow, use podcast_follow and podcast_unfollow. "
     "Never call podcast_open_spotify to follow. "
@@ -128,6 +137,11 @@ def podcast_follow_extension(esp32: Any) -> Any:
             UNFOLLOW_TOOL: ToolMetadata(True, "portal_podcast", 30.0),
         },
         instructions=FOLLOW_INSTRUCTIONS,
+        instructions_for=lambda: (
+            FOLLOW_INSTRUCTIONS_ONE_VOICE
+            if getattr(esp32, "one_voice", False) is True
+            else FOLLOW_INSTRUCTIONS
+        ),
     )
 
 

@@ -299,7 +299,10 @@ class GbotVoiceBridge:
             {
                 "name": alias,
                 "type": "function",
-                "description": panel_tool_description(canonical),
+                "description": panel_tool_description(
+                    canonical,
+                    one_voice=getattr(self._executor_options.get("esp32"), "one_voice", False) is True,
+                ),
                 "parameters": self._tool_schemas[alias],
             }
         )
@@ -336,7 +339,10 @@ class GbotVoiceBridge:
             {
                 "name": alias,
                 "type": "function",
-                "description": device_command_description(canonical),
+                "description": device_command_description(
+                    canonical,
+                    one_voice=getattr(self._executor_options.get("esp32"), "one_voice", False) is True,
+                ),
                 "parameters": self._tool_schemas[alias],
             }
         )
