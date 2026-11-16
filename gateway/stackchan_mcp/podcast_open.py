@@ -297,7 +297,17 @@ def is_podcast_frame(frame: object) -> bool:
         return False
     if not isinstance(frame.get("announce"), str):
         return False
-    allowed = {"type", "announce", "openSpotifyUri", "openSpotifyUrl", "openKind", "showTitle", "rssEpisode"}
+    allowed = {
+        "type",
+        "announce",
+        "openSpotifyUri",
+        "openSpotifyUrl",
+        "openKind",
+        "showTitle",
+        "rssEpisode",
+        "seq",
+        "voice",
+    }
     if any(key not in allowed for key in frame):
         return False
     for key in ("openSpotifyUri", "openSpotifyUrl", "showTitle"):
@@ -306,6 +316,12 @@ def is_podcast_frame(frame: object) -> bool:
             return False
     kind = frame.get("openKind")
     if kind is not None and kind not in ("episode", "show"):
+        return False
+    seq = frame.get("seq")
+    if seq is not None and (isinstance(seq, bool) or not isinstance(seq, int)):
+        return False
+    voice = frame.get("voice")
+    if voice is not None and voice != "grok":
         return False
     rss = frame.get("rssEpisode")
     if rss is not None:
@@ -528,8 +544,20 @@ def podcast_open_extension(esp32: Any) -> Any:
                 if isinstance(error, dict) and isinstance(error.get("message"), str):
                     message = error["message"]
                 return {"ok": False, "error": message}
-            guard.commit_open(str(result.get("title") or frame.get("showTitle") or show))
+            title = str(sent.get("show") or result.get("title") or frame.get("showTitle") or show)
+            guard.commit_open(title)
             logger.info("portal frame type=podcast")
+            if isinstance(sent.get("status"), str):
+                body: dict[str, Any] = {
+                    "ok": True,
+                    "status": sent["status"],
+                    "show": title,
+                    "target": sent.get("target"),
+                    "say": sent.get("say"),
+                }
+                if isinstance(sent.get("last_outcome"), dict):
+                    body["last_outcome"] = sent["last_outcome"]
+                return body
             return result
 
     def _open_args(args: dict[str, Any]) -> tuple[int | None, str, dict[str, Any] | None]:
@@ -543,11 +571,20 @@ def podcast_open_extension(esp32: Any) -> Any:
             return None, "", _miss("empty")
         return None, show, None
 
+    def bind(announce):
+        if esp32 is None:
+            return
+        try:
+            esp32.announce_podcast = announce
+        except Exception:
+            return
+
     return ToolExtension(
         declarations=declarations,
         dispatch=dispatch,
         metadata={PODCAST_TOOL_NAME: ToolMetadata(True, "portal_podcast", 30.0)},
         instructions=PODCAST_INSTRUCTIONS,
+        bind_result=bind,
     )
 
 

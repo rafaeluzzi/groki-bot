@@ -178,6 +178,26 @@ async def test_extension_sends_one_frame_and_does_not_wait_for_a_result():
 
 
 @pytest.mark.asyncio
+async def test_extension_returns_a_confirmed_result_or_an_unconfirmed_timeout():
+    class Device:
+        def __init__(self, result):
+            self.result = result
+
+        async def send_device_command(self, frame):
+            return self.result, None
+
+    quiet = device_command_extension(Device({"ok": True, "confirmed": False}))
+    missed = await quiet.dispatch("device_command", {"name": "media_pause", "args": {}})
+    assert missed["ok"] is True
+    assert missed["confirmed"] is False
+
+    heard = device_command_extension(Device({"ok": True, "confirmed": True, "detail": "level 1"}))
+    done = await heard.dispatch("device_command", {"name": "media_pause", "args": {}})
+    assert done["confirmed"] is True
+    assert done["detail"] == "level 1"
+
+
+@pytest.mark.asyncio
 async def test_extension_reports_send_failure_without_the_arguments():
     class Device:
         async def send_device_command(self, frame):

@@ -231,7 +231,13 @@ def build_device_command_frame(tool_name: object, arguments: object) -> dict[str
 def is_device_command_frame(frame: object) -> bool:
     if not isinstance(frame, dict) or frame.get("type") != "device_command":
         return False
-    if set(frame) != {"type", "name", "args"}:
+    if set(frame) - {"type", "name", "args", "seq", "id"}:
+        return False
+    seq = frame.get("seq")
+    if "seq" in frame and (isinstance(seq, bool) or not isinstance(seq, int)):
+        return False
+    command_id = frame.get("id")
+    if "id" in frame and (not isinstance(command_id, str) or not command_id.strip()):
         return False
     command = frame.get("name")
     if command not in DEVICE_COMMAND_NAMES or not isinstance(frame.get("args"), dict):
@@ -318,9 +324,17 @@ def device_command_extension(esp32: Any) -> Any:
             if isinstance(error, dict) and isinstance(error.get("message"), str):
                 message = error["message"]
             return {"ok": False, "error": message}
-        if isinstance(result, dict) and result.get("ok") is True:
-            payload: dict[str, Any] = {"ok": True, "name": frame["name"]}
-            if frame["name"] == "get_volume":
+        if isinstance(result, dict) and (result.get("ok") is True or "confirmed" in result):
+            confirmed = result.get("confirmed") is True if "confirmed" in result else None
+            payload: dict[str, Any] = {
+                "ok": True if confirmed is False else result.get("ok") is True,
+                "name": frame["name"],
+            }
+            if confirmed is not None:
+                payload["confirmed"] = confirmed
+                if isinstance(result.get("detail"), str):
+                    payload["detail"] = result["detail"]
+            if frame["name"] == "get_volume" and confirmed is None:
                 payload["reading"] = "on_device"
             return payload
         return {"ok": False, "error": "device command frame rejected"}
