@@ -533,7 +533,7 @@ async def open_show(
 
 def podcast_open_extension(esp32: Any) -> Any:
     """Voice-tool extension. Ok means the podcast frame was written."""
-    from .podcast_turn import context_panel, shared_guard, turn_key
+    from .podcast_turn import context_panel, shared_guard, turn_key_for
     from .voice_tools import ToolExtension, ToolMetadata
 
     declarations = tuple(podcast_declarations())
@@ -546,7 +546,7 @@ def podcast_open_extension(esp32: Any) -> Any:
             return {"ok": False, "error": "unknown podcast tool"}
         guard = shared_guard(esp32)
         async with guard.lock:
-            rejection = guard.claim_open(turn_key(esp32))
+            rejection = guard.claim_open(turn_key_for(esp32, turn_seq))
             if rejection is not None:
                 return rejection
             ordinal, show, problem = _open_args(args)
@@ -583,7 +583,8 @@ def podcast_open_extension(esp32: Any) -> Any:
                     message = error["message"]
                 return {"ok": False, "error": message}
             title = str(sent.get("show") or result.get("title") or frame.get("showTitle") or show)
-            guard.commit_open(title)
+            if sent.get("status") != "stale":
+                guard.commit_open(title)
             logger.info("portal frame type=podcast")
             if isinstance(sent.get("status"), str):
                 body: dict[str, Any] = {

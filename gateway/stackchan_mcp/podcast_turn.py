@@ -91,6 +91,17 @@ def _generation(esp32: Any) -> int:
     return generation
 
 
+def turn_key_for(esp32: Any, turn_seq: Any) -> tuple[Any, ...]:
+    """The seq captured when the tool started, not a context that arrived while it waited."""
+    generation = _generation(esp32)
+    if isinstance(turn_seq, int) and not isinstance(turn_seq, bool):
+        return ("seq", turn_seq, generation)
+    starts = getattr(esp32, "listen_starts", 0)
+    if not isinstance(starts, int) or isinstance(starts, bool):
+        starts = 0
+    return ("listen", starts, generation)
+
+
 def turn_key(esp32: Any) -> tuple[Any, ...]:
     """Context seq when the Portal has sent one, otherwise the listen counter.
 

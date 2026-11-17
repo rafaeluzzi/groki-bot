@@ -355,3 +355,52 @@ async def test_a_new_connection_can_open_the_same_seq(monkeypatch):
     host.connection_generation = 2
     assert (await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"}))["ok"] is True
     assert len(host.frames) == 2
+
+
+@pytest.mark.asyncio
+async def test_the_guard_uses_the_seq_captured_at_dispatch(monkeypatch):
+    _patch_catalog(monkeypatch, [{"id": "hf", "title": "Hard Fork"}])
+    host = _Host()
+    host.koji_context = {"seq": 4, "panel": None}
+    from stackchan_mcp.podcast_turn import shared_guard
+
+    guard = shared_guard(host)
+    real = guard.lock
+
+    class SwapLock:
+        async def __aenter__(self):
+            await real.acquire()
+            host.koji_context = {"seq": 9, "panel": None}
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            real.release()
+            return False
+
+    guard.lock = SwapLock()
+    assert (await podcast_open_extension(host).dispatch("podcast_open_spotify", {"show": "Hard Fork"}))["ok"] is True
+    assert guard._key == ("seq", 4, 0)
+
+
+@pytest.mark.asyncio
+async def test_a_stale_answer_does_not_use_the_open(monkeypatch):
+    _patch_catalog(monkeypatch, [{"id": "hf", "title": "Hard Fork"}])
+
+    class Host(_Host):
+        def __init__(self):
+            super().__init__()
+            self.koji_context = {"seq": 4, "panel": None}
+
+        async def send_podcast(self, frame, turn_seq=None):
+            self.frames.append(frame)
+            status = "stale" if len(self.frames) == 1 else "opening"
+            return {"ok": True, "status": status, "show": "Hard Fork", "target": "spotify", "say": "Opening."}, None
+
+    host = Host()
+    extension = podcast_open_extension(host)
+    first = await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"})
+    assert first["status"] == "stale"
+    second = await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"})
+    assert second["ok"] is True
+    assert second["status"] == "opening"
+    assert len(host.frames) == 2

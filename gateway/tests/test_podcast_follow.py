@@ -90,4 +90,26 @@ async def test_follow_titles_run_together_and_the_batch_stays_bounded(monkeypatc
     started = time.monotonic()
     late = await podcast_follow_extension(host).dispatch("podcast_follow", {"shows": ["Late"]})
     assert time.monotonic() - started < 0.4
-    assert late["results"] == [{"title": "Late", "status": "not_found"}]
+    assert late["results"] == [{"title": "Late", "status": "pending"}]
+    assert "Still adding Late" in late["say"]
+
+
+@pytest.mark.asyncio
+async def test_a_batch_timeout_keeps_the_finished_results(monkeypatch):
+    import asyncio
+
+    async def post(title):
+        if title == "Slow":
+            await asyncio.sleep(1)
+        return {"status": "followed", "title": title}
+
+    monkeypatch.setattr("stackchan_mcp.podcast_follow._post_follow", post)
+    monkeypatch.setattr("stackchan_mcp.podcast_follow.FOLLOW_BATCH_S", 0.05)
+    host = _Host()
+    result = await podcast_follow_extension(host).dispatch("podcast_follow", {"shows": ["Fast", "Slow"]})
+    assert result["results"] == [
+        {"title": "Fast", "status": "followed"},
+        {"title": "Slow", "status": "pending"},
+    ]
+    assert "Followed Fast" in result["say"]
+    assert "Still adding Slow" in result["say"]

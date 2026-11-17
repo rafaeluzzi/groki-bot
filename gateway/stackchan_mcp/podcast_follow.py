@@ -95,6 +95,7 @@ def follow_summary(results: list[dict[str, Any]]) -> str:
         "already": "Already following",
         "not_found": "Couldn't find",
         "ambiguous": "Need a clearer name for",
+        "pending": "Still adding",
     }
     parts = []
     for status, prefix in groups.items():
@@ -183,7 +184,7 @@ async def _follow(esp32: Any, args: dict[str, Any], guard: Any) -> dict[str, Any
                 logger.warning("podcast follow failed")
                 body = {"status": "not_found"}
         status = body.get("status") if isinstance(body, dict) else None
-        if status not in {"followed", "already", "not_found", "ambiguous"}:
+        if status not in {"followed", "already", "not_found", "ambiguous", "pending"}:
             status = "not_found"
         row: dict[str, Any] = {"title": title, "status": status}
         names = body.get("names") if isinstance(body, dict) else None
@@ -191,15 +192,30 @@ async def _follow(esp32: Any, args: dict[str, Any], guard: Any) -> dict[str, Any
             row["names"] = [str(name) for name in names[:3] if isinstance(name, str)]
         return row
 
-    try:
-        results = await asyncio.wait_for(
-            asyncio.gather(*(one(title) for title in titles)),
-            timeout=FOLLOW_BATCH_S,
-        )
-    except asyncio.TimeoutError:
+    pairs = [(title, asyncio.create_task(one(title))) for title in titles]
+    done, unfinished = await asyncio.wait([task for _, task in pairs], timeout=FOLLOW_BATCH_S)
+    if unfinished:
         logger.warning("podcast follow batch timed out")
-        results = [{"title": title, "status": "not_found"} for title in titles]
-    return {"ok": True, "results": list(results), "say": follow_summary(results)}
+    finished = {}
+    for task in done:
+        try:
+            row = task.result()
+        except Exception:
+            logger.warning("podcast follow failed")
+            continue
+        finished[task] = row
+    results = []
+    for title, task in pairs:
+        if task in finished:
+            results.append(finished[task])
+        else:
+            results.append({"title": title, "status": "pending"})
+    # The reply already says pending. These are the client waits, not the router follow.
+    for task in unfinished:
+        task.cancel()
+    if unfinished:
+        await asyncio.gather(*unfinished, return_exceptions=True)
+    return {"ok": True, "results": results, "say": follow_summary(results)}
 
 
 async def _unfollow(args: dict[str, Any]) -> dict[str, Any]:
