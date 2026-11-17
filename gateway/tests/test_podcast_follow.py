@@ -113,3 +113,22 @@ async def test_a_batch_timeout_keeps_the_finished_results(monkeypatch):
     ]
     assert "Followed Fast" in result["say"]
     assert "Still adding Slow" in result["say"]
+
+
+@pytest.mark.asyncio
+async def test_a_client_timeout_is_pending_and_fits_the_batch(monkeypatch):
+    import asyncio
+
+    from stackchan_mcp.podcast_follow import FOLLOW_BATCH_S, FOLLOW_CLIENT_S
+
+    assert FOLLOW_BATCH_S <= 20
+    assert 18 < FOLLOW_CLIENT_S < FOLLOW_BATCH_S
+
+    async def timed_out(title):
+        raise asyncio.TimeoutError
+
+    monkeypatch.setattr("stackchan_mcp.podcast_follow._post_follow", timed_out)
+    host = _Host()
+    result = await podcast_follow_extension(host).dispatch("podcast_follow", {"shows": ["Slow"]})
+    assert result["results"] == [{"title": "Slow", "status": "pending"}]
+    assert "Still adding Slow" in result["say"]

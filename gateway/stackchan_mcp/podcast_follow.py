@@ -17,6 +17,8 @@ from .podcast_turn import context_panel, shared_guard, turn_key
 logger = logging.getLogger(__name__)
 
 FOLLOW_BATCH_S = 20.0
+# The router uses 8 s to search and 10 s to follow. Stay under the batch cap.
+FOLLOW_CLIENT_S = 19.0
 _FOLLOW_SLOTS = 4
 
 FOLLOW_TOOL = "podcast_follow"
@@ -180,6 +182,9 @@ async def _follow(esp32: Any, args: dict[str, Any], guard: Any) -> dict[str, Any
         async with semaphore:
             try:
                 body = await _post_follow(title)
+            except TimeoutError:
+                logger.warning("podcast follow still running")
+                body = {"status": "pending"}
             except Exception:
                 logger.warning("podcast follow failed")
                 body = {"status": "not_found"}
@@ -249,8 +254,8 @@ async def _unfollow(args: dict[str, Any]) -> dict[str, Any]:
 async def _post_follow(title: str) -> dict:
     import aiohttp
 
-    # Longer than the router's search-and-follow budget, so a slow follow is not reported missing.
-    timeout = aiohttp.ClientTimeout(total=12)
+    # Longer than the router's search plus follow, and still inside the batch cap.
+    timeout = aiohttp.ClientTimeout(total=FOLLOW_CLIENT_S)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(
             f"{router_origin()}/api/podcasts/follow_by_title",
