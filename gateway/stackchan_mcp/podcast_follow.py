@@ -7,6 +7,7 @@ show URI, so playback falls back to the public RSS enclosure.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -14,6 +15,9 @@ from .podcast_open import match_followed, router_origin
 from .podcast_turn import context_panel, shared_guard, turn_key
 
 logger = logging.getLogger(__name__)
+
+FOLLOW_BATCH_S = 20.0
+_FOLLOW_SLOTS = 4
 
 FOLLOW_TOOL = "podcast_follow"
 UNFOLLOW_TOOL = "podcast_unfollow"
@@ -169,13 +173,15 @@ async def _follow(esp32: Any, args: dict[str, Any], guard: Any) -> dict[str, Any
     rejection = guard.claim_follow(turn_key(esp32))
     if rejection is not None:
         return rejection
-    results = []
-    for title in titles:
-        try:
-            body = await _post_follow(title)
-        except Exception:
-            logger.warning("podcast follow failed")
-            body = {"status": "not_found"}
+    semaphore = asyncio.Semaphore(_FOLLOW_SLOTS)
+
+    async def one(title: str) -> dict[str, Any]:
+        async with semaphore:
+            try:
+                body = await _post_follow(title)
+            except Exception:
+                logger.warning("podcast follow failed")
+                body = {"status": "not_found"}
         status = body.get("status") if isinstance(body, dict) else None
         if status not in {"followed", "already", "not_found", "ambiguous"}:
             status = "not_found"
@@ -183,8 +189,17 @@ async def _follow(esp32: Any, args: dict[str, Any], guard: Any) -> dict[str, Any
         names = body.get("names") if isinstance(body, dict) else None
         if status == "ambiguous" and isinstance(names, list):
             row["names"] = [str(name) for name in names[:3] if isinstance(name, str)]
-        results.append(row)
-    return {"ok": True, "results": results, "say": follow_summary(results)}
+        return row
+
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*(one(title) for title in titles)),
+            timeout=FOLLOW_BATCH_S,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("podcast follow batch timed out")
+        results = [{"title": title, "status": "not_found"} for title in titles]
+    return {"ok": True, "results": list(results), "say": follow_summary(results)}
 
 
 async def _unfollow(args: dict[str, Any]) -> dict[str, Any]:
@@ -218,7 +233,8 @@ async def _unfollow(args: dict[str, Any]) -> dict[str, Any]:
 async def _post_follow(title: str) -> dict:
     import aiohttp
 
-    timeout = aiohttp.ClientTimeout(total=8)
+    # Longer than the router's search-and-follow budget, so a slow follow is not reported missing.
+    timeout = aiohttp.ClientTimeout(total=12)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         async with session.post(
             f"{router_origin()}/api/podcasts/follow_by_title",

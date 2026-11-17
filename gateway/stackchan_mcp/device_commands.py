@@ -342,6 +342,9 @@ def device_command_extension(esp32: Any) -> Any:
     declarations = tuple(device_command_declarations())
 
     async def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        from .koji_voice import context_seq, deliver_frame
+
+        turn_seq = context_seq(getattr(esp32, "koji_context", None))
         frame = build_device_command_frame(name, args)
         if frame is None:
             return {"ok": False, "error": "invalid device command arguments"}
@@ -349,7 +352,7 @@ def device_command_extension(esp32: Any) -> Any:
         if not callable(send):
             return {"ok": False, "error": "device command channel unavailable"}
         try:
-            result, error = await send(frame)
+            result, error = await deliver_frame(send, frame, turn_seq)
         except Exception:
             return {"ok": False, "error": "device command frame failed"}
         if error:

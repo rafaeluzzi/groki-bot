@@ -47,6 +47,27 @@ def test_command_names_and_mac_tools_are_not_the_tool(name):
     assert device_command_for_tool(name) is None
 
 
+@pytest.mark.asyncio
+async def test_device_command_uses_the_seq_from_dispatch_start():
+    class Device:
+        def __init__(self):
+            self.koji_context = {"seq": 3}
+            self.seen = None
+
+        async def send_device_command(self, frame, turn_seq=None):
+            self.seen = turn_seq
+            self.koji_context = {"seq": 8}
+            return {"ok": True}, None
+
+    device = Device()
+    result = await device_command_extension(device).dispatch(
+        "device_command",
+        {"name": "media_pause", "args": {}},
+    )
+    assert result["ok"] is True
+    assert device.seen == 3
+
+
 def test_one_voice_instructions_stay_off_until_the_device_asks():
     from types import SimpleNamespace
 

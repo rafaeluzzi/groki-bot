@@ -226,6 +226,8 @@ def test_ordinal_uses_the_visible_row_or_the_az_list():
     assert plan_open("", followed, ordinal=1)["title"] == "Hard Fork"
     assert plan_open("", followed, ordinal=2)["title"] == "Planet Money"
     assert plan_open("", followed, ordinal=4)["result"]["reason"] == "out_of_range"
+    playing = {"id": "now", "kind": "now_playing", "title": "Episode", "rows": [{"n": 1, "label": "Decoder"}]}
+    assert plan_open("", followed, ordinal=2, panel=playing)["title"] == "Planet Money"
 
 
 class _Host:
@@ -317,4 +319,39 @@ async def test_listen_starts_reset_the_guard_when_there_is_no_context(monkeypatc
     host.listen_starts = 2
     third = await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"})
     assert third["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_open_keeps_the_seq_from_when_the_call_started(monkeypatch):
+    _patch_catalog(monkeypatch, [{"id": "hf", "title": "Hard Fork"}])
+
+    class Host(_Host):
+        def __init__(self):
+            super().__init__()
+            self.koji_context = {"seq": 4, "panel": None}
+            self.seen = None
+
+        async def send_podcast(self, frame, turn_seq=None):
+            self.seen = turn_seq
+            self.koji_context = {"seq": 9, "panel": None}
+            self.frames.append(frame)
+            return {"ok": True, "status": "opening", "show": "Hard Fork", "target": "spotify", "say": "Opening."}, None
+
+    host = Host()
+    await podcast_open_extension(host).dispatch("podcast_open_spotify", {"show": "Hard Fork"})
+    assert host.seen == 4
+
+
+@pytest.mark.asyncio
+async def test_a_new_connection_can_open_the_same_seq(monkeypatch):
+    _patch_catalog(monkeypatch, [{"id": "hf", "title": "Hard Fork"}])
+    host = _Host()
+    host.koji_context = {"seq": 1, "panel": None}
+    host.connection_generation = 1
+    extension = podcast_open_extension(host)
+    assert (await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"}))["ok"] is True
+    blocked = await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"})
+    assert blocked["reason"] == "one_open_per_turn"
+    host.connection_generation = 2
+    assert (await extension.dispatch("podcast_open_spotify", {"show": "Hard Fork"}))["ok"] is True
     assert len(host.frames) == 2

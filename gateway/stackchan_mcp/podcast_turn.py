@@ -29,6 +29,13 @@ class TurnGuard:
         self._opened: str | None = None
         self._follow_used = False
 
+    def reset(self) -> None:
+        """A new Portal connection. The next open is not blocked by the previous one."""
+        self._key = None
+        self._calls = 0
+        self._opened = None
+        self._follow_used = False
+
     def claim_open(self, key: tuple[Any, ...]) -> dict[str, Any] | None:
         self._roll(key)
         self._calls += 1
@@ -77,17 +84,29 @@ def shared_guard(esp32: Any) -> TurnGuard:
     return guard
 
 
+def _generation(esp32: Any) -> int:
+    generation = getattr(esp32, "connection_generation", 0)
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        return 0
+    return generation
+
+
 def turn_key(esp32: Any) -> tuple[Any, ...]:
-    """Context seq when the Portal has sent one, otherwise the listen counter."""
+    """Context seq when the Portal has sent one, otherwise the listen counter.
+
+    The connection generation is part of the key so a restarted APK, whose
+    seq starts at 1 again, is a new turn.
+    """
+    generation = _generation(esp32)
     ctx = getattr(esp32, "koji_context", None)
     if isinstance(ctx, dict):
         seq = ctx.get("seq")
         if isinstance(seq, int) and not isinstance(seq, bool):
-            return ("seq", seq)
+            return ("seq", seq, generation)
     starts = getattr(esp32, "listen_starts", 0)
     if not isinstance(starts, int) or isinstance(starts, bool):
         starts = 0
-    return ("listen", starts)
+    return ("listen", starts, generation)
 
 
 def context_panel(esp32: Any) -> dict[str, Any] | None:

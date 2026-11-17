@@ -1744,3 +1744,26 @@ async def test_koji_context_and_podcast_result_are_not_forwarded():
         assert "Decoder Secret Label" not in json.dumps(proxy.messages)
     finally:
         await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_clears_the_previous_outcome_and_refreshes_tools(manager):
+    from stackchan_mcp.podcast_turn import TurnGuard
+
+    refreshed = []
+
+    async def hello_hook():
+        refreshed.append(manager.one_voice)
+
+    manager.on_portal_hello = hello_hook
+    manager._last_podcast_outcome = {"outcome": "spotify_playing", "show": "Hard Fork"}
+    manager.podcast_guard = TurnGuard()
+    manager.podcast_guard.commit_open("Hard Fork")
+    port = manager._test_port
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await _voice_hello(ws, one_voice=True)
+    assert manager.one_voice is True
+    assert manager._last_podcast_outcome is None
+    assert manager.podcast_guard._opened is None
+    assert refreshed == [True]
+    assert manager.connection_generation >= 1

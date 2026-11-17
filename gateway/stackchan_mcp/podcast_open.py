@@ -279,8 +279,15 @@ def _plan_ordinal(ordinal: int, titled: list[dict], panel: dict | None) -> dict[
 
 
 def _panel_rows(panel: dict | None) -> list[dict] | None:
-    """None means there is no panel, so ordinal uses the A-to-Z list."""
+    """None means there is no list, so ordinal uses the A-to-Z list.
+
+    A now-playing card, a choice, or a webview is not a numbered list.
+    A panel with no kind stays a list, which is what older contexts sent.
+    """
     if not isinstance(panel, dict):
+        return None
+    kind = panel.get("kind")
+    if isinstance(kind, str) and kind != "list":
         return None
     rows = panel.get("rows")
     if not isinstance(rows, list):
@@ -532,6 +539,9 @@ def podcast_open_extension(esp32: Any) -> Any:
     declarations = tuple(podcast_declarations())
 
     async def dispatch(name: str, args: dict[str, Any]) -> dict[str, Any]:
+        from .koji_voice import context_seq, deliver_frame
+
+        turn_seq = context_seq(getattr(esp32, "koji_context", None))
         if name != PODCAST_TOOL_NAME:
             return {"ok": False, "error": "unknown podcast tool"}
         guard = shared_guard(esp32)
@@ -564,7 +574,7 @@ def podcast_open_extension(esp32: Any) -> Any:
             if not callable(send):
                 return {"ok": False, "error": "podcast channel unavailable"}
             try:
-                sent, error = await send(frame)
+                sent, error = await deliver_frame(send, frame, turn_seq)
             except Exception:
                 return {"ok": False, "error": "podcast frame failed"}
             if error or not (isinstance(sent, dict) and sent.get("ok") is True):

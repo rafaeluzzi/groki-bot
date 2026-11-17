@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: MIT
 """One-voice frames: stamp seq and voice, store screen context, wait for results.
 
-The Portal is the only side that speaks when ``features.one_voice`` is set.
+Grok is the only voice when ``features.one_voice`` is set. The Portal stays silent.
 These helpers never log row labels or the words of a result.
 """
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any
 
@@ -22,6 +23,13 @@ _SAY = {
     "stale": "That ask is already over.",
     "sent_unconfirmed": "Opening {show}.",
 }
+
+
+async def deliver_frame(send, frame: dict[str, Any], turn_seq: int | None):
+    """Pass the seq captured when the tool started, when the sender accepts it."""
+    if "turn_seq" in inspect.signature(send).parameters:
+        return await send(frame, turn_seq=turn_seq)
+    return await send(frame)
 
 
 def context_seq(context: object) -> int | None:
@@ -121,6 +129,9 @@ def store_koji_context(message: dict[str, Any]) -> dict[str, Any] | None:
             rows.append(item)
         row_count = len(rows)
         stored_panel = {"id": panel_id if panel_id != "-" else "", "title": title[:120], "rows": rows}
+        kind = panel.get("kind")
+        if isinstance(kind, str) and kind.strip():
+            stored_panel["kind"] = kind.strip()[:32]
     logger.info("koji_context seq=%s panel=%s rows=%s", seq, panel_id, row_count)
     stored: dict[str, Any] = {"seq": seq, "panel": stored_panel}
     attempt = message.get("local_attempt")

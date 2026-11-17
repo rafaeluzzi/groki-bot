@@ -30,6 +30,9 @@ from .protocol import HelloResponse, make_mcp_message, parse_jsonrpc_response
 
 logger = logging.getLogger(__name__)
 
+# Omitted seq means "read the context at send time". A tool passes the seq it saw at dispatch.
+_TURN_SEQ_UNSET = object()
+
 # Timeout for waiting for ESP32 responses
 RESPONSE_TIMEOUT = 300.0
 
@@ -441,7 +444,9 @@ class ESP32Manager:
         self.on_wake_detected: Callable[[], Awaitable[None]] | None = None
         # Podcast turn key when the Portal has not sent a context seq.
         self.listen_starts = 0
+        self.connection_generation = 0
         self.one_voice = False
+        self.on_portal_hello: Callable[[], Any] | None = None
         self.koji_context: dict[str, Any] | None = None
         self.announce_podcast: Callable[..., Any] | None = None
         self._command_ids = 0
@@ -594,6 +599,15 @@ class ESP32Manager:
                     mcp_supported = bool(features.get("mcp"))
                     connection.mcp_supported = mcp_supported
                     connection.one_voice = features.get("one_voice") is True
+                    # Copy the flag before the voice session starts, so its
+                    # tool text matches this hello. A later hello refreshes it.
+                    self.one_voice = connection.one_voice
+                    self.connection_generation += 1
+                    self._last_podcast_outcome = None
+                    guard = getattr(self, "podcast_guard", None)
+                    reset = getattr(guard, "reset", None)
+                    if callable(reset):
+                        reset()
                     if not mcp_supported:
                         # Voice-only chassis (e.g. ciniml/stackchan-idf's
                         # XiaoZhiClient): accept the connection for audio +
@@ -654,7 +668,16 @@ class ESP32Manager:
                         self._connection = connection
                         self.one_voice = connection.one_voice
                         self.koji_context = None
+                        self._last_podcast_outcome = None
                         self._debug_status.on_device_connected(device_id)
+                    hook = self.on_portal_hello
+                    if callable(hook):
+                        try:
+                            refreshed = hook()
+                            if inspect.isawaitable(refreshed):
+                                await refreshed
+                        except Exception:
+                            logger.warning("portal hello tool refresh failed")
 
                     if mcp_supported:
                         # Start initialization as a separate task so the read
@@ -1097,11 +1120,13 @@ class ESP32Manager:
     async def send_podcast(
         self,
         frame: dict[str, Any],
+        turn_seq: Any = _TURN_SEQ_UNSET,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Send a Portal ``type:podcast`` frame on the current device socket.
 
-        There is no ack: ok means the frame was written. The Portal says the
-        announce line and opens Spotify when a link is set.
+        There is no ack: ok means the frame was written. In one-voice mode the
+        Portal stays silent and Grok says the line. ``turn_seq`` is the ask
+        seq from when the tool started.
         """
         connection = self._connection
         if connection is None or not connection.connected:
@@ -1109,7 +1134,12 @@ class ESP32Manager:
         from .koji_voice import ACCEPT_WAIT_S, accept_result, context_seq, podcast_target, say_hint, stamp_podcast_frame
         from .podcast_open import is_podcast_frame
 
-        seq = context_seq(self.koji_context)
+        if turn_seq is _TURN_SEQ_UNSET:
+            seq = context_seq(self.koji_context)
+        elif isinstance(turn_seq, int) and not isinstance(turn_seq, bool):
+            seq = turn_seq
+        else:
+            seq = None
         stamped = stamp_podcast_frame(frame, one_voice=self.one_voice, seq=seq)
         if not is_podcast_frame(stamped):
             return None, {"code": -32602, "message": "invalid podcast frame"}
@@ -1151,6 +1181,7 @@ class ESP32Manager:
     async def send_device_command(
         self,
         frame: dict[str, Any],
+        turn_seq: Any = _TURN_SEQ_UNSET,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Send a Portal ``type:device_command`` frame on the current device socket.
 
@@ -1164,7 +1195,12 @@ class ESP32Manager:
             return None, {"code": -32000, "message": "No ESP32 device connected"}
         from .koji_voice import ACCEPT_WAIT_S, context_seq, stamp_device_command
 
-        seq = context_seq(self.koji_context)
+        if turn_seq is _TURN_SEQ_UNSET:
+            seq = context_seq(self.koji_context)
+        elif isinstance(turn_seq, int) and not isinstance(turn_seq, bool):
+            seq = turn_seq
+        else:
+            seq = None
         command_id = ""
         if self.one_voice:
             self._command_ids += 1
