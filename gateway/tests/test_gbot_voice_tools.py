@@ -1290,3 +1290,51 @@ def test_a_fresh_reconnect_still_counts_as_the_channel_up(monkeypatch):
     assert b._desktop_channel_ready() is True
     b._native.within_reconnect_grace = lambda: False
     assert b._desktop_channel_ready() is False
+
+
+@pytest.mark.asyncio
+async def test_a_later_hello_refreshes_the_session_tools(monkeypatch):
+    class Esp:
+        one_voice = False
+
+    class Live:
+        def __init__(self):
+            self.esp = Esp()
+
+        def declarations(self):
+            text = "The Portal does not speak" if self.esp.one_voice else "Do not say anything before or after"
+            return [{"name": "show_panel", "description": text, "parameters": {"type": "object"}}]
+
+        def instructions(self, **kwargs):
+            if self.esp.one_voice:
+                return "The Portal does not speak. Call the tool before speaking."
+            return "Do not say anything before or after this tool."
+
+    live = Live()
+    monkeypatch.setenv("STACKCHAN_TOOL_BOT", "")
+    monkeypatch.setenv("STACKCHAN_TOOL_BOT_ID", "agent")
+    bridge = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        agent_id="agent",
+        esp32=live.esp,
+        tool_executor=live,
+    )
+    sent = []
+
+    async def capture(payload):
+        sent.append(payload)
+
+    bridge._send = capture
+    bridge._ws = object()
+    bridge.running = True
+    bridge._session_snapshot = {"instructions": "Base.", "tools": []}
+    bridge._configure_tools(bridge._session_snapshot)
+    live.esp.one_voice = True
+    assert await bridge.refresh_tools() is True
+    update = sent[-1]
+    assert update["type"] == "session.update"
+    assert "The Portal does not speak" in update["session"]["instructions"]
+    assert "The Portal does not speak" in update["session"]["tools"][0]["description"]

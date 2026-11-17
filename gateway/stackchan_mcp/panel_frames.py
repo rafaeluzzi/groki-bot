@@ -169,17 +169,9 @@ _DISMISS_ONE_VOICE = (
     "ok means the dismiss frame was sent."
 )
 
-PANEL_INSTRUCTIONS_ONE_VOICE = (
+_ONE_VOICE_PANEL = (
     "You are the only voice. The Portal does not speak. "
-    "Call show_panel before speaking. After it returns, say one short line. "
-    "A panel sits beside the orb. "
-    "kind list, now_playing, or choice. Example: "
-    + PANEL_EXAMPLE
-    + ". "
-    "dismiss_panel closes it. "
-    "For a rich card, use kind webview with template and data. "
-    "When the person is picking among 2 to 4 options, call kind choice in that same turn. "
-    "Do not claim the panel showed before the tool returns ok."
+    "Call the tool before speaking. After it returns, say one short line. "
 )
 
 PANEL_INSTRUCTIONS = (
@@ -206,6 +198,8 @@ PANEL_INSTRUCTIONS = (
     "Do not claim the panel showed before the tool returns ok. "
     "Do not end every reply with an open-ended follow-up."
 )
+
+PANEL_INSTRUCTIONS_ONE_VOICE = _ONE_VOICE_PANEL + PANEL_INSTRUCTIONS
 
 
 def panel_frames_enabled() -> bool:

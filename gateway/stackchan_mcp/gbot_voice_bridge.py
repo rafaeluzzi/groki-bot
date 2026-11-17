@@ -490,6 +490,26 @@ class GbotVoiceBridge:
         logger.info("Grok voice declared tools=%s", ",".join(names))
         return declarations
 
+    async def refresh_tools(self) -> bool:
+        """Resend tools and instructions after a Portal hello.
+
+        The session.update that opens the voice session is built once. If the
+        Portal connects, or reconnects with one_voice, after that, this sends
+        a fresh session.update from the flag on the device now.
+        """
+        if not self.running or self._stopped or self._ws is None:
+            return False
+        session = self._session_snapshot if isinstance(getattr(self, "_session_snapshot", None), dict) else {}
+        declarations = self._configure_tools(session)
+        base = session.get("instructions", "Always speak English. Keep replies short and natural.")
+        extra = self._provider_tool_instructions() if self._executor and self._local_tools_enabled else ""
+        instructions = base + ("\n\n" + extra if extra else "")
+        await self._send({
+            "type": "session.update",
+            "session": {"instructions": instructions, "tools": declarations},
+        })
+        return True
+
     def _provider_tool_instructions(self):
         if not self._executor or not self._local_tools_enabled:
             return ""
@@ -1087,6 +1107,7 @@ class GbotVoiceBridge:
             del credential
             stage = "configure_tools"
             self.metrics["startup_stage"] = stage
+            self._session_snapshot = session
             declarations = self._configure_tools(session)
             stage = "provider_instructions"
             self.metrics["startup_stage"] = stage
