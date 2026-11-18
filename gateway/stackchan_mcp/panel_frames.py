@@ -78,12 +78,18 @@ _NORMALIZED_ACTIONS = {
 # the provider wire (``self.panel.show`` -> ``self_panel_show``) and dispatched
 # back to the original name. Do not also declare the sanitized spelling: that
 # collides with the dotted form.
+# One name each on the gbot session. Old names still dispatch through normalization.
 PANEL_DECLARED_NAMES = (
     "show_panel",
-    "self.panel.show",
     "dismiss_panel",
-    "self.panel.dismiss",
 )
+
+PANEL_DISPATCH_ALIASES = {
+    "panel_show": "show_panel",
+    "self_panel_show": "show_panel",
+    "panel_dismiss": "dismiss_panel",
+    "self_panel_dismiss": "dismiss_panel",
+}
 
 _CANONICAL = {
     "show": "show_panel",
@@ -622,9 +628,13 @@ def build_panel_frame(tool_name: object, arguments: object) -> dict[str, Any] | 
 def is_panel_frame(frame: object) -> bool:
     if not isinstance(frame, dict) or frame.get("type") != "panel":
         return False
-    if set(frame) == {"type", "dismiss"}:
+    keys = set(frame)
+    ident = frame.get("id")
+    if ident is not None and (not isinstance(ident, str) or not ident.startswith("cmd-")):
+        return False
+    if keys <= {"type", "dismiss", "id"} and "dismiss" in keys:
         return frame.get("dismiss") is True
-    if set(frame) != {"type", "panel"}:
+    if not keys <= {"type", "panel", "id"} or "panel" not in keys:
         return False
     document = validate_panel_document(frame.get("panel"))
     return document is not None and document == frame.get("panel")
@@ -758,6 +768,16 @@ def measure_panel(document: dict[str, Any]) -> tuple[str, str, str, int, int, in
     return ident, kind, template, items, images, size
 
 
+def _copy_portal(result: object, payload: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(result, dict):
+        return payload
+    out = dict(payload)
+    for key in ("action_id", "state", "portal_state", "confirmed", "portal_events", "deduped"):
+        if key in result:
+            out[key] = result[key]
+    return out
+
+
 def panel_frame_extension(esp32: Any) -> Any:
     """Voice-tool extension that validates a panel and sends one frame.
 
@@ -803,7 +823,7 @@ def panel_frame_extension(esp32: Any) -> Any:
             if frame.get("dismiss") is True:
                 logger.info("panel outcome id=%s result=dismissed-tool", open_id[0])
                 open_id[0] = "-"
-                return {"ok": True, "dismiss": True}
+                return _copy_portal(result, {"ok": True, "dismiss": True})
             document = frame["panel"]
             ident, kind, template, items, images, size = measure_panel(document)
             logger.info(
@@ -821,7 +841,7 @@ def panel_frame_extension(esp32: Any) -> Any:
                 shown["template"] = template
             if dropped:
                 shown["not_shown"] = dropped
-            return shown
+            return _copy_portal(result, shown)
         return {"ok": False, "error": "panel frame rejected"}
 
     return ToolExtension(
@@ -831,6 +851,6 @@ def panel_frame_extension(esp32: Any) -> Any:
             name: ToolMetadata(True, "portal_panel", 5.0) for name in PANEL_DECLARED_NAMES
         },
         instructions=PANEL_INSTRUCTIONS,
-        instructions_for=lambda: PANEL_INSTRUCTIONS_ONE_VOICE if voiced() else PANEL_INSTRUCTIONS,
+        instructions_for=lambda: PANEL_INSTRUCTIONS,
         declarations_for=lambda: tuple(panel_tool_declarations(one_voice=voiced())),
     )

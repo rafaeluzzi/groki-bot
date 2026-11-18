@@ -144,11 +144,7 @@ def podcast_follow_extension(esp32: Any) -> Any:
             UNFOLLOW_TOOL: ToolMetadata(True, "portal_podcast", 30.0),
         },
         instructions=FOLLOW_INSTRUCTIONS,
-        instructions_for=lambda: (
-            FOLLOW_INSTRUCTIONS_ONE_VOICE
-            if getattr(esp32, "one_voice", False) is True
-            else FOLLOW_INSTRUCTIONS
-        ),
+        instructions_for=lambda: FOLLOW_INSTRUCTIONS,
     )
 
 

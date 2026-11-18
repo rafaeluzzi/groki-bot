@@ -18,7 +18,7 @@ The Portal handlers that accept this frame were not in this repository when the 
 - The frame has no `session_id`. The gateway does not send `abort` with it and does not change Opus audio or the voice session.
 - There is no ack. `ok` from the tool means the gateway checked the call and wrote the frame.
 
-`get_volume` uses that same fire-and-forget frame. The gateway does not wait for a result and does not return a volume number. The tool result is `{"ok":true,"name":"get_volume","reading":"on_device"}`. A reading stays on the device. If the device later sends `{"type":"device_command_result",...}` or any inbound `{"type":"device_command",...}`, the gateway drops that text and does not give it to the model.
+`get_volume` on a device that is not one-voice uses that same fire-and-forget frame. The gateway does not wait for a result and does not return a volume number. The tool result is `{"ok":true,"name":"get_volume","reading":"on_device"}`. In one-voice mode the gateway waits up to 1.5 s and returns `step`, `max`, and `percent`. If the device later sends `{"type":"device_command_result",...}` or any inbound `{"type":"device_command",...}`, the gateway reads the result for the waiting tool and does not give the raw text to the model.
 
 ## Catalog v1
 
@@ -30,7 +30,7 @@ The machine-readable list is `gateway/contract/koji-contract.json`, a copy of gr
 | `set_volume_level` | `{"level": <int 0..100>}` | a step the device maps onto its scale |
 | `volume_up` | `{"steps"?: <int 1..100>}` | one step louder by default |
 | `volume_down` | `{"steps"?: <int 1..100>}` | one step quieter by default |
-| `get_volume` | `{}` | on-device only; no number comes back |
+| `get_volume` | `{}` | one-voice returns step, max, and percent; otherwise on-device only |
 | `media_pause` | `{}` | |
 | `media_resume` | `{}` | |
 | `media_stop` | `{}` | |
@@ -42,6 +42,7 @@ The machine-readable list is `gateway/contract/koji-contract.json`, a copy of gr
 | `open_app` | `{"id": "spotify" \| "koji_settings"}` | `spotify` |
 | `show_settings` | `{"page"?: "device_commands"}` | settings root without `page` |
 | `reconnect_bridge` | `{}` | |
+| `get_state` | `{}` | the live Portal status document |
 
 `open_app` only accepts the app ids the Portal knows. Any other id is not sent, and the gateway never launches a Mac app for it.
 

@@ -35,11 +35,13 @@ def test_one_voice_tells_grok_to_say_the_line():
     legacy = podcast_open_extension(quiet)
     assert legacy.instructions_for() == PODCAST_INSTRUCTIONS
     assert "do not say anything before or after" in legacy.declarations_for()[0]["description"].lower()
+    from stackchan_mcp.portal_skill import portal_skill_block
+
     heard = SimpleNamespace(one_voice=True)
     voiced = podcast_open_extension(heard)
-    text = voiced.instructions_for()
+    text = portal_skill_block()
     assert "The Portal does not speak" in text
-    assert "say one short line from say" in text
+    assert "call the tool before speaking" in text.lower()
     assert "do not say anything before or after" not in voiced.declarations_for()[0]["description"].lower()
 
 

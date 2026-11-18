@@ -88,9 +88,12 @@ def test_unrelated_tool_names_are_not_panel_actions(name):
 
 
 def test_one_voice_panel_instructions_keep_the_full_catalog():
-    text = PANEL_INSTRUCTIONS_ONE_VOICE
-    assert text.startswith("You are the only voice")
-    assert "The Portal does not speak" in text
+    from stackchan_mcp.portal_skill import portal_skill_block
+
+    text = PANEL_INSTRUCTIONS
+    skill = portal_skill_block()
+    assert "You are the only voice" in skill
+    assert "The Portal does not speak" in skill
     for phrase in (
         "webview",
         "chart",
@@ -381,13 +384,14 @@ async def test_gbot_voice_declares_and_forwards_panel_tools(monkeypatch):
     names = {item["name"] for item in declarations}
     assert {
         "show_panel",
-        "self_panel_show",
         "dismiss_panel",
-        "self_panel_dismiss",
         "panel_show",
         "core_morph",
         "core_say",
     } <= names
+    assert "self_panel_show" not in names
+    assert "self_panel_dismiss" not in names
+    assert bridge._local_tools["self_panel_show"] == "show_panel"
     for banned in ("core_draw", "draw", "self_core_draw", "Self_Core_Draw", "self.core.draw"):
         assert banned not in names
     assert "unknown_remote_action" not in bridge._remote_tools

@@ -450,6 +450,13 @@ class ESP32Manager:
         self.koji_context: dict[str, Any] | None = None
         self.announce_podcast: Callable[..., Any] | None = None
         self._command_ids = 0
+        from .portal_read import PortalStatusCache
+        from .quiet_context import QuietContext
+
+        self.portal_cache = PortalStatusCache()
+        self.quiet = QuietContext()
+        self.pending_portal_events: list[dict[str, Any]] = []
+        self.on_portal_frame: Callable[[], Any] | None = None
         self._podcast_waiters: dict[int, list[asyncio.Future]] = {}
         self._command_waiters: dict[str, asyncio.Future] = {}
         self._last_podcast_outcome: dict[str, Any] | None = None
@@ -602,6 +609,7 @@ class ESP32Manager:
                     # Copy the flag before the voice session starts, so its
                     # tool text matches this hello. A later hello refreshes it.
                     self.one_voice = connection.one_voice
+                    self.portal_cache.clear()
                     self.connection_generation += 1
                     self._last_podcast_outcome = None
                     guard = getattr(self, "podcast_guard", None)
@@ -678,6 +686,8 @@ class ESP32Manager:
                                 await refreshed
                         except Exception:
                             logger.warning("portal hello tool refresh failed")
+                    if connection.one_voice:
+                        asyncio.create_task(self._resync_router_status())
 
                     if mcp_supported:
                         # Start initialization as a separate task so the read
@@ -731,6 +741,11 @@ class ESP32Manager:
                         )
                     continue
 
+                elif msg_type in {"portal_status", "portal_event", "action_final"}:
+                    if connection is self._connection:
+                        self._take_portal_frame(data)
+                    continue
+
                 elif msg_type == "device_command":
                     # Fire-and-forget Portal system commands. Not user speech.
                     continue
@@ -749,6 +764,11 @@ class ESP32Manager:
                         stored = store_koji_context(data)
                         if stored is not None:
                             self.koji_context = stored
+                            if isinstance(stored.get("portal_state"), dict):
+                                self.portal_cache.offer(stored["portal_state"], source="portal")
+                            if isinstance(stored.get("portal_events"), list) and stored["portal_events"]:
+                                self.quiet.offer(stored.get("portal_state"), stored["portal_events"])
+                                self.pending_portal_events = list(stored["portal_events"])
                     continue
 
                 elif msg_type == "podcast_result":
@@ -1042,14 +1062,21 @@ class ESP32Manager:
         connection = self._connection
         if connection is None or not connection.connected:
             return None, {"code": -32000, "message": "No ESP32 device connected"}
-        if not is_panel_frame(frame):
+        outgoing = frame
+        if self.one_voice and "id" not in outgoing:
+            outgoing = dict(frame)
+            outgoing["id"] = self.alloc_command_id()
+        if not is_panel_frame(outgoing):
             return None, {"code": -32602, "message": "invalid panel frame"}
         try:
-            result = await connection.send_panel(frame)
+            result = await connection.send_panel(outgoing)
         except Exception as exc:
             return None, {"code": -32000, "message": str(exc)}
         if self._connection is not connection or not connection.connected:
             return None, {"code": -32000, "message": "ESP32 disconnected"}
+        if self.one_voice and isinstance(result, dict):
+            action_id = outgoing.get("id") if isinstance(outgoing.get("id"), str) else ""
+            result = self._finish_portal(result, action_id=action_id, state="done")[0]
         return result, None
 
     def _arm_podcast_waiter(self, seq: int) -> asyncio.Future:
@@ -1115,7 +1142,93 @@ class ESP32Manager:
         if future is None or future.done():
             return
         detail = message.get("detail") if isinstance(message.get("detail"), str) else ""
-        future.set_result({"ok": message.get("ok") is True, "detail": detail})
+        body: dict[str, Any] = {"ok": message.get("ok") is True, "detail": detail}
+        state = message.get("portal_state")
+        if isinstance(state, dict):
+            body["portal_state"] = state
+            self.portal_cache.offer(state, source="portal")
+        for key in ("action_id", "state"):
+            if isinstance(message.get(key), str):
+                body[key] = message[key]
+        if message.get("deduped") is True:
+            body["deduped"] = True
+        future.set_result(body)
+
+    def alloc_command_id(self) -> str:
+        self._command_ids += 1
+        return f"cmd-{self._command_ids}"
+
+    def _finish_portal(
+        self,
+        body: dict[str, Any],
+        *,
+        action_id: str,
+        state: str,
+        portal_state: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], None]:
+        from .portal_state import attach_portal
+
+        out = dict(body)
+        if isinstance(portal_state, dict):
+            self.portal_cache.offer(portal_state, source="portal")
+            out["portal_state"] = portal_state
+        return attach_portal(self, out, action_id=action_id, state=state), None
+
+    async def send_grok_state(self, frame: dict[str, Any]) -> None:
+        """Progress only. A missing socket or a non-one-voice device drops it."""
+        if not self.one_voice:
+            return
+        connection = self._connection
+        if connection is None or not connection.connected:
+            return
+        try:
+            await connection._ws_send(json.dumps(frame, ensure_ascii=False))
+        except Exception:
+            logger.info("grok_state dropped")
+
+    def _take_portal_frame(self, message: dict[str, Any]) -> None:
+        kind = message.get("type")
+        status = message.get("status") if kind == "portal_status" else message.get("portal_state")
+        if isinstance(status, dict):
+            self.portal_cache.offer(status, source="portal")
+        events = message.get("events") if isinstance(message.get("events"), list) else []
+        if kind == "action_final":
+            action = message.get("action") if isinstance(message.get("action"), dict) else {}
+            events = [
+                {
+                    "type": "action_final",
+                    "action_id": action.get("action_id") if isinstance(action.get("action_id"), str) else "",
+                    "state": action.get("state") if isinstance(action.get("state"), str) else "",
+                }
+            ]
+        if events or kind == "portal_event":
+            self.quiet.offer(self.portal_cache.status, events)
+            hook = self.on_portal_frame
+            if callable(hook):
+                try:
+                    result = hook()
+                    if inspect.isawaitable(result):
+                        asyncio.create_task(result)
+                except Exception:
+                    self.pending_portal_events = list(self.quiet.events)
+                    logger.info("portal_event injected=false n=%s", len(self.pending_portal_events))
+            else:
+                self.pending_portal_events = list(self.quiet.events)
+        logger.info("portal_frame type=%s", kind if kind in {"portal_status", "portal_event", "action_final"} else "other")
+
+    async def _resync_router_status(self) -> None:
+        from .portal_read import fetch_router_status
+
+        try:
+            body = await fetch_router_status()
+        except Exception:
+            logger.info("portal_state resync ok=false")
+            return
+        status = body.get("status") if isinstance(body, dict) else None
+        if self.portal_cache.offer(status, source="router"):
+            logger.info("portal_state resync ok=true source=router")
+        else:
+            logger.info("portal_state resync ok=true source=kept")
 
     async def send_podcast(
         self,
@@ -1141,6 +1254,8 @@ class ESP32Manager:
         else:
             seq = None
         stamped = stamp_podcast_frame(frame, one_voice=self.one_voice, seq=seq)
+        if self.one_voice:
+            stamped["id"] = self.alloc_command_id()
         if not is_podcast_frame(stamped):
             return None, {"code": -32602, "message": "invalid podcast frame"}
         show = str(stamped.get("showTitle") or "")
@@ -1159,13 +1274,14 @@ class ESP32Manager:
             return result, None
         last = self._last_podcast_outcome
         self._last_podcast_outcome = None
+        action_id = stamped.get("id") if isinstance(stamped.get("id"), str) else ""
         if waiter is None:
-            return accept_result("sent_unconfirmed", show, stamped, last), None
+            return self._finish_portal(accept_result("sent_unconfirmed", show, stamped, last), action_id=action_id, state="uncertain")
         try:
             accepted = await asyncio.wait_for(waiter, ACCEPT_WAIT_S)
         except asyncio.TimeoutError:
             self._drop_podcast_waiter(stamped.get("seq"), waiter)
-            return accept_result("sent_unconfirmed", show, stamped, last), None
+            return self._finish_portal(accept_result("sent_unconfirmed", show, stamped, last), action_id=action_id, state="uncertain")
         status = accepted.get("status") if isinstance(accepted, dict) else None
         if not isinstance(status, str) or not status:
             status = "sent_unconfirmed"
@@ -1176,7 +1292,9 @@ class ESP32Manager:
         if status == "sent_unconfirmed":
             body["say"] = say_hint("sent_unconfirmed", show)
             body["target"] = podcast_target(stamped)
-        return body, None
+        phase = "in_progress" if status == "opening" else "done"
+        portal = accepted.get("portal_state") if isinstance(accepted, dict) else None
+        return self._finish_portal(body, action_id=action_id, state=phase, portal_state=portal)
 
     async def send_device_command(
         self,
@@ -1203,8 +1321,7 @@ class ESP32Manager:
             seq = None
         command_id = ""
         if self.one_voice:
-            self._command_ids += 1
-            command_id = f"cmd-{self._command_ids}"
+            command_id = self.alloc_command_id()
         stamped = stamp_device_command(frame, one_voice=self.one_voice, seq=seq, command_id=command_id)
         if not is_device_command_frame(stamped):
             return None, {"code": -32602, "message": "invalid device command frame"}
@@ -1225,10 +1342,27 @@ class ESP32Manager:
             accepted = await asyncio.wait_for(waiter, ACCEPT_WAIT_S)
         except asyncio.TimeoutError:
             self._drop_command_waiter(command_id, waiter)
-            return {"ok": True, "confirmed": False}, None
+            from .portal_state import mark_stale
+
+            stale = mark_stale(self.portal_cache.status)
+            missed: dict[str, Any] = {"ok": True, "confirmed": False}
+            if stale is not None:
+                missed["portal_state"] = stale
+            return missed, None
         detail = accepted.get("detail") if isinstance(accepted, dict) else ""
         ok = bool(isinstance(accepted, dict) and accepted.get("ok") is True)
-        return {"ok": ok, "confirmed": True, "detail": detail if isinstance(detail, str) else ""}, None
+        heard: dict[str, Any] = {
+            "ok": ok,
+            "confirmed": True,
+            "detail": detail if isinstance(detail, str) else "",
+        }
+        if isinstance(accepted, dict):
+            for key in ("portal_state", "action_id", "state"):
+                if key in accepted:
+                    heard[key] = accepted[key]
+            if accepted.get("deduped") is True:
+                heard["deduped"] = True
+        return heard, None
 
     async def send_audio_frame(self, opus_frame: bytes) -> None:
         """Push a single Opus frame to the connected device.

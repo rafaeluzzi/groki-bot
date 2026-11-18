@@ -167,14 +167,11 @@ async def test_gbot_voice_forwards_core_aliases_and_leaves_unknown_native_tools(
         }
     )
     names = {item["name"] for item in declarations}
-    assert {
-        "core_morph",
-        "morph",
-        "self_core_morph",
-        "core_say",
-        "say",
-        "self_core_say",
-    } <= names
+    assert {"core_morph", "core_say", "morph"} <= names
+    assert "say" not in names
+    assert "self_core_morph" not in names
+    assert "self_core_say" not in names
+    assert bridge._local_tools["self_core_say"] == "core_say"
     for banned in ("core_draw", "draw", "self_core_draw", "Self_Core_Draw", "self.core.draw"):
         assert banned not in names
     assert "unknown_remote_action" not in bridge._remote_tools

@@ -342,6 +342,7 @@ def is_podcast_frame(frame: object) -> bool:
         "rssEpisode",
         "seq",
         "voice",
+        "id",
     }
     if any(key not in allowed for key in frame):
         return False
@@ -627,7 +628,7 @@ def podcast_open_extension(esp32: Any) -> Any:
         metadata={PODCAST_TOOL_NAME: ToolMetadata(True, "portal_podcast", 30.0)},
         instructions=PODCAST_INSTRUCTIONS,
         bind_result=bind,
-        instructions_for=lambda: PODCAST_INSTRUCTIONS_ONE_VOICE if voiced() else PODCAST_INSTRUCTIONS,
+        instructions_for=lambda: PODCAST_INSTRUCTIONS,
         declarations_for=lambda: tuple(podcast_declarations(one_voice=voiced())),
     )
 

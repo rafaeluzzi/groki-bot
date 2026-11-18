@@ -223,6 +223,19 @@ class GbotVoiceBridge:
             "native_updates": {},
             "response_triggers": {},
         }
+        from .grok_state import GrokProgress
+        from .quiet_context import QuietContext
+
+        self._grok_progress = GrokProgress()
+        self._quiet = QuietContext()
+        self._quiet_system_rejected = False
+        self._skill_logged = False
+        esp = self._executor_options.get("esp32")
+        if esp is not None:
+            try:
+                esp.on_portal_frame = self._on_portal_frame
+            except Exception:
+                pass
 
     def _executor_declares(self, name):
         if self._executor is None:
@@ -429,6 +442,20 @@ class GbotVoiceBridge:
                 wiki = koji_wiki_extension()
                 if wiki is not None:
                     extensions = (*extensions, wiki)
+            from .podcast_followed import podcast_followed_extension
+            from .portal_read import PortalStatusCache, get_portal_state_extension
+
+            extensions = (*extensions, podcast_followed_extension())
+            esp32 = options.get("esp32")
+            cache = getattr(esp32, "portal_cache", None)
+            if not isinstance(cache, PortalStatusCache):
+                cache = PortalStatusCache()
+                if esp32 is not None:
+                    try:
+                        esp32.portal_cache = cache
+                    except Exception:
+                        pass
+            extensions = (*extensions, get_portal_state_extension(esp32, cache))
             options["extensions"] = extensions
             self._executor = (self._executor_factory or VoiceToolExecutor)(**options)
         target = os.getenv("STACKCHAN_TOOL_BOT_ID", "")
@@ -485,10 +512,33 @@ class GbotVoiceBridge:
             self._remote_tools[name] = declaration
             self._tool_schemas[name] = declaration.get("parameters", {})
             declarations.append(declaration)
+        self._register_portal_aliases()
         names = sorted(self._safe_tool_name(item["name"]) for item in declarations)
         self.metrics["declared_tools"] = names
         logger.info("Grok voice declared tools=%s", ",".join(names))
+        self._log_portal_skill(declarations)
         return declarations
+
+    def _register_portal_aliases(self):
+        """Old names still dispatch. They are not declared on the session."""
+        from .core_frames import CORE_DISPATCH_ALIASES
+        from .panel_frames import PANEL_DISPATCH_ALIASES
+
+        for alias, canonical in {**CORE_DISPATCH_ALIASES, **PANEL_DISPATCH_ALIASES}.items():
+            if alias in self._local_tools or canonical not in self._local_tools:
+                continue
+            self._local_tools[alias] = canonical
+            self._tool_schemas[alias] = self._tool_schemas.get(canonical, {})
+
+    def _log_portal_skill(self, declarations):
+        esp = self._executor_options.get("esp32")
+        if getattr(esp, "one_voice", False) is not True or self._skill_logged:
+            return
+        from .portal_skill import portal_skill_block, skill_stats
+
+        count, size = skill_stats(portal_skill_block())
+        self._skill_logged = True
+        logger.info("portal_skill tools=%s bytes=%s declared=%s", count, size, len(declarations))
 
     async def refresh_tools(self) -> bool:
         """Resend tools and instructions after a Portal hello.
@@ -524,6 +574,12 @@ class GbotVoiceBridge:
         )
         if "end_the_call" in self._remote_tools:
             instructions = instructions.replace("end_conversation", "end_the_call")
+        esp = self._executor_options.get("esp32")
+        if getattr(esp, "one_voice", False) is True:
+            from .portal_skill import portal_skill_block
+
+            instructions = instructions + "\n\n" + portal_skill_block()
+            self._log_portal_skill(self.metrics.get("declared_tools") or [])
         return instructions + (
             "\nOnly call tools declared in this session. "
             "Use send_task only when it is declared. "
@@ -649,6 +705,8 @@ class GbotVoiceBridge:
         self._idle_task = None
 
     async def _finish_turn(self, slot=None):
+        self._schedule_grok(self._grok_progress.on_audio_ended())
+        await self._flush_quiet()
         await self._on_turn_complete()
         # Playback has drained and tts stop has been sent. A real answer
         # starts the quiet clock only now, after spoken/delivered is logged.
@@ -1003,6 +1061,101 @@ class GbotVoiceBridge:
         if self._executor:
             self._executor.clear_turn_emotion_face()
 
+    def _on_portal_frame(self):
+        return self._flush_quiet()
+
+    async def _flush_quiet(self) -> bool:
+        esp = self._executor_options.get("esp32")
+        quiet = getattr(esp, "quiet", None) or self._quiet
+        active = bool(self._response_in_progress or getattr(self, "_user_speaking", False))
+        item = quiet.due(time.monotonic(), response_active=active)
+        if item is None:
+            held = list(getattr(quiet, "events", []) or [])
+            if esp is not None and held:
+                esp.pending_portal_events = held
+            logger.info("portal_event injected=%s n=%s", False, len(held))
+            return False
+        try:
+            await self._send(item)
+        except Exception:
+            quiet.fail()
+            if esp is not None:
+                esp.pending_portal_events = quiet.take_attached()
+            logger.info("portal_event injected=%s n=%s", False, len(getattr(esp, "pending_portal_events", [])))
+            return False
+        count = len(item.get("item", {}).get("content", []))
+        quiet.note_sent()
+        logger.info("portal_event injected=%s n=%s", True, count)
+        return True
+
+    async def inject_context_quiet(self, text: str) -> bool:
+        """One conversation item. This never sends response.create."""
+        if not isinstance(text, str) or not text:
+            return False
+        if self._response_in_progress:
+            self._quiet.offer({"rev": 0}, [{"type": "reflex", "what": "note"}])
+            esp = self._executor_options.get("esp32")
+            if esp is not None:
+                esp.pending_portal_events = list(self._quiet.events)
+            logger.info("portal_event injected=%s n=%s", False, 1)
+            return False
+        now = time.monotonic()
+        if now - self._quiet._last_sent < 2.0 and self._quiet._last_sent > 0:
+            logger.info("portal_event injected=%s n=%s", False, 1)
+            return False
+        role = "user" if self._quiet_system_rejected else "system"
+        body = text
+        if role == "user" and not text.startswith("[portal status, context only, do not reply]"):
+            body = "[portal status, context only, do not reply] " + text
+        await self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": role,
+                    "content": [{"type": "input_text", "text": body}],
+                },
+            }
+        )
+        self._quiet._last_sent = now
+        self._quiet_text = body
+        self._quiet_outstanding = role == "system"
+        logger.info("portal_event injected=%s n=%s", True, 1)
+        return True
+
+    async def _resend_quiet_as_user(self) -> None:
+        text = getattr(self, "_quiet_text", "")
+        if not isinstance(text, str) or not text:
+            return
+        if not text.startswith("[portal status, context only, do not reply]"):
+            text = "[portal status, context only, do not reply] " + text
+        await self._send(
+            {
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+
+    def _schedule_grok(self, state):
+        if state is None:
+            return
+        esp = self._executor_options.get("esp32")
+        if getattr(esp, "one_voice", False) is not True:
+            return
+        from .grok_state import grok_state_frame
+        from .koji_voice import context_seq
+
+        seq = context_seq(getattr(esp, "koji_context", None))
+        frame = grok_state_frame(state, seq)
+        logger.debug("grok_state state=%s seq=%s", state, -1 if seq is None else seq)
+        send = getattr(esp, "send_grok_state", None)
+        if callable(send):
+            asyncio.create_task(send(frame))
+
     async def send_keepalive_audio(self, pcm):
         await self._send_pcm(pcm)
 
@@ -1309,9 +1462,11 @@ class GbotVoiceBridge:
             counts = self.metrics["response_triggers"]
             counts[trigger] = counts.get(trigger, 0) + 1
             logger.info("Grok voice response state=created trigger=%s", trigger)
+            self._schedule_grok(self._grok_progress.on_response_created())
             self.response_started_at[self._active_response] = time.monotonic()
             self._drop_until_response = False
         elif kind == "input_audio_buffer.speech_started":
+            self._grok_progress.on_speech_started()
             self._maybe_warm()
             self._response_progress_at = None
             self.metrics["speech_starts"] += 1
@@ -1322,7 +1477,11 @@ class GbotVoiceBridge:
                 self._turn_task and not self._turn_task.done()
             ):
                 await self.interrupt()
-        elif kind == "input_audio_buffer.speech_stopped":
+        elif kind in {"input_audio_buffer.speech_stopped", "input_audio_buffer.committed"}:
+            if kind == "input_audio_buffer.speech_stopped" or kind == "input_audio_buffer.committed":
+                self._schedule_grok(self._grok_progress.on_user_audio_boundary())
+            if kind != "input_audio_buffer.speech_stopped":
+                return
             self._response_progress_at = time.monotonic()
             self._user_speaking = False
             # Native completions must not depend on a subsequent VAD response.
@@ -1368,6 +1527,7 @@ class GbotVoiceBridge:
                 return
             self._response_progress_at = None
             self._response_in_progress = False
+            self._schedule_grok(self._grok_progress.on_response_done())
             slot = self._settle_desktop_response(response_id, event)
             if response_id not in self._suppressed:
                 # Order normal completion after its audio without blocking VAD.
@@ -1380,6 +1540,7 @@ class GbotVoiceBridge:
             has_id = isinstance(event.get("call_id"), str) and bool(event["call_id"])
             counts = self.metrics["tool_events"]
             counts[name] = counts.get(name, 0) + 1
+            self._schedule_grok(self._grok_progress.on_tool())
             logger.info(
                 "Grok voice tool event name=%s call_id_present=%s user_epoch=%d desktop_epoch=%d",
                 name,
@@ -1418,6 +1579,10 @@ class GbotVoiceBridge:
                 "model",
                 "tools",
             }
+            if getattr(self, "_quiet_outstanding", False) and code in {"invalid_request_error", "invalid_value"}:
+                self._quiet_outstanding = False
+                self._quiet_system_rejected = True
+                asyncio.create_task(self._resend_quiet_as_user())
             code = code if code in allowed_codes else "other"
             param = param if param in allowed_params else "other"
             key = code + ":" + param

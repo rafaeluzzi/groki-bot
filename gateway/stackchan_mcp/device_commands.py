@@ -70,6 +70,7 @@ DEVICE_COMMAND_ARGS: dict[str, dict[str, dict[str, Any]]] = {
     "open_app": {"id": {"type": "enum", "values": list(PORTAL_APP_IDS), "required": True}},
     "show_settings": {"page": {"type": "enum", "values": ["device_commands"]}},
     "reconnect_bridge": {},
+    "get_state": {},
 }
 
 DEVICE_COMMAND_NAMES = tuple(DEVICE_COMMAND_ARGS)
@@ -136,7 +137,7 @@ DEVICE_COMMAND_INSTRUCTIONS_ONE_VOICE = (
     'A request such as 50% is set_volume_percent with args {"percent": 50}. '
     "If confirmed is false, say you are not sure it landed. "
     "If local_attempt is set, say that detail and do not send the same command again. "
-    "get_volume returns reading on_device and no volume number; do not invent one."
+    "get_volume waits for the Portal and returns step, max, and percent. Do not invent a number."
 )
 
 DEVICE_COMMAND_INSTRUCTIONS = (
@@ -372,6 +373,24 @@ def device_command_extension(esp32: Any) -> Any:
                     payload["detail"] = result["detail"]
             if frame["name"] == "get_volume" and confirmed is None:
                 payload["reading"] = "on_device"
+            if frame["name"] == "get_volume" and voiced() and confirmed is True:
+                from .portal_state import parse_volume
+
+                parsed = parse_volume(payload.get("detail") or "")
+                if parsed:
+                    payload.update(parsed)
+            state = result.get("portal_state") if isinstance(result, dict) else None
+            if isinstance(state, dict):
+                payload["portal_state"] = state
+            for key in ("action_id", "state"):
+                if isinstance(result, dict) and isinstance(result.get(key), str) and result.get(key):
+                    payload[key] = result[key]
+            if isinstance(result, dict) and result.get("deduped") is True:
+                payload["deduped"] = True
+            pending = getattr(esp32, "pending_portal_events", None)
+            if voiced() and isinstance(pending, list) and pending:
+                payload["portal_events"] = pending
+                esp32.pending_portal_events = []
             if voiced():
                 context = getattr(esp32, "koji_context", None)
                 attempt = context.get("local_attempt") if isinstance(context, dict) else None
@@ -390,6 +409,6 @@ def device_command_extension(esp32: Any) -> Any:
             name: ToolMetadata(True, "portal_device", 5.0) for name in DEVICE_COMMAND_DECLARED_NAMES
         },
         instructions=DEVICE_COMMAND_INSTRUCTIONS,
-        instructions_for=lambda: DEVICE_COMMAND_INSTRUCTIONS_ONE_VOICE if voiced() else DEVICE_COMMAND_INSTRUCTIONS,
+        instructions_for=lambda: "" if voiced() else DEVICE_COMMAND_INSTRUCTIONS,
         declarations_for=lambda: tuple(device_command_declarations(one_voice=voiced())),
     )

@@ -84,8 +84,11 @@ async def test_one_voice_device_result_includes_the_local_attempt():
         async def send_device_command(self, frame):
             return {"ok": True, "confirmed": True, "detail": "paused"}, None
 
+    from stackchan_mcp.portal_skill import portal_skill_block
+
     voiced = device_command_extension(Device())
-    assert "The Portal does not speak" in voiced.instructions_for()
+    assert voiced.instructions_for() == ""
+    assert "The Portal does not speak" in portal_skill_block()
     result = await voiced.dispatch("device_command", {"name": "media_pause", "args": {}})
     assert result["local_attempt"]["name"] == "pause"
     assert result["local_attempt"]["detail"] == "nothing playing"
