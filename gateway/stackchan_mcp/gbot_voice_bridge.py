@@ -299,7 +299,10 @@ class GbotVoiceBridge:
             {
                 "name": alias,
                 "type": "function",
-                "description": panel_tool_description(canonical),
+                "description": panel_tool_description(
+                    canonical,
+                    one_voice=getattr(self._executor_options.get("esp32"), "one_voice", False) is True,
+                ),
                 "parameters": self._tool_schemas[alias],
             }
         )
@@ -336,7 +339,10 @@ class GbotVoiceBridge:
             {
                 "name": alias,
                 "type": "function",
-                "description": device_command_description(canonical),
+                "description": device_command_description(
+                    canonical,
+                    one_voice=getattr(self._executor_options.get("esp32"), "one_voice", False) is True,
+                ),
                 "parameters": self._tool_schemas[alias],
             }
         )
@@ -387,6 +393,16 @@ class GbotVoiceBridge:
                 }
                 if "podcast_open_spotify" not in declared:
                     extensions = (*extensions, podcast_open_extension(options.get("esp32")))
+            from .podcast_follow import podcast_follow_extension
+
+            if podcast_open_enabled():
+                declared = {
+                    entry.get("name")
+                    for ext in extensions
+                    for entry in getattr(ext, "declarations", ())
+                }
+                if "podcast_follow" not in declared:
+                    extensions = (*extensions, podcast_follow_extension(options.get("esp32")))
             from .roku_play import roku_play_enabled, roku_play_extension
 
             if roku_play_enabled():
@@ -473,6 +489,26 @@ class GbotVoiceBridge:
         self.metrics["declared_tools"] = names
         logger.info("Grok voice declared tools=%s", ",".join(names))
         return declarations
+
+    async def refresh_tools(self) -> bool:
+        """Resend tools and instructions after a Portal hello.
+
+        The session.update that opens the voice session is built once. If the
+        Portal connects, or reconnects with one_voice, after that, this sends
+        a fresh session.update from the flag on the device now.
+        """
+        if not self.running or self._stopped or self._ws is None:
+            return False
+        session = self._session_snapshot if isinstance(getattr(self, "_session_snapshot", None), dict) else {}
+        declarations = self._configure_tools(session)
+        base = session.get("instructions", "Always speak English. Keep replies short and natural.")
+        extra = self._provider_tool_instructions() if self._executor and self._local_tools_enabled else ""
+        instructions = base + ("\n\n" + extra if extra else "")
+        await self._send({
+            "type": "session.update",
+            "session": {"instructions": instructions, "tools": declarations},
+        })
+        return True
 
     def _provider_tool_instructions(self):
         if not self._executor or not self._local_tools_enabled:
@@ -1071,6 +1107,7 @@ class GbotVoiceBridge:
             del credential
             stage = "configure_tools"
             self.metrics["startup_stage"] = stage
+            self._session_snapshot = session
             declarations = self._configure_tools(session)
             stage = "provider_instructions"
             self.metrics["startup_stage"] = stage

@@ -152,6 +152,7 @@ class Gateway:
         self.esp32.on_device_state = self.idle_gate.notify_device_state
         self.esp32.on_wake_detected = self._run_wake_response
         self.esp32.on_end_conversation = self._handle_end_conversation
+        self.esp32.on_portal_hello = self._refresh_voice_tools
         self._running = False
         self._http_runner: web.AppRunner | None = None
 
@@ -176,6 +177,13 @@ class Gateway:
     def _active_voice_proxy(self):
         connection = getattr(self.esp32, "connection", None)
         return getattr(connection, "cloud_proxy", None)
+
+    async def _refresh_voice_tools(self):
+        """A Portal hello arrived after the voice session was built. Resend its tools."""
+        proxy = self._active_voice_proxy()
+        refresh = getattr(getattr(proxy, "_bridge", None), "refresh_tools", None)
+        if callable(refresh):
+            await refresh()
 
     @property
     def capture_port(self) -> int:

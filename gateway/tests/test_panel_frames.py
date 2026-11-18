@@ -12,6 +12,7 @@ from stackchan_mcp.panel_frames import (
     PANEL_DECLARED_NAMES,
     PANEL_EXAMPLE,
     PANEL_INSTRUCTIONS,
+    PANEL_INSTRUCTIONS_ONE_VOICE,
     build_panel_frame,
     is_panel_frame,
     normalize_panel_document,
@@ -84,6 +85,24 @@ def test_panel_tool_names_map_to_one_action(name, action):
 )
 def test_unrelated_tool_names_are_not_panel_actions(name):
     assert panel_action_for_tool(name) is None
+
+
+def test_one_voice_panel_instructions_keep_the_full_catalog():
+    text = PANEL_INSTRUCTIONS_ONE_VOICE
+    assert text.startswith("You are the only voice")
+    assert "The Portal does not speak" in text
+    for phrase in (
+        "webview",
+        "chart",
+        "ttl_s",
+        "Podcasts I follow",
+        "A button tap arrives as a user turn",
+        "Podcasts or Spotify?",
+        "The same id updates in place",
+    ):
+        assert phrase in text
+    heard = panel_frame_extension(type("Device", (), {"one_voice": True})())
+    assert heard.instructions_for() == text
 
 
 def test_panel_instructions_name_the_screen_rules():

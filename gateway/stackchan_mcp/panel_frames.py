@@ -160,6 +160,20 @@ _DISMISS_DESCRIPTION = (
     "This does not speak audio. ok means the dismiss frame was sent."
 )
 
+_SHOW_ONE_VOICE = (
+    "Call show_panel before speaking. After it returns, say one short line. The Portal does not speak. "
+)
+
+_DISMISS_ONE_VOICE = (
+    "Call dismiss_panel before speaking. After it returns, say one short line. The Portal does not speak. "
+    "ok means the dismiss frame was sent."
+)
+
+_ONE_VOICE_PANEL = (
+    "You are the only voice. The Portal does not speak. "
+    "Call the tool before speaking. After it returns, say one short line. "
+)
+
 PANEL_INSTRUCTIONS = (
     "A panel sits beside the orb and takes about two thirds of the screen. "
     "When a list, what is playing, or a short choice fits, call show_panel with a "
@@ -184,6 +198,8 @@ PANEL_INSTRUCTIONS = (
     "Do not claim the panel showed before the tool returns ok. "
     "Do not end every reply with an open-ended follow-up."
 )
+
+PANEL_INSTRUCTIONS_ONE_VOICE = _ONE_VOICE_PANEL + PANEL_INSTRUCTIONS
 
 
 def panel_frames_enabled() -> bool:
@@ -686,22 +702,25 @@ def panel_action_delivery(frame: object, *, session_live: bool) -> tuple[str | N
     return f'User tapped "{label}" on panel "{panel}".', "delivered"
 
 
-def panel_tool_description(name: str) -> str:
+def panel_tool_description(name: str, *, one_voice: bool = False) -> str:
     action = panel_action_for_tool(name)
     if action is None:
         raise ValueError("not a panel tool")
     canonical = _CANONICAL[action]
-    text = _DISMISS_DESCRIPTION if action == "dismiss" else _SHOW_DESCRIPTION
+    if one_voice:
+        text = _DISMISS_ONE_VOICE if action == "dismiss" else _SHOW_ONE_VOICE + _SHOW_DESCRIPTION
+    else:
+        text = _DISMISS_DESCRIPTION if action == "dismiss" else _SHOW_DESCRIPTION
     if name != canonical:
         return f"Alias of {canonical}. " + text
     return text
 
 
-def panel_tool_declarations() -> list[dict[str, Any]]:
+def panel_tool_declarations(*, one_voice: bool = False) -> list[dict[str, Any]]:
     return [
         {
             "name": name,
-            "description": panel_tool_description(name),
+            "description": panel_tool_description(name, one_voice=one_voice),
             "parameters": panel_tool_parameters(name),
         }
         for name in PANEL_DECLARED_NAMES
@@ -748,6 +767,9 @@ def panel_frame_extension(esp32: Any) -> Any:
     """
     from .panel_images import cap_panel_payload, inline_panel_argument
     from .voice_tools import ToolExtension, ToolMetadata
+
+    def voiced() -> bool:
+        return getattr(esp32, "one_voice", False) is True
 
     declarations = tuple(panel_tool_declarations())
     open_id = ["-"]
@@ -809,4 +831,6 @@ def panel_frame_extension(esp32: Any) -> Any:
             name: ToolMetadata(True, "portal_panel", 5.0) for name in PANEL_DECLARED_NAMES
         },
         instructions=PANEL_INSTRUCTIONS,
+        instructions_for=lambda: PANEL_INSTRUCTIONS_ONE_VOICE if voiced() else PANEL_INSTRUCTIONS,
+        declarations_for=lambda: tuple(panel_tool_declarations(one_voice=voiced())),
     )

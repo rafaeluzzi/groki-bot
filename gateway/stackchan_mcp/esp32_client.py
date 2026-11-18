@@ -30,6 +30,9 @@ from .protocol import HelloResponse, make_mcp_message, parse_jsonrpc_response
 
 logger = logging.getLogger(__name__)
 
+# Omitted seq means "read the context at send time". A tool passes the seq it saw at dispatch.
+_TURN_SEQ_UNSET = object()
+
 # Timeout for waiting for ESP32 responses
 RESPONSE_TIMEOUT = 300.0
 
@@ -73,6 +76,7 @@ class ESP32Connection:
         # a connection built outside the hello handshake (as in tests)
         # keeps the historical "assume full MCP" behaviour.
         self.mcp_supported: bool = True
+        self.one_voice: bool = False
 
     @property
     def connected(self) -> bool:
@@ -438,6 +442,17 @@ class ESP32Manager:
         self.on_head_command: Callable[[], None] | None = None
         self.on_device_state: Callable[[str], None] | None = None
         self.on_wake_detected: Callable[[], Awaitable[None]] | None = None
+        # Podcast turn key when the Portal has not sent a context seq.
+        self.listen_starts = 0
+        self.connection_generation = 0
+        self.one_voice = False
+        self.on_portal_hello: Callable[[], Any] | None = None
+        self.koji_context: dict[str, Any] | None = None
+        self.announce_podcast: Callable[..., Any] | None = None
+        self._command_ids = 0
+        self._podcast_waiters: dict[int, list[asyncio.Future]] = {}
+        self._command_waiters: dict[str, asyncio.Future] = {}
+        self._last_podcast_outcome: dict[str, Any] | None = None
 
     @property
     def device_connected(self) -> bool:
@@ -579,8 +594,20 @@ class ESP32Manager:
                 if msg_type == "hello":
                     # ESP32 hello handshake
                     features = data.get("features", {})
+                    if not isinstance(features, dict):
+                        features = {}
                     mcp_supported = bool(features.get("mcp"))
                     connection.mcp_supported = mcp_supported
+                    connection.one_voice = features.get("one_voice") is True
+                    # Copy the flag before the voice session starts, so its
+                    # tool text matches this hello. A later hello refreshes it.
+                    self.one_voice = connection.one_voice
+                    self.connection_generation += 1
+                    self._last_podcast_outcome = None
+                    guard = getattr(self, "podcast_guard", None)
+                    reset = getattr(guard, "reset", None)
+                    if callable(reset):
+                        reset()
                     if not mcp_supported:
                         # Voice-only chassis (e.g. ciniml/stackchan-idf's
                         # XiaoZhiClient): accept the connection for audio +
@@ -639,7 +666,18 @@ class ESP32Manager:
                             self._debug_status.on_tts_state(False, source="device")
                             self._debug_status.on_tts_state(False, source="local")
                         self._connection = connection
+                        self.one_voice = connection.one_voice
+                        self.koji_context = None
+                        self._last_podcast_outcome = None
                         self._debug_status.on_device_connected(device_id)
+                    hook = self.on_portal_hello
+                    if callable(hook):
+                        try:
+                            refreshed = hook()
+                            if inspect.isawaitable(refreshed):
+                                await refreshed
+                        except Exception:
+                            logger.warning("portal hello tool refresh failed")
 
                     if mcp_supported:
                         # Start initialization as a separate task so the read
@@ -693,9 +731,29 @@ class ESP32Manager:
                         )
                     continue
 
-                elif msg_type in {"device_command", "device_command_result"}:
-                    # Fire-and-forget Portal system commands. A result, including
-                    # get_volume, stays on the device and is not user speech.
+                elif msg_type == "device_command":
+                    # Fire-and-forget Portal system commands. Not user speech.
+                    continue
+
+                elif msg_type == "device_command_result":
+                    # The tool waiter reads this. It is never user speech.
+                    if connection is self._connection:
+                        self._take_command_result(data)
+                    continue
+
+                elif msg_type == "koji_context":
+                    # Screen context for this ask. Stored, never forwarded.
+                    if connection is self._connection:
+                        from .koji_voice import store_koji_context
+
+                        stored = store_koji_context(data)
+                        if stored is not None:
+                            self.koji_context = stored
+                    continue
+
+                elif msg_type == "podcast_result":
+                    if connection is self._connection:
+                        self._take_podcast_result(data)
                     continue
 
                 elif msg_type == "koji_presence":
@@ -994,33 +1052,136 @@ class ESP32Manager:
             return None, {"code": -32000, "message": "ESP32 disconnected"}
         return result, None
 
+    def _arm_podcast_waiter(self, seq: int) -> asyncio.Future:
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._podcast_waiters.setdefault(seq, []).append(future)
+        return future
+
+    def _drop_podcast_waiter(self, seq: object, future: asyncio.Future | None) -> None:
+        if future is None or not isinstance(seq, int):
+            return
+        waiting = [item for item in self._podcast_waiters.get(seq, []) if item is not future]
+        if waiting:
+            self._podcast_waiters[seq] = waiting
+        else:
+            self._podcast_waiters.pop(seq, None)
+
+    def _arm_command_waiter(self, command_id: str) -> asyncio.Future:
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._command_waiters[command_id] = future
+        return future
+
+    def _drop_command_waiter(self, command_id: str, future: asyncio.Future | None) -> None:
+        if future is None:
+            return
+        if self._command_waiters.get(command_id) is future:
+            self._command_waiters.pop(command_id, None)
+
+    def _take_podcast_result(self, message: dict[str, Any]) -> None:
+        from .koji_voice import final_instruction
+
+        seq = message.get("seq")
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            return
+        phase = message.get("phase")
+        show = message.get("show") if isinstance(message.get("show"), str) else ""
+        if phase == "accepted":
+            status = message.get("status") if isinstance(message.get("status"), str) else ""
+            for future in self._podcast_waiters.pop(seq, []):
+                if not future.done():
+                    future.set_result({"status": status, "show": show})
+            return
+        if phase != "final":
+            return
+        outcome = message.get("outcome") if isinstance(message.get("outcome"), str) else ""
+        if outcome in {"spotify_playing", "cancelled"}:
+            self._last_podcast_outcome = {"outcome": outcome, "show": show}
+            return
+        text = final_instruction(outcome, show)
+        if text is None:
+            return
+        announce = self.announce_podcast
+        if not callable(announce):
+            return
+        result = announce(text)
+        if inspect.isawaitable(result):
+            asyncio.create_task(result)
+
+    def _take_command_result(self, message: dict[str, Any]) -> None:
+        command_id = message.get("id")
+        if not isinstance(command_id, str) or not command_id:
+            return
+        future = self._command_waiters.pop(command_id, None)
+        if future is None or future.done():
+            return
+        detail = message.get("detail") if isinstance(message.get("detail"), str) else ""
+        future.set_result({"ok": message.get("ok") is True, "detail": detail})
+
     async def send_podcast(
         self,
         frame: dict[str, Any],
+        turn_seq: Any = _TURN_SEQ_UNSET,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Send a Portal ``type:podcast`` frame on the current device socket.
 
-        There is no ack: ok means the frame was written. The Portal says the
-        announce line and opens Spotify when a link is set.
+        There is no ack: ok means the frame was written. In one-voice mode the
+        Portal stays silent and Grok says the line. ``turn_seq`` is the ask
+        seq from when the tool started.
         """
         connection = self._connection
         if connection is None or not connection.connected:
             return None, {"code": -32000, "message": "No ESP32 device connected"}
+        from .koji_voice import ACCEPT_WAIT_S, accept_result, context_seq, podcast_target, say_hint, stamp_podcast_frame
         from .podcast_open import is_podcast_frame
 
-        if not is_podcast_frame(frame):
+        if turn_seq is _TURN_SEQ_UNSET:
+            seq = context_seq(self.koji_context)
+        elif isinstance(turn_seq, int) and not isinstance(turn_seq, bool):
+            seq = turn_seq
+        else:
+            seq = None
+        stamped = stamp_podcast_frame(frame, one_voice=self.one_voice, seq=seq)
+        if not is_podcast_frame(stamped):
             return None, {"code": -32602, "message": "invalid podcast frame"}
+        show = str(stamped.get("showTitle") or "")
+        waiter = None
+        if self.one_voice and isinstance(stamped.get("seq"), int):
+            waiter = self._arm_podcast_waiter(stamped["seq"])
         try:
-            result = await connection.send_podcast(frame)
+            result = await connection.send_podcast(stamped)
         except Exception as exc:
+            self._drop_podcast_waiter(stamped.get("seq"), waiter)
             return None, {"code": -32000, "message": str(exc)}
         if self._connection is not connection or not connection.connected:
+            self._drop_podcast_waiter(stamped.get("seq"), waiter)
             return None, {"code": -32000, "message": "ESP32 disconnected"}
-        return result, None
+        if not self.one_voice:
+            return result, None
+        last = self._last_podcast_outcome
+        self._last_podcast_outcome = None
+        if waiter is None:
+            return accept_result("sent_unconfirmed", show, stamped, last), None
+        try:
+            accepted = await asyncio.wait_for(waiter, ACCEPT_WAIT_S)
+        except asyncio.TimeoutError:
+            self._drop_podcast_waiter(stamped.get("seq"), waiter)
+            return accept_result("sent_unconfirmed", show, stamped, last), None
+        status = accepted.get("status") if isinstance(accepted, dict) else None
+        if not isinstance(status, str) or not status:
+            status = "sent_unconfirmed"
+        heard = accepted.get("show") if isinstance(accepted, dict) else None
+        if isinstance(heard, str) and heard.strip():
+            show = heard
+        body = accept_result(status, show, stamped, last)
+        if status == "sent_unconfirmed":
+            body["say"] = say_hint("sent_unconfirmed", show)
+            body["target"] = podcast_target(stamped)
+        return body, None
 
     async def send_device_command(
         self,
         frame: dict[str, Any],
+        turn_seq: Any = _TURN_SEQ_UNSET,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         """Send a Portal ``type:device_command`` frame on the current device socket.
 
@@ -1032,15 +1193,42 @@ class ESP32Manager:
         connection = self._connection
         if connection is None or not connection.connected:
             return None, {"code": -32000, "message": "No ESP32 device connected"}
-        if not is_device_command_frame(frame):
+        from .koji_voice import ACCEPT_WAIT_S, context_seq, stamp_device_command
+
+        if turn_seq is _TURN_SEQ_UNSET:
+            seq = context_seq(self.koji_context)
+        elif isinstance(turn_seq, int) and not isinstance(turn_seq, bool):
+            seq = turn_seq
+        else:
+            seq = None
+        command_id = ""
+        if self.one_voice:
+            self._command_ids += 1
+            command_id = f"cmd-{self._command_ids}"
+        stamped = stamp_device_command(frame, one_voice=self.one_voice, seq=seq, command_id=command_id)
+        if not is_device_command_frame(stamped):
             return None, {"code": -32602, "message": "invalid device command frame"}
+        waiter = None
+        if self.one_voice and command_id:
+            waiter = self._arm_command_waiter(command_id)
         try:
-            result = await connection.send_device_command(frame)
+            result = await connection.send_device_command(stamped)
         except Exception as exc:
+            self._drop_command_waiter(command_id, waiter)
             return None, {"code": -32000, "message": str(exc)}
         if self._connection is not connection or not connection.connected:
+            self._drop_command_waiter(command_id, waiter)
             return None, {"code": -32000, "message": "ESP32 disconnected"}
-        return result, None
+        if waiter is None:
+            return result, None
+        try:
+            accepted = await asyncio.wait_for(waiter, ACCEPT_WAIT_S)
+        except asyncio.TimeoutError:
+            self._drop_command_waiter(command_id, waiter)
+            return {"ok": True, "confirmed": False}, None
+        detail = accepted.get("detail") if isinstance(accepted, dict) else ""
+        ok = bool(isinstance(accepted, dict) and accepted.get("ok") is True)
+        return {"ok": ok, "confirmed": True, "detail": detail if isinstance(detail, str) else ""}, None
 
     async def send_audio_frame(self, opus_frame: bytes) -> None:
         """Push a single Opus frame to the connected device.
@@ -1095,6 +1283,8 @@ class ESP32Manager:
         msg_type = message.get("type", "")
         state = str(message.get("state", "")).lower()
         if msg_type == "listen":
+            if state == "start":
+                self.listen_starts += 1
             if state in {"start", "detect"}:
                 if callback is not None:
                     callback("listening")

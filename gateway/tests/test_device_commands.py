@@ -47,6 +47,51 @@ def test_command_names_and_mac_tools_are_not_the_tool(name):
     assert device_command_for_tool(name) is None
 
 
+@pytest.mark.asyncio
+async def test_device_command_uses_the_seq_from_dispatch_start():
+    class Device:
+        def __init__(self):
+            self.koji_context = {"seq": 3}
+            self.seen = None
+
+        async def send_device_command(self, frame, turn_seq=None):
+            self.seen = turn_seq
+            self.koji_context = {"seq": 8}
+            return {"ok": True}, None
+
+    device = Device()
+    result = await device_command_extension(device).dispatch(
+        "device_command",
+        {"name": "media_pause", "args": {}},
+    )
+    assert result["ok"] is True
+    assert device.seen == 3
+
+
+def test_one_voice_instructions_stay_off_until_the_device_asks():
+    from types import SimpleNamespace
+
+    quiet = device_command_extension(SimpleNamespace(one_voice=False))
+    assert quiet.instructions_for() == DEVICE_COMMAND_INSTRUCTIONS
+
+
+@pytest.mark.asyncio
+async def test_one_voice_device_result_includes_the_local_attempt():
+    class Device:
+        one_voice = True
+        koji_context = {"local_attempt": {"name": "pause", "detail": "nothing playing"}}
+
+        async def send_device_command(self, frame):
+            return {"ok": True, "confirmed": True, "detail": "paused"}, None
+
+    voiced = device_command_extension(Device())
+    assert "The Portal does not speak" in voiced.instructions_for()
+    result = await voiced.dispatch("device_command", {"name": "media_pause", "args": {}})
+    assert result["local_attempt"]["name"] == "pause"
+    assert result["local_attempt"]["detail"] == "nothing playing"
+    assert "nothing playing" not in voiced.instructions_for()
+
+
 def test_instructions_keep_portal_controls_off_the_mac():
     text = DEVICE_COMMAND_INSTRUCTIONS
     assert "stay on this device" in text
@@ -175,6 +220,26 @@ async def test_extension_sends_one_frame_and_does_not_wait_for_a_result():
     assert len(sent) == 3
     missed = await extension.dispatch("open_app", {"name": "spotify"})
     assert missed == {"ok": False, "error": "invalid device command arguments"}
+
+
+@pytest.mark.asyncio
+async def test_extension_returns_a_confirmed_result_or_an_unconfirmed_timeout():
+    class Device:
+        def __init__(self, result):
+            self.result = result
+
+        async def send_device_command(self, frame):
+            return self.result, None
+
+    quiet = device_command_extension(Device({"ok": True, "confirmed": False}))
+    missed = await quiet.dispatch("device_command", {"name": "media_pause", "args": {}})
+    assert missed["ok"] is True
+    assert missed["confirmed"] is False
+
+    heard = device_command_extension(Device({"ok": True, "confirmed": True, "detail": "level 1"}))
+    done = await heard.dispatch("device_command", {"name": "media_pause", "args": {}})
+    assert done["confirmed"] is True
+    assert done["detail"] == "level 1"
 
 
 @pytest.mark.asyncio

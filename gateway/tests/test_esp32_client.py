@@ -68,6 +68,9 @@ async def test_listen_detect_triggers_wake_callback_without_state_callback():
     mgr._observe_device_state({"type": "listen", "state": "detect"})
 
     await asyncio.wait_for(wake_detected.wait(), timeout=1.0)
+    assert mgr.listen_starts == 0
+    mgr._observe_device_state({"type": "listen", "state": "start"})
+    assert mgr.listen_starts == 1
 
 
 @pytest.mark.asyncio
@@ -1533,3 +1536,234 @@ async def _complete_handshake(ws, tools=None):
         },
     }
     await ws.send(json.dumps(tools_resp))
+
+
+def _podcast_frame():
+    return {
+        "type": "podcast",
+        "announce": "Opening Hard Fork.",
+        "showTitle": "Hard Fork",
+        "openSpotifyUri": "spotify:show:hf",
+    }
+
+
+async def _voice_hello(ws, *, one_voice: bool):
+    await ws.send(json.dumps({
+        "type": "hello",
+        "version": 1,
+        "transport": "websocket",
+        "features": {"mcp": False, "one_voice": one_voice},
+    }))
+    hello = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+    assert hello["type"] == "hello"
+    await asyncio.sleep(0.05)
+
+
+@pytest.mark.asyncio
+async def test_one_voice_stamps_frames_and_waits_for_results(manager, caplog, monkeypatch):
+    import logging
+
+    from stackchan_mcp import koji_voice
+
+    monkeypatch.setattr(koji_voice, "ACCEPT_WAIT_S", 0.15)
+    caplog.set_level(logging.INFO, logger="stackchan_mcp.koji_voice")
+    port = manager._test_port
+    frame = _podcast_frame()
+
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await _voice_hello(ws, one_voice=False)
+        plain, error = await manager.send_podcast(frame)
+        raw = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert error is None
+        assert plain == {"ok": True}
+        assert "seq" not in raw
+        assert "voice" not in raw
+
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await _voice_hello(ws, one_voice=True)
+        await ws.send(json.dumps({
+            "type": "koji_context",
+            "v": 1,
+            "seq": 4,
+            "panel": {
+                "id": "suggestions",
+                "title": "Podcast-suggestions",
+                "rows": [{"n": 1, "label": "Decoder Secret Label"}],
+            },
+        }))
+        await asyncio.sleep(0.05)
+        assert manager.koji_context["seq"] == 4
+        assert manager.koji_context["panel"]["rows"][0]["label"] == "Decoder Secret Label"
+        assert "koji_context seq=4 panel=suggestions rows=1" in caplog.text
+        assert "Decoder Secret Label" not in caplog.text
+
+        pending = asyncio.create_task(manager.send_podcast(frame))
+        stamped = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert stamped["seq"] == 4
+        assert stamped["voice"] == "grok"
+        assert stamped["announce"] == frame["announce"]
+        await ws.send(json.dumps({
+            "type": "podcast_result",
+            "seq": 4,
+            "show": "Hard Fork",
+            "phase": "accepted",
+            "status": "opening",
+        }))
+        opened, open_error = await pending
+        assert open_error is None
+        assert opened["status"] == "opening"
+        assert opened["show"] == "Hard Fork"
+        assert opened["target"] == "spotify"
+        assert len(opened["say"].replace(".", "").split()) <= 8
+
+        called = []
+
+        async def announce(text):
+            called.append(text)
+
+        manager.announce_podcast = announce
+        await ws.send(json.dumps({
+            "type": "podcast_result",
+            "seq": 4,
+            "show": "Hard Fork",
+            "phase": "final",
+            "outcome": "rss_playing",
+        }))
+        await asyncio.sleep(0.05)
+        assert len(called) == 1
+        assert "Portal speaker" in called[0]
+        await ws.send(json.dumps({
+            "type": "podcast_result",
+            "seq": 4,
+            "show": "Hard Fork",
+            "phase": "final",
+            "outcome": "spotify_playing",
+        }))
+        await asyncio.sleep(0.05)
+        assert len(called) == 1
+
+        follow = asyncio.create_task(manager.send_podcast(frame))
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+        await ws.send(json.dumps({
+            "type": "podcast_result",
+            "seq": 4,
+            "show": "Hard Fork",
+            "phase": "accepted",
+            "status": "opening",
+        }))
+        again, again_error = await follow
+        assert again_error is None
+        assert again["last_outcome"]["outcome"] == "spotify_playing"
+
+        command = asyncio.create_task(manager.send_device_command(
+            {"type": "device_command", "name": "media_pause", "args": {}},
+        ))
+        command_frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=5.0))
+        assert command_frame["seq"] == 4
+        assert command_frame["id"]
+        await ws.send(json.dumps({
+            "type": "device_command_result",
+            "id": command_frame["id"],
+            "name": "media_pause",
+            "ok": True,
+            "detail": "paused",
+        }))
+        command_result, command_error = await command
+        assert command_error is None
+        assert command_result["confirmed"] is True
+        assert command_result["detail"] == "paused"
+        assert command_result["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_one_voice_result_timeout_is_unconfirmed(manager, monkeypatch):
+    from stackchan_mcp import koji_voice
+
+    monkeypatch.setattr(koji_voice, "ACCEPT_WAIT_S", 0.05)
+    port = manager._test_port
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await _voice_hello(ws, one_voice=True)
+        await ws.send(json.dumps({"type": "koji_context", "v": 1, "seq": 2, "panel": None}))
+        await asyncio.sleep(0.05)
+        pending = asyncio.create_task(manager.send_podcast(_podcast_frame()))
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+        opened, error = await pending
+        assert error is None
+        assert opened["status"] == "sent_unconfirmed"
+        command = asyncio.create_task(manager.send_device_command(
+            {"type": "device_command", "name": "media_pause", "args": {}},
+        ))
+        await asyncio.wait_for(ws.recv(), timeout=5.0)
+        result, command_error = await command
+        assert command_error is None
+        assert result == {"ok": True, "confirmed": False}
+
+
+@pytest.mark.asyncio
+async def test_koji_context_and_podcast_result_are_not_forwarded():
+    class RecordingProxy:
+        def __init__(self):
+            self.messages = []
+
+        async def start(self, info, hello, send):
+            return True
+
+        async def stop(self):
+            return None
+
+        async def send_device_json(self, message):
+            self.messages.append(message)
+            return True
+
+        async def try_handle_device_mcp(self, message):
+            return False
+
+    proxy = RecordingProxy()
+    mgr = ESP32Manager(cloud_proxy_factory=lambda: proxy)
+    await mgr.start("127.0.0.1", 0)
+    port = mgr._server.sockets[0].getsockname()[1]
+    try:
+        async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+            await _voice_hello(ws, one_voice=True)
+            await ws.send(json.dumps({
+                "type": "koji_context",
+                "v": 1,
+                "seq": 1,
+                "panel": {"id": "suggestions", "rows": [{"n": 1, "label": "Decoder Secret Label"}]},
+            }))
+            await ws.send(json.dumps({
+                "type": "podcast_result",
+                "seq": 1,
+                "show": "Hard Fork",
+                "phase": "final",
+                "outcome": "failed",
+            }))
+            await ws.send(json.dumps({"type": "listen", "state": "stop"}))
+            await asyncio.sleep(0.05)
+        assert proxy.messages == [{"type": "listen", "state": "stop"}]
+        assert "Decoder Secret Label" not in json.dumps(proxy.messages)
+    finally:
+        await mgr.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_reconnect_clears_the_previous_outcome_and_refreshes_tools(manager):
+    from stackchan_mcp.podcast_turn import TurnGuard
+
+    refreshed = []
+
+    async def hello_hook():
+        refreshed.append(manager.one_voice)
+
+    manager.on_portal_hello = hello_hook
+    manager._last_podcast_outcome = {"outcome": "spotify_playing", "show": "Hard Fork"}
+    manager.podcast_guard = TurnGuard()
+    manager.podcast_guard.commit_open("Hard Fork")
+    port = manager._test_port
+    async with websockets.connect(f"ws://127.0.0.1:{port}") as ws:
+        await _voice_hello(ws, one_voice=True)
+    assert manager.one_voice is True
+    assert manager._last_podcast_outcome is None
+    assert manager.podcast_guard._opened is None
+    assert refreshed == [True]
+    assert manager.connection_generation >= 1
