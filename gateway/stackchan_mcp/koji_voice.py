@@ -132,8 +132,39 @@ def store_koji_context(message: dict[str, Any]) -> dict[str, Any] | None:
         kind = panel.get("kind")
         if isinstance(kind, str) and kind.strip():
             stored_panel["kind"] = kind.strip()[:32]
-    logger.info("koji_context seq=%s panel=%s rows=%s", seq, panel_id, row_count)
+    from .portal_state import OFFLINE, REFLEX, clean_events
+
+    reflex = []
+    raw_reflex = message.get("reflex")
+    if isinstance(raw_reflex, list):
+        for item in raw_reflex:
+            if isinstance(item, str) and item in REFLEX and item not in reflex:
+                reflex.append(item)
+    offline = []
+    raw_offline = message.get("offline_actions")
+    if isinstance(raw_offline, list):
+        for item in raw_offline:
+            if isinstance(item, str) and item in OFFLINE and item not in offline:
+                offline.append(item)
+    logger.info(
+        "koji_context seq=%s panel=%s rows=%s reflex=%s offline=%s",
+        seq,
+        panel_id,
+        row_count,
+        len(reflex),
+        len(offline),
+    )
     stored: dict[str, Any] = {"seq": seq, "panel": stored_panel}
+    if reflex:
+        stored["reflex"] = reflex
+    if offline:
+        stored["offline_actions"] = offline
+    portal_state = message.get("portal_state")
+    if isinstance(portal_state, dict):
+        stored["portal_state"] = portal_state
+    events = clean_events(message.get("portal_events"), limit=5)
+    if events:
+        stored["portal_events"] = events
     attempt = message.get("local_attempt")
     if isinstance(attempt, dict) and attempt.get("ok") is False:
         name = attempt.get("name") if isinstance(attempt.get("name"), str) else ""

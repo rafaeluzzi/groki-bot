@@ -2,26 +2,144 @@
   "about": "Portal <-> bridge contract. Edit this copy in grok-portal, then run `python3 tools/sync-contract.py` to copy it to groki-bot gateway/contract/. Koji tests (ContractTest.kt) and gateway tests (test_koji_contract.py) both read it.",
   "version": 1,
   "device_commands": [
-    {"name": "set_volume_percent", "args": {"percent": {"type": "int", "min": 0, "max": 100, "required": true}}},
-    {"name": "set_volume_level", "args": {"level": {"type": "int", "min": 0, "max": 100, "required": true}}},
-    {"name": "volume_up", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
-    {"name": "volume_down", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
-    {"name": "get_volume", "args": {}},
-    {"name": "media_pause", "args": {}},
-    {"name": "media_resume", "args": {}},
-    {"name": "media_stop", "args": {}},
-    {"name": "media_skip_next", "args": {}},
-    {"name": "media_skip_previous", "args": {}},
-    {"name": "set_brightness_percent", "args": {"percent": {"type": "int", "min": 0, "max": 100, "required": true}}},
-    {"name": "brightness_up", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
-    {"name": "brightness_down", "args": {"steps": {"type": "int", "min": 1, "max": 100}}},
-    {"name": "open_app", "args": {"id": {"type": "enum", "values": ["spotify", "koji_settings"], "required": true}}},
-    {"name": "show_settings", "args": {"page": {"type": "enum", "values": ["device_commands"]}}},
-    {"name": "reconnect_bridge", "args": {}}
+    {
+      "name": "set_volume_percent",
+      "args": {
+        "percent": {
+          "type": "int",
+          "min": 0,
+          "max": 100,
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "set_volume_level",
+      "args": {
+        "level": {
+          "type": "int",
+          "min": 0,
+          "max": 100,
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "volume_up",
+      "args": {
+        "steps": {
+          "type": "int",
+          "min": 1,
+          "max": 100
+        }
+      }
+    },
+    {
+      "name": "volume_down",
+      "args": {
+        "steps": {
+          "type": "int",
+          "min": 1,
+          "max": 100
+        }
+      }
+    },
+    {
+      "name": "get_volume",
+      "args": {}
+    },
+    {
+      "name": "media_pause",
+      "args": {}
+    },
+    {
+      "name": "media_resume",
+      "args": {}
+    },
+    {
+      "name": "media_stop",
+      "args": {}
+    },
+    {
+      "name": "media_skip_next",
+      "args": {}
+    },
+    {
+      "name": "media_skip_previous",
+      "args": {}
+    },
+    {
+      "name": "set_brightness_percent",
+      "args": {
+        "percent": {
+          "type": "int",
+          "min": 0,
+          "max": 100,
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "brightness_up",
+      "args": {
+        "steps": {
+          "type": "int",
+          "min": 1,
+          "max": 100
+        }
+      }
+    },
+    {
+      "name": "brightness_down",
+      "args": {
+        "steps": {
+          "type": "int",
+          "min": 1,
+          "max": 100
+        }
+      }
+    },
+    {
+      "name": "open_app",
+      "args": {
+        "id": {
+          "type": "enum",
+          "values": [
+            "spotify",
+            "koji_settings"
+          ],
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "show_settings",
+      "args": {
+        "page": {
+          "type": "enum",
+          "values": [
+            "device_commands"
+          ]
+        }
+      }
+    },
+    {
+      "name": "reconnect_bridge",
+      "args": {}
+    },
+    {
+      "name": "get_state",
+      "args": {}
+    }
   ],
   "panel": {
     "version": 1,
-    "kinds": ["list", "now_playing", "choice", "webview"],
+    "kinds": [
+      "list",
+      "now_playing",
+      "choice",
+      "webview"
+    ],
     "id_pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$",
     "limits": {
       "rows": 12,
@@ -35,39 +153,342 @@
       "data_url": 20000,
       "seconds": 172800
     },
-    "ttl_s_default": {"list": 45, "choice": 60, "webview": 30, "now_playing": 0},
-    "templates": ["weather", "compare", "agenda", "steps", "fact", "score", "key_points", "chart"],
+    "ttl_s_default": {
+      "list": 45,
+      "choice": 60,
+      "webview": 30,
+      "now_playing": 0
+    },
+    "templates": [
+      "weather",
+      "compare",
+      "agenda",
+      "steps",
+      "fact",
+      "score",
+      "key_points",
+      "chart"
+    ],
     "rebuilds": [
       {
         "name": "logged podcast list with label and title",
-        "input": {"kind": "list", "title": "Podcasts I follow", "items": [{"label": "Following on Portal Spotify", "title": "Planet Money"}, {"label": "Following on Portal Spotify", "title": "All-In"}]},
-        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-2", "label": "All-In", "subtitle": "Following on Portal Spotify"}, {"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify"}]}
+        "input": {
+          "kind": "list",
+          "title": "Podcasts I follow",
+          "items": [
+            {
+              "label": "Following on Portal Spotify",
+              "title": "Planet Money"
+            },
+            {
+              "label": "Following on Portal Spotify",
+              "title": "All-In"
+            }
+          ]
+        },
+        "output": {
+          "version": 1,
+          "kind": "list",
+          "id": "Podcasts-I-follow",
+          "title": "Podcasts I follow",
+          "rows": [
+            {
+              "id": "row-2",
+              "label": "All-In",
+              "subtitle": "Following on Portal Spotify"
+            },
+            {
+              "id": "row-1",
+              "label": "Planet Money",
+              "subtitle": "Following on Portal Spotify"
+            }
+          ]
+        }
       },
       {
         "name": "logged podcast list with no title",
-        "input": {"kind": "list", "items": [{"text": "Following", "title": "Planet Money"}, {"text": "Following", "title": "All-In"}]},
-        "output": {"version": 1, "kind": "list", "id": "List", "title": "List", "rows": [{"id": "row-1", "label": "Planet Money", "subtitle": "Following"}, {"id": "row-2", "label": "All-In", "subtitle": "Following"}]}
+        "input": {
+          "kind": "list",
+          "items": [
+            {
+              "text": "Following",
+              "title": "Planet Money"
+            },
+            {
+              "text": "Following",
+              "title": "All-In"
+            }
+          ]
+        },
+        "output": {
+          "version": 1,
+          "kind": "list",
+          "id": "List",
+          "title": "List",
+          "rows": [
+            {
+              "id": "row-1",
+              "label": "Planet Money",
+              "subtitle": "Following"
+            },
+            {
+              "id": "row-2",
+              "label": "All-In",
+              "subtitle": "Following"
+            }
+          ]
+        }
       },
       {
         "name": "string items, markup and art",
-        "input": {"kind": "list", "title": "Podcasts I follow", "items": [{"label": "Following on Portal Spotify", "title": "Planet Money", "art_url": "https://x.test/a.jpg"}, "All-In", {"id": "ep 1", "name": "Tea <time>", "action": {"label": "Play"}}]},
-        "output": {"version": 1, "kind": "list", "id": "Podcasts-I-follow", "title": "Podcasts I follow", "rows": [{"id": "row-2", "label": "All-In"}, {"id": "row-1", "label": "Planet Money", "subtitle": "Following on Portal Spotify", "artUrl": "https://x.test/a.jpg"}, {"id": "ep-1", "label": "Tea \u2039time>", "action": {"id": "Play", "label": "Play"}}]}
+        "input": {
+          "kind": "list",
+          "title": "Podcasts I follow",
+          "items": [
+            {
+              "label": "Following on Portal Spotify",
+              "title": "Planet Money",
+              "art_url": "https://x.test/a.jpg"
+            },
+            "All-In",
+            {
+              "id": "ep 1",
+              "name": "Tea <time>",
+              "action": {
+                "label": "Play"
+              }
+            }
+          ]
+        },
+        "output": {
+          "version": 1,
+          "kind": "list",
+          "id": "Podcasts-I-follow",
+          "title": "Podcasts I follow",
+          "rows": [
+            {
+              "id": "row-2",
+              "label": "All-In"
+            },
+            {
+              "id": "row-1",
+              "label": "Planet Money",
+              "subtitle": "Following on Portal Spotify",
+              "artUrl": "https://x.test/a.jpg"
+            },
+            {
+              "id": "ep-1",
+              "label": "Tea \u2039time>",
+              "action": {
+                "id": "Play",
+                "label": "Play"
+              }
+            }
+          ]
+        }
       },
       {
         "name": "now playing from loose fields",
-        "input": {"kind": "now_playing", "title": "Episode 12", "show": "Planet Money", "paused": true, "position_ms": 65000, "duration_ms": 1800000},
-        "output": {"version": 1, "kind": "now_playing", "id": "Episode-12", "title": "Episode 12", "show": "Planet Money", "elapsed": 65, "duration": 1800, "primary": {"id": "local:resume", "label": "Play"}}
+        "input": {
+          "kind": "now_playing",
+          "title": "Episode 12",
+          "show": "Planet Money",
+          "paused": true,
+          "position_ms": 65000,
+          "duration_ms": 1800000
+        },
+        "output": {
+          "version": 1,
+          "kind": "now_playing",
+          "id": "Episode-12",
+          "title": "Episode 12",
+          "show": "Planet Money",
+          "elapsed": 65,
+          "duration": 1800,
+          "primary": {
+            "id": "local:resume",
+            "label": "Play"
+          }
+        }
       },
       {
         "name": "choice from plain options",
-        "input": {"kind": "choice", "prompt": "Tea or coffee?", "options": ["Tea", "Coffee"]},
-        "output": {"version": 1, "kind": "choice", "id": "Tea-or-coffee", "prompt": "Tea or coffee?", "actions": [{"id": "Tea", "label": "Tea"}, {"id": "Coffee", "label": "Coffee"}]}
+        "input": {
+          "kind": "choice",
+          "prompt": "Tea or coffee?",
+          "options": [
+            "Tea",
+            "Coffee"
+          ]
+        },
+        "output": {
+          "version": 1,
+          "kind": "choice",
+          "id": "Tea-or-coffee",
+          "prompt": "Tea or coffee?",
+          "actions": [
+            {
+              "id": "Tea",
+              "label": "Tea"
+            },
+            {
+              "id": "Coffee",
+              "label": "Coffee"
+            }
+          ]
+        }
       },
       {
         "name": "html alias",
-        "input": {"kind": "html", "title": "Note", "html": "<p>Hi</p>"},
-        "output": {"version": 1, "kind": "webview", "id": "Note", "title": "Note", "html": "<p>Hi</p>"}
+        "input": {
+          "kind": "html",
+          "title": "Note",
+          "html": "<p>Hi</p>"
+        },
+        "output": {
+          "version": 1,
+          "kind": "webview",
+          "id": "Note",
+          "title": "Note",
+          "html": "<p>Hi</p>"
+        }
       }
     ]
+  },
+  "portal_status": {
+    "v": 1,
+    "media_where": [
+      "spotify",
+      "rss",
+      "roku",
+      "none"
+    ],
+    "media_state": [
+      "playing",
+      "paused",
+      "buffering",
+      "stopped",
+      "unknown"
+    ],
+    "bridge_state": [
+      "up",
+      "down",
+      "offline"
+    ],
+    "voice_state": [
+      "idle",
+      "listening",
+      "uploading",
+      "thinking",
+      "grok_speaking",
+      "follow_up"
+    ],
+    "conversation_mode": [
+      "off",
+      "auto",
+      "always"
+    ],
+    "opened_by": [
+      "grok",
+      "user",
+      "system"
+    ],
+    "waiting": [
+      "none",
+      "user_pick",
+      "spotify_start",
+      "rss_start",
+      "list_loading",
+      "follow_batch"
+    ],
+    "close_reason": [
+      "user_x",
+      "grok_dismiss",
+      "timeout",
+      "replaced",
+      "playback_stopped",
+      "app_left"
+    ],
+    "action_source": [
+      "grok",
+      "reflex",
+      "offline",
+      "user_touch",
+      "system"
+    ],
+    "action_kind": [
+      "media_pause",
+      "media_resume",
+      "media_stop",
+      "media_skip_next",
+      "media_skip_previous",
+      "volume",
+      "spotify_start",
+      "rss_start",
+      "panel_show",
+      "panel_dismiss",
+      "follow_batch",
+      "roku_launch",
+      "get_state",
+      "brightness",
+      "open_app",
+      "show_settings",
+      "reconnect_bridge"
+    ],
+    "action_state": [
+      "accepted",
+      "in_progress",
+      "done",
+      "failed",
+      "uncertain",
+      "cancelled"
+    ],
+    "event_type": [
+      "panel_opened",
+      "panel_closed",
+      "panel_waiting",
+      "panel_changed",
+      "playback_started",
+      "playback_paused",
+      "playback_ended",
+      "late_spotify",
+      "reflex",
+      "offline_command",
+      "bridge_up",
+      "bridge_down",
+      "action_final"
+    ],
+    "reflex": [
+      "ducked",
+      "grok_cut",
+      "launch_cancelled"
+    ],
+    "offline_action": [
+      "media_pause",
+      "media_resume",
+      "media_stop",
+      "media_skip_next",
+      "media_skip_previous",
+      "volume_up",
+      "volume_down",
+      "set_volume_percent"
+    ],
+    "grok_state": [
+      "heard",
+      "working",
+      "tool",
+      "done"
+    ],
+    "frames": [
+      "portal_status",
+      "portal_event",
+      "action_final",
+      "grok_state"
+    ],
+    "debounce_ms": 250,
+    "event_coalesce_ms": 500,
+    "event_cap": 10,
+    "action_cap": 20,
+    "context_event_cap": 5
   }
 }

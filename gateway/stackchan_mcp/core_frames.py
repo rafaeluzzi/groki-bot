@@ -75,14 +75,18 @@ _NORMALIZED_ACTIONS = {
 # the provider wire (``self.core.morph`` -> ``self_core_morph``) and dispatched
 # back to the original name. Do not also declare the sanitized spelling: that
 # collides with the dotted form.
+# One name each on the gbot session. Old names still dispatch through normalization.
 CORE_DECLARED_NAMES = (
     "core_morph",
-    "morph",
-    "self.core.morph",
     "core_say",
-    "say",
-    "self.core.say",
 )
+
+CORE_DISPATCH_ALIASES = {
+    "morph": "core_morph",
+    "self_core_morph": "core_morph",
+    "say": "core_say",
+    "self_core_say": "core_say",
+}
 
 _MAX_CHARS = 500
 
@@ -92,8 +96,8 @@ _DESCRIPTIONS = {
         "name is a short face id such as heart. This does not speak audio."
     ),
     "say": (
-        "Show a short line of text on the connected Portal screen as speech text. "
-        "text is the line to show. This does not play audio."
+        "Draw a short line of text on the connected Portal screen. "
+        "text is the line to draw. This draws text and makes no sound."
     ),
 }
 
