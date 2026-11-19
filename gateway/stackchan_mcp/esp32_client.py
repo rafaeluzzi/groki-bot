@@ -687,7 +687,7 @@ class ESP32Manager:
                         except Exception:
                             logger.warning("portal hello tool refresh failed")
                     if connection.one_voice:
-                        asyncio.create_task(self._resync_router_status())
+                        self._hold(self._resync_router_status())
 
                     if mcp_supported:
                         # Start initialization as a separate task so the read
@@ -768,7 +768,6 @@ class ESP32Manager:
                                 self.portal_cache.offer(stored["portal_state"], source="portal")
                             if isinstance(stored.get("portal_events"), list) and stored["portal_events"]:
                                 self.quiet.offer(stored.get("portal_state"), stored["portal_events"])
-                                self.pending_portal_events = list(stored["portal_events"])
                     continue
 
                 elif msg_type == "podcast_result":
@@ -1076,8 +1075,57 @@ class ESP32Manager:
             return None, {"code": -32000, "message": "ESP32 disconnected"}
         if self.one_voice and isinstance(result, dict):
             action_id = outgoing.get("id") if isinstance(outgoing.get("id"), str) else ""
-            result = self._finish_portal(result, action_id=action_id, state="done")[0]
+            show_id = None
+            dismiss_id = None
+            panel = outgoing.get("panel") if isinstance(outgoing.get("panel"), dict) else None
+            if isinstance(panel, dict) and isinstance(panel.get("id"), str):
+                show_id = panel["id"]
+            elif outgoing.get("dismiss") is True:
+                current = {}
+                cached = self.portal_cache.status if isinstance(self.portal_cache.status, dict) else {}
+                panel_doc = cached.get("panel") if isinstance(cached.get("panel"), dict) else {}
+                current = panel_doc.get("current") if isinstance(panel_doc.get("current"), dict) else {}
+                if isinstance(current.get("id"), str):
+                    dismiss_id = current["id"]
+            confirmed = await self._wait_panel(show_id=show_id, dismiss_id=dismiss_id)
+            result = dict(result)
+            result["confirmed"] = confirmed
+            if not confirmed:
+                from .portal_state import mark_stale
+
+                stale = mark_stale(self.portal_cache.status)
+                if isinstance(stale, dict):
+                    result["portal_state"] = stale
+            result = self._finish_portal(
+                result,
+                action_id=action_id,
+                state="done" if confirmed else "uncertain",
+            )[0]
         return result, None
+
+    async def _wait_panel(self, *, show_id: str | None, dismiss_id: str | None) -> bool:
+        from .portal_state import panel_matches
+
+        if not show_id and not dismiss_id:
+            return False
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 0.5
+        while True:
+            if panel_matches(self.portal_cache.status, show_id=show_id, dismiss_id=dismiss_id):
+                return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(0.05)
+
+    def _hold(self, coro):
+        task = asyncio.create_task(coro)
+        held = getattr(self, "_held", None)
+        if held is None:
+            held = set()
+            self._held = held
+        held.add(task)
+        task.add_done_callback(held.discard)
+        return task
 
     def _arm_podcast_waiter(self, seq: int) -> asyncio.Future:
         future: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -1201,19 +1249,20 @@ class ESP32Manager:
                     "state": action.get("state") if isinstance(action.get("state"), str) else "",
                 }
             ]
-        if events or kind == "portal_event":
-            self.quiet.offer(self.portal_cache.status, events)
+        if isinstance(status, dict) or events or kind in {"portal_event", "action_final"}:
+            self.quiet.offer(self.portal_cache.status, events if isinstance(events, list) else [])
             hook = self.on_portal_frame
             if callable(hook):
                 try:
                     result = hook()
                     if inspect.isawaitable(result):
-                        asyncio.create_task(result)
+                        self._hold(result)
                 except Exception:
-                    self.pending_portal_events = list(self.quiet.events)
-                    logger.info("portal_event injected=false n=%s", len(self.pending_portal_events))
+                    self.quiet.fail()
+                    self.pending_portal_events = self.quiet.take_attached()
             else:
-                self.pending_portal_events = list(self.quiet.events)
+                self.quiet.fail()
+                self.pending_portal_events = self.quiet.take_attached()
         logger.info("portal_frame type=%s", kind if kind in {"portal_status", "portal_event", "action_final"} else "other")
 
     async def _resync_router_status(self) -> None:

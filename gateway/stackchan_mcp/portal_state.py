@@ -80,18 +80,59 @@ def _looks_like_uri(value: object) -> bool:
     return isinstance(value, str) and ("://" in value or value.startswith("spotify:"))
 
 
-def accept_status(current: dict[str, Any] | None, incoming: object) -> dict[str, Any] | None:
-    """A higher rev wins. A lower rev is ignored. Epoch is recorded and is not an order."""
+def _at_ms(status: dict[str, Any]) -> int | None:
+    value = status.get("at_ms")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def accept_status(
+    current: dict[str, Any] | None,
+    incoming: object,
+    *,
+    fresh_session: bool = False,
+) -> dict[str, Any] | None:
+    """Higher rev wins inside one epoch.
+
+    A different epoch is a new Portal process (reinstall or cleared app data).
+    Accept it when its at_ms is newer, or when it is the first status of a new session.
+    """
     if not isinstance(incoming, dict):
         return current
     rev = incoming.get("rev")
     if isinstance(rev, bool) or not isinstance(rev, int):
         return current
-    if current is not None:
-        old = current.get("rev")
-        if isinstance(old, int) and not isinstance(old, bool) and rev < old:
+    if current is None or fresh_session:
+        return incoming
+    same = incoming.get("epoch") == current.get("epoch")
+    old = current.get("rev")
+    old_rev = old if isinstance(old, int) and not isinstance(old, bool) else None
+    if same:
+        if old_rev is not None and rev <= old_rev:
             return current
-    return incoming
+        return incoming
+    new_at = _at_ms(incoming)
+    old_at = _at_ms(current)
+    if new_at is not None and old_at is not None and new_at >= old_at:
+        return incoming
+    if old_rev is None or rev > old_rev:
+        return incoming
+    return current
+
+
+def panel_matches(status: dict[str, Any] | None, *, show_id: str | None, dismiss_id: str | None) -> bool:
+    """True when a later portal_status shows the panel we just opened or closed."""
+    panel = status.get("panel") if isinstance(status, dict) else None
+    if not isinstance(panel, dict):
+        return False
+    if show_id:
+        current = panel.get("current")
+        return isinstance(current, dict) and current.get("id") == show_id
+    if dismiss_id:
+        closed = panel.get("last_closed")
+        return isinstance(closed, dict) and closed.get("id") == dismiss_id
+    return False
 
 
 def mark_stale(status: dict[str, Any] | None) -> dict[str, Any] | None:

@@ -17,9 +17,16 @@ class GrokProgress:
         self._audio_ended = False
 
     def on_speech_started(self) -> None:
-        self._heard = False
+        # A server VAD split inside one clip must not send a second heard.
+        # A new turn resets from done, or from a new koji_context seq.
         self._response_done = False
         self._audio_ended = False
+
+    def on_context(self, seq: int | None) -> None:
+        if seq is None or seq == getattr(self, "_seq", None):
+            return
+        self._seq = seq
+        self._heard = False
 
     def on_user_audio_boundary(self) -> str | None:
         """speech_stopped or input_audio_buffer.committed. The first one wins."""

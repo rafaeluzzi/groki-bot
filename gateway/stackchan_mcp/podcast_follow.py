@@ -120,6 +120,9 @@ def podcast_follow_extension(esp32: Any) -> Any:
                 return await _unfollow(args)
             return {"ok": False, "error": "unknown podcast tool"}
 
+    def voiced() -> bool:
+        return getattr(esp32, "one_voice", False) is True
+
     return ToolExtension(
         declarations=(
             {
@@ -144,7 +147,7 @@ def podcast_follow_extension(esp32: Any) -> Any:
             UNFOLLOW_TOOL: ToolMetadata(True, "portal_podcast", 30.0),
         },
         instructions=FOLLOW_INSTRUCTIONS,
-        instructions_for=lambda: FOLLOW_INSTRUCTIONS,
+        instructions_for=lambda: "" if voiced() else FOLLOW_INSTRUCTIONS,
     )
 
 

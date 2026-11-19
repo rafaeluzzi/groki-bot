@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Grok decides every Portal command. These tests cover the gateway half."""
 
+import asyncio
 import json
 
 import pytest
@@ -12,9 +13,150 @@ from stackchan_mcp.portal_state import accept_status, mark_stale, parse_volume
 from stackchan_mcp.quiet_context import QUIET_PREFIX, QuietContext
 
 
+def test_one_voice_instructions_drop_portal_speech(monkeypatch):
+    from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
+    from stackchan_mcp.panel_frames import PANEL_INSTRUCTIONS, panel_frame_extension
+    from stackchan_mcp.podcast_follow import FOLLOW_INSTRUCTIONS, podcast_follow_extension
+    from stackchan_mcp.podcast_open import PODCAST_INSTRUCTIONS, podcast_open_extension
+
+    class Esp:
+        one_voice = True
+
+    assert podcast_open_extension(Esp()).instructions_for() == ""
+    assert podcast_follow_extension(Esp()).instructions_for() == ""
+    assert panel_frame_extension(Esp()).instructions_for() == ""
+
+    class Quiet:
+        one_voice = False
+
+    assert podcast_open_extension(Quiet()).instructions_for() == PODCAST_INSTRUCTIONS
+    assert podcast_follow_extension(Quiet()).instructions_for() == FOLLOW_INSTRUCTIONS
+    assert panel_frame_extension(Quiet()).instructions_for() == PANEL_INSTRUCTIONS
+
+    bridge = GbotVoiceBridge(
+        on_audio=lambda _pcm: None,
+        on_turn_complete=lambda: None,
+        on_interrupt=lambda: None,
+        on_session_dead=lambda: None,
+        esp32=Esp(),
+        local_tools=False,
+    )
+    bridge._executor = type("Exec", (), {"instructions": lambda self, model_search=False: ""})()
+    bridge._local_tools_enabled = True
+    bridge.metrics["declared_tools"] = ["device_command", "podcast_open_spotify", "show_panel"]
+    text = bridge._provider_tool_instructions()
+    assert "The Portal speaks" not in text
+    assert "Do not say anything before or after" not in text
+    assert "self.panel" not in text
+    assert "ordinal" in text
+    assert "did_you_mean" in text
+    assert "one_open_per_turn" in text
+
+
+def test_a_new_epoch_is_accepted_when_it_is_newer():
+    old = {"rev": 9, "epoch": "old", "at_ms": 1000}
+    assert accept_status(old, {"rev": 1, "epoch": "new", "at_ms": 500}) is old
+    assert accept_status(old, {"rev": 1, "epoch": "new", "at_ms": 2000})["epoch"] == "new"
+    assert accept_status(old, {"rev": 1, "epoch": "new", "at_ms": 500}, fresh_session=True)["rev"] == 1
+
+
+def test_panel_match_confirms_show_and_dismiss():
+    from stackchan_mcp.portal_state import panel_matches
+
+    shown = {"panel": {"current": {"id": "p1"}}}
+    assert panel_matches(shown, show_id="p1", dismiss_id=None) is True
+    assert panel_matches(shown, show_id="other", dismiss_id=None) is False
+    closed = {"panel": {"last_closed": {"id": "p1"}}}
+    assert panel_matches(closed, show_id=None, dismiss_id="p1") is True
+    assert panel_matches({}, show_id="p1", dismiss_id=None) is False
+
+
+def test_declared_tools_are_the_only_ones_listed():
+    from stackchan_mcp.portal_skill import portal_skill_block
+
+    block = portal_skill_block(declared=("device_command", "show_panel"))
+    assert "Portal tools: device_command, show_panel." in block
+    assert "roku_play" not in block.split("Portal tools:")[1]
+
+
+@pytest.mark.asyncio
+async def test_flush_quiet_resends_a_rejected_system_item_as_user():
+    from unittest.mock import AsyncMock
+
+    from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
+
+    bridge = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        local_tools=False,
+    )
+    bridge._send = AsyncMock()
+    bridge._quiet.offer({"rev": 1, "media": {"where": "spotify"}}, [{"type": "reflex", "what": "ducked"}])
+    assert await bridge._flush_quiet() is True
+    assert bridge._send.await_args_list[0].args[0]["item"]["role"] == "system"
+    await bridge._handle_event({"type": "error", "error": {"code": "invalid_request_error", "param": "item"}})
+    await asyncio.sleep(0)
+    roles = [call.args[0]["item"]["role"] for call in bridge._send.await_args_list]
+    kinds = [call.args[0]["type"] for call in bridge._send.await_args_list]
+    assert roles == ["system", "user"]
+    assert "response.create" not in kinds
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_events_are_not_both_injected_and_attached():
+    from unittest.mock import AsyncMock
+
+    from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
+
+    class Device:
+        one_voice = True
+        pending_portal_events = []
+        quiet = None
+
+    device = Device()
+    bridge = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        esp32=device,
+        local_tools=False,
+    )
+    from stackchan_mcp.quiet_context import QuietContext
+
+    device.quiet = QuietContext()
+    bridge._send = AsyncMock()
+    device.quiet.offer({"rev": 2}, [{"type": "playback_paused", "rev": 2}])
+    assert await bridge._flush_quiet() is True
+    assert device.pending_portal_events == []
+    await bridge._handle_event({"type": "conversation.item.created"})
+    assert device.quiet.events == []
+    assert device.pending_portal_events == []
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_get_portal_state_from_a_live_portal_is_not_stale():
+    from stackchan_mcp.portal_read import PortalStatusCache, read_portal_state
+
+    class Esp:
+        device_connected = True
+
+        async def send_device_command(self, _frame):
+            return {"ok": True, "portal_state": {"rev": 4, "epoch": "e", "media": {"where": "spotify"}}}, None
+
+    view = await read_portal_state(Esp(), PortalStatusCache())
+    assert view["stale"] is False
+    assert view["source"] == "portal"
+
+
 def test_grok_state_orders_one_heard_per_turn():
     progress = GrokProgress()
     assert progress.on_user_audio_boundary() == "heard"
+    progress.on_speech_started()
     assert progress.on_user_audio_boundary() is None
     assert progress.on_response_created() == "working"
     assert progress.on_tool() == "tool"

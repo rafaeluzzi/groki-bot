@@ -851,6 +851,6 @@ def panel_frame_extension(esp32: Any) -> Any:
             name: ToolMetadata(True, "portal_panel", 5.0) for name in PANEL_DECLARED_NAMES
         },
         instructions=PANEL_INSTRUCTIONS,
-        instructions_for=lambda: PANEL_INSTRUCTIONS,
+        instructions_for=lambda: "" if voiced() else PANEL_INSTRUCTIONS,
         declarations_for=lambda: tuple(panel_tool_declarations(one_voice=voiced())),
     )

@@ -90,22 +90,15 @@ def test_unrelated_tool_names_are_not_panel_actions(name):
 def test_one_voice_panel_instructions_keep_the_full_catalog():
     from stackchan_mcp.portal_skill import portal_skill_block
 
-    text = PANEL_INSTRUCTIONS
     skill = portal_skill_block()
     assert "You are the only voice" in skill
     assert "The Portal does not speak" in skill
-    for phrase in (
-        "webview",
-        "chart",
-        "ttl_s",
-        "Podcasts I follow",
-        "A button tap arrives as a user turn",
-        "Podcasts or Spotify?",
-        "The same id updates in place",
-    ):
-        assert phrase in text
+    assert "webview" in skill
+    assert "Podcasts I follow" in skill
     heard = panel_frame_extension(type("Device", (), {"one_voice": True})())
-    assert heard.instructions_for() == text
+    assert heard.instructions_for() == ""
+    quiet = panel_frame_extension(type("Device", (), {"one_voice": False})())
+    assert quiet.instructions_for() == PANEL_INSTRUCTIONS
 
 
 def test_panel_instructions_name_the_screen_rules():

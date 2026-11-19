@@ -445,8 +445,9 @@ class GbotVoiceBridge:
             from .podcast_followed import podcast_followed_extension
             from .portal_read import PortalStatusCache, get_portal_state_extension
 
-            extensions = (*extensions, podcast_followed_extension())
             esp32 = options.get("esp32")
+            if getattr(esp32, "one_voice", False) is True:
+                extensions = (*extensions, podcast_followed_extension())
             cache = getattr(esp32, "portal_cache", None)
             if not isinstance(cache, PortalStatusCache):
                 cache = PortalStatusCache()
@@ -455,7 +456,8 @@ class GbotVoiceBridge:
                         esp32.portal_cache = cache
                     except Exception:
                         pass
-            extensions = (*extensions, get_portal_state_extension(esp32, cache))
+            if getattr(esp32, "one_voice", False) is True:
+                extensions = (*extensions, get_portal_state_extension(esp32, cache))
             options["extensions"] = extensions
             self._executor = (self._executor_factory or VoiceToolExecutor)(**options)
         target = os.getenv("STACKCHAN_TOOL_BOT_ID", "")
@@ -534,9 +536,12 @@ class GbotVoiceBridge:
         esp = self._executor_options.get("esp32")
         if getattr(esp, "one_voice", False) is not True or self._skill_logged:
             return
-        from .portal_skill import portal_skill_block, skill_stats
+        from .portal_skill import PORTAL_TOOLS, portal_skill_block, skill_stats
 
-        count, size = skill_stats(portal_skill_block())
+        declared = tuple(self.metrics.get("declared_tools") or ())
+        block = portal_skill_block(declared=declared) if declared else portal_skill_block()
+        listed = tuple(name for name in PORTAL_TOOLS if not declared or name in declared)
+        count, size = skill_stats(block, tools=listed)
         self._skill_logged = True
         logger.info("portal_skill tools=%s bytes=%s declared=%s", count, size, len(declarations))
 
@@ -578,7 +583,8 @@ class GbotVoiceBridge:
         if getattr(esp, "one_voice", False) is True:
             from .portal_skill import portal_skill_block
 
-            instructions = instructions + "\n\n" + portal_skill_block()
+            declared = tuple(self.metrics.get("declared_tools") or ())
+            instructions = instructions + "\n\n" + portal_skill_block(declared=declared)
             self._log_portal_skill(self.metrics.get("declared_tools") or [])
         return instructions + (
             "\nOnly call tools declared in this session. "
@@ -1064,16 +1070,25 @@ class GbotVoiceBridge:
     def _on_portal_frame(self):
         return self._flush_quiet()
 
+    def _hold(self, coro):
+        task = asyncio.create_task(coro)
+        held = getattr(self, "_held", None)
+        if held is None:
+            held = set()
+            self._held = held
+        held.add(task)
+        task.add_done_callback(held.discard)
+        return task
+
     async def _flush_quiet(self) -> bool:
+        """One conversation item. Never response.create. note_sent waits until the item is accepted."""
         esp = self._executor_options.get("esp32")
         quiet = getattr(esp, "quiet", None) or self._quiet
+        if quiet.snapshot is None and not quiet.events:
+            return False
         active = bool(self._response_in_progress or getattr(self, "_user_speaking", False))
         item = quiet.due(time.monotonic(), response_active=active)
         if item is None:
-            held = list(getattr(quiet, "events", []) or [])
-            if esp is not None and held:
-                esp.pending_portal_events = held
-            logger.info("portal_event injected=%s n=%s", False, len(held))
             return False
         try:
             await self._send(item)
@@ -1081,64 +1096,38 @@ class GbotVoiceBridge:
             quiet.fail()
             if esp is not None:
                 esp.pending_portal_events = quiet.take_attached()
-            logger.info("portal_event injected=%s n=%s", False, len(getattr(esp, "pending_portal_events", [])))
             return False
-        count = len(item.get("item", {}).get("content", []))
-        quiet.note_sent()
+        self._quiet_outstanding = item.get("item", {}).get("role") == "system"
+        self._quiet_target = quiet
+        count = len(quiet.events) or 1
         logger.info("portal_event injected=%s n=%s", True, count)
+        self._hold(self._quiet_accept_timeout())
         return True
+
+    async def _quiet_accept_timeout(self) -> None:
+        await asyncio.sleep(2.0)
+        if not getattr(self, "_quiet_outstanding", False):
+            return
+        self._quiet_outstanding = False
+        quiet = getattr(self, "_quiet_target", None) or self._quiet
+        quiet.fail()
+        esp = self._executor_options.get("esp32")
+        if esp is not None:
+            esp.pending_portal_events = quiet.take_attached()
+
+    def _accept_quiet_item(self) -> None:
+        if not getattr(self, "_quiet_outstanding", False):
+            return
+        self._quiet_outstanding = False
+        quiet = getattr(self, "_quiet_target", None) or self._quiet
+        quiet.note_sent()
 
     async def inject_context_quiet(self, text: str) -> bool:
-        """One conversation item. This never sends response.create."""
+        """Test and fallback entry. The production path is _flush_quiet."""
         if not isinstance(text, str) or not text:
             return False
-        if self._response_in_progress:
-            self._quiet.offer({"rev": 0}, [{"type": "reflex", "what": "note"}])
-            esp = self._executor_options.get("esp32")
-            if esp is not None:
-                esp.pending_portal_events = list(self._quiet.events)
-            logger.info("portal_event injected=%s n=%s", False, 1)
-            return False
-        now = time.monotonic()
-        if now - self._quiet._last_sent < 2.0 and self._quiet._last_sent > 0:
-            logger.info("portal_event injected=%s n=%s", False, 1)
-            return False
-        role = "user" if self._quiet_system_rejected else "system"
-        body = text
-        if role == "user" and not text.startswith("[portal status, context only, do not reply]"):
-            body = "[portal status, context only, do not reply] " + text
-        await self._send(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": role,
-                    "content": [{"type": "input_text", "text": body}],
-                },
-            }
-        )
-        self._quiet._last_sent = now
-        self._quiet_text = body
-        self._quiet_outstanding = role == "system"
-        logger.info("portal_event injected=%s n=%s", True, 1)
-        return True
-
-    async def _resend_quiet_as_user(self) -> None:
-        text = getattr(self, "_quiet_text", "")
-        if not isinstance(text, str) or not text:
-            return
-        if not text.startswith("[portal status, context only, do not reply]"):
-            text = "[portal status, context only, do not reply] " + text
-        await self._send(
-            {
-                "type": "conversation.item.create",
-                "item": {
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": text}],
-                },
-            }
-        )
+        self._quiet.offer({"rev": 0}, [{"type": "reflex", "what": "note"}])
+        return await self._flush_quiet()
 
     def _schedule_grok(self, state):
         if state is None:
@@ -1154,7 +1143,7 @@ class GbotVoiceBridge:
         logger.debug("grok_state state=%s seq=%s", state, -1 if seq is None else seq)
         send = getattr(esp, "send_grok_state", None)
         if callable(send):
-            asyncio.create_task(send(frame))
+            self._hold(send(frame))
 
     async def send_keepalive_audio(self, pcm):
         await self._send_pcm(pcm)
@@ -1479,6 +1468,10 @@ class GbotVoiceBridge:
                 await self.interrupt()
         elif kind in {"input_audio_buffer.speech_stopped", "input_audio_buffer.committed"}:
             if kind == "input_audio_buffer.speech_stopped" or kind == "input_audio_buffer.committed":
+                from .koji_voice import context_seq
+
+                esp = self._executor_options.get("esp32")
+                self._grok_progress.on_context(context_seq(getattr(esp, "koji_context", None)))
                 self._schedule_grok(self._grok_progress.on_user_audio_boundary())
             if kind != "input_audio_buffer.speech_stopped":
                 return
@@ -1557,6 +1550,8 @@ class GbotVoiceBridge:
                 task.add_done_callback(self._tools.discard)
             else:
                 self._tool_outcome(name, "undeclared")
+        elif kind == "conversation.item.created":
+            self._accept_quiet_item()
         elif kind == "error":
             error = event.get("error", {})
             code = error.get("code")
@@ -1581,8 +1576,10 @@ class GbotVoiceBridge:
             }
             if getattr(self, "_quiet_outstanding", False) and code in {"invalid_request_error", "invalid_value"}:
                 self._quiet_outstanding = False
-                self._quiet_system_rejected = True
-                asyncio.create_task(self._resend_quiet_as_user())
+                quiet = getattr(self, "_quiet_target", None) or self._quiet
+                retry = quiet.note_rejected()
+                if retry is not None:
+                    self._hold(self._send(retry))
             code = code if code in allowed_codes else "other"
             param = param if param in allowed_params else "other"
             key = code + ":" + param

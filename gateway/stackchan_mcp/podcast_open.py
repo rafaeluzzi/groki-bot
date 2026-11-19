@@ -628,7 +628,7 @@ def podcast_open_extension(esp32: Any) -> Any:
         metadata={PODCAST_TOOL_NAME: ToolMetadata(True, "portal_podcast", 30.0)},
         instructions=PODCAST_INSTRUCTIONS,
         bind_result=bind,
-        instructions_for=lambda: PODCAST_INSTRUCTIONS,
+        instructions_for=lambda: "" if voiced() else PODCAST_INSTRUCTIONS,
         declarations_for=lambda: tuple(podcast_declarations(one_voice=voiced())),
     )
 

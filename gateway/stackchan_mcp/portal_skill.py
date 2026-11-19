@@ -33,6 +33,16 @@ _RULES = (
     "If portal_state is stale, say so before relying on it.\n"
     "Before you list followed shows or build a followed-shows panel, call podcast_followed "
     "and use only its result, even if the user names specific shows.\n"
+    "When the user says a number, pass ordinal. Do not turn it into a title. "
+    "Call podcast_open_spotify again only once, and only when did_you_mean is set. "
+    "Otherwise tell the user it isn't followed and offer to follow it. "
+    "Never use podcast_open_spotify to follow. "
+    "One open per turn. If the result says one_open_per_turn, say the show that already opened. "
+    "One podcast_follow per turn. If the result says already_handled, do not call it again. "
+    "Say one short line from say after the result.\n"
+    "A panel document is version 1. Kinds are list, now_playing, choice, and webview. "
+    "Webview templates are weather, compare, agenda, steps, fact, score, key_points, and chart. "
+    "A list titled Podcasts I follow is A-Z, numbered from the top of titled rows.\n"
 )
 
 _EXAMPLES = (
@@ -75,11 +85,20 @@ def load_contract(path: Path | None = None) -> dict[str, Any]:
     return data
 
 
-def portal_skill_block(contract: dict[str, Any] | None = None, tools: tuple[str, ...] = PORTAL_TOOLS) -> str:
+def portal_skill_block(
+    contract: dict[str, Any] | None = None,
+    tools: tuple[str, ...] | None = None,
+    declared: tuple[str, ...] | None = None,
+) -> str:
     data = contract if contract is not None else load_contract()
     commands = data.get("device_commands") if isinstance(data.get("device_commands"), list) else []
     names = [item.get("name") for item in commands if isinstance(item, dict) and isinstance(item.get("name"), str)]
-    listed = [name for name in tools if name]
+    catalog = tools if tools is not None else PORTAL_TOOLS
+    if declared is None:
+        listed = [name for name in catalog if name]
+    else:
+        present = set(declared)
+        listed = [name for name in catalog if name in present]
     lines = [
         _RULES,
         "Portal actions: " + ", ".join(names) + ".",
@@ -93,5 +112,6 @@ def portal_skill_block(contract: dict[str, Any] | None = None, tools: tuple[str,
     return "\n".join(lines)
 
 
-def skill_stats(block: str, tools: tuple[str, ...] = PORTAL_TOOLS) -> tuple[int, int]:
-    return len(tools), len(block.encode("utf-8"))
+def skill_stats(block: str, tools: tuple[str, ...] | None = None) -> tuple[int, int]:
+    listed = tools if tools is not None else PORTAL_TOOLS
+    return len(listed), len(block.encode("utf-8"))

@@ -42,7 +42,7 @@ The machine-readable list is `gateway/contract/koji-contract.json`, a copy of gr
 | `open_app` | `{"id": "spotify" \| "koji_settings"}` | `spotify` |
 | `show_settings` | `{"page"?: "device_commands"}` | settings root without `page` |
 | `reconnect_bridge` | `{}` | |
-| `get_state` | `{}` | the live Portal status document |
+| `get_state` | `{}` | `portal_state` snapshot (media, panel, bridge, voice, pending). No playback position. `stale` is false when the Portal answered. |
 
 `open_app` only accepts the app ids the Portal knows. Any other id is not sent, and the gateway never launches a Mac app for it.
 
