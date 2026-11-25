@@ -1085,8 +1085,11 @@ class GbotVoiceBridge:
         esp = self._executor_options.get("esp32")
         return getattr(esp, "quiet", None) or self._quiet
 
+    def _hold_quiet_turn(self) -> None:
+        self._quiet_box().hold_turn(time.monotonic())
+
     def _release_quiet_turn(self) -> None:
-        self._quiet_box().turn_pending = False
+        self._quiet_box().release_turn()
 
     async def _flush_quiet(self) -> bool:
         """One conversation item. Never response.create. note_sent waits until that item id is accepted."""
@@ -1116,19 +1119,23 @@ class GbotVoiceBridge:
         self._quiet_id = item.get("item", {}).get("id")
         self._quiet_target = quiet
         logger.info("portal_event injected=%s n=%s", True, len(quiet.events))
-        self._hold(self._quiet_accept_timeout())
+        self._hold(self._quiet_accept_timeout(self._quiet_id))
         return True
 
-    async def _quiet_accept_timeout(self) -> None:
-        await asyncio.sleep(2.0)
+    async def _quiet_accept_timeout(self, item_id: str, delay: float = 2.0) -> None:
+        await asyncio.sleep(delay)
         if not getattr(self, "_quiet_outstanding", False):
             return
+        if getattr(self, "_quiet_id", None) != item_id:
+            return
         self._quiet_outstanding = False
+        self._quiet_id = None
         quiet = getattr(self, "_quiet_target", None) or self._quiet
         quiet.fail()
         esp = self._executor_options.get("esp32")
         if esp is not None:
             esp.pending_portal_events = quiet.take_attached()
+        logger.info("portal_event accepted=false reason=timeout")
 
     def _accept_quiet_item(self, event: dict | None = None) -> None:
         if not getattr(self, "_quiet_outstanding", False):
@@ -1228,6 +1235,7 @@ class GbotVoiceBridge:
         return result
 
     async def start(self):
+        self._release_quiet_turn()
         stage = "account_requests"
         self.metrics["startup_stage"] = stage
         trace = aiohttp.TraceConfig()
@@ -1481,7 +1489,7 @@ class GbotVoiceBridge:
             self.metrics["speech_starts"] += 1
             self._user_epoch += 1
             self._user_speaking = True
-            self._quiet_box().turn_pending = True
+            self._hold_quiet_turn()
             self._cancel_idle()
             if self._response_in_progress or (
                 self._turn_task and not self._turn_task.done()
@@ -1536,6 +1544,7 @@ class GbotVoiceBridge:
             elif self._on_text and text:
                 await self._on_text(text)
         elif kind == "response.done":
+            self._release_quiet_turn()
             response_id = event.get("response", {}).get("id") or self._active_response
             if response_id != self._active_response:
                 return
@@ -1608,6 +1617,9 @@ class GbotVoiceBridge:
                     self._quiet_outstanding = True
                     self._quiet_id = retry.get("item", {}).get("id")
                     self._hold(self._send(retry))
+                    self._hold(self._quiet_accept_timeout(self._quiet_id))
+            if code in {"server_error", "authentication_error", "session_expired"}:
+                self._release_quiet_turn()
             code = code if code in allowed_codes else "other"
             param = param if param in allowed_params else "other"
             key = code + ":" + param
@@ -1776,6 +1788,7 @@ class GbotVoiceBridge:
                 await self._output.cancel()
             self.running = False
             self._connected_event.clear()
+            self._release_quiet_turn()
             if not self._stopped:
                 if self._native:
                     await self._native.close()
@@ -1788,6 +1801,7 @@ class GbotVoiceBridge:
 
     async def stop(self):
         self._stopped = True
+        self._release_quiet_turn()
         await self._desktop_tasks.aclose()
         self._cancel_idle()
         self._pending_updates.clear()

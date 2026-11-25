@@ -436,3 +436,72 @@ async def test_no_injection_between_speech_started_and_response_done():
     assert bridge._send.await_count == 1
     assert bridge._send.await_args.args[0]["item"]["role"] == "system"
     await bridge.stop()
+
+
+def test_device_hello_and_expiry_clear_a_stuck_turn():
+    from stackchan_mcp.esp32_client import ESP32Manager
+
+    device = ESP32Manager()
+    device.quiet.hold_turn(0)
+    device.note_device_hello()
+    assert device.quiet.turn_pending is False
+    device.quiet.hold_turn(0)
+    device.quiet.offer({"rev": 1}, [{"type": "action_final", "action_id": "cmd-1", "state": "done"}])
+    assert device.quiet.expire_turn(44) is False
+    assert device.quiet.due(44, response_active=False) is None
+    assert device.quiet.expire_turn(45) is True
+    item = device.quiet.due(45, response_active=False)
+    assert item["item"]["role"] == "system"
+
+
+@pytest.mark.asyncio
+async def test_accept_timeout_ignores_a_replaced_item_id():
+    from unittest.mock import AsyncMock
+
+    from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
+
+    bridge = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        local_tools=False,
+    )
+    bridge._send = AsyncMock()
+    bridge._quiet.offer({"rev": 1}, [{"type": "action_final", "action_id": "cmd-1", "state": "done"}])
+    assert await bridge._flush_quiet() is True
+    system_id = bridge._quiet_id
+    await bridge._handle_event({"type": "error", "error": {"code": "invalid_request_error", "param": "item"}})
+    await asyncio.sleep(0)
+    retry_id = bridge._quiet_id
+    assert retry_id != system_id
+    await bridge._quiet_accept_timeout(system_id, delay=0)
+    assert bridge._quiet_outstanding is True
+    assert bridge._quiet.events
+    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": retry_id}})
+    assert bridge._quiet.events == []
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_session_error_and_stop_clear_a_stuck_turn():
+    from unittest.mock import AsyncMock
+
+    from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
+
+    bridge = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        local_tools=False,
+    )
+    bridge._quiet.hold_turn(0)
+    await bridge._handle_event({"type": "response.done", "response": {"id": "other"}})
+    assert bridge._quiet.turn_pending is False
+    bridge._quiet.hold_turn(1)
+    await bridge._handle_event({"type": "error", "error": {"code": "session_expired", "param": "session"}})
+    assert bridge._quiet.turn_pending is False
+    bridge._quiet.hold_turn(2)
+    await bridge.stop()
+    assert bridge._quiet.turn_pending is False

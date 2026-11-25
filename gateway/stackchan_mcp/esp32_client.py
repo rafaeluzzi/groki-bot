@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import os
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -525,8 +526,14 @@ class ESP32Manager:
             process_request=self._check_auth,
         )
 
+    def note_device_hello(self) -> None:
+        """A Portal socket came up. Drop the last snapshot and a turn that never finished."""
+        self.portal_cache.clear()
+        self.quiet.release_turn()
+
     async def stop(self) -> None:
         """Stop the WebSocket server."""
+        self.quiet.release_turn()
         # Cancel any pending initialization tasks
         for task in self._init_tasks:
             task.cancel()
@@ -609,7 +616,7 @@ class ESP32Manager:
                     # Copy the flag before the voice session starts, so its
                     # tool text matches this hello. A later hello refreshes it.
                     self.one_voice = connection.one_voice
-                    self.portal_cache.clear()
+                    self.note_device_hello()
                     self.connection_generation += 1
                     self._last_podcast_outcome = None
                     guard = getattr(self, "podcast_guard", None)
@@ -759,7 +766,7 @@ class ESP32Manager:
                 elif msg_type == "koji_context":
                     # Screen context for this ask. Stored, never forwarded.
                     # A user turn is open until the reply finishes, so status events wait.
-                    self.quiet.turn_pending = True
+                    self.quiet.hold_turn(time.monotonic())
                     if connection is self._connection:
                         from .koji_voice import store_koji_context
 

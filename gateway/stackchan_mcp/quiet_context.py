@@ -9,6 +9,7 @@ from typing import Any
 QUIET_PREFIX = "[portal status, context only, do not reply]"
 RATE_S = 2.0
 MAX_EVENTS = 5
+TURN_PENDING_S = 45.0
 
 
 class QuietContext:
@@ -21,6 +22,7 @@ class QuietContext:
         self._pending_system = False
         self.system_rejected = False
         self.turn_pending = False
+        self.turn_pending_at: float | None = None
         self.attached: list[dict[str, Any]] = []
         self._ids = 0
 
@@ -33,11 +35,29 @@ class QuietContext:
         if len(self.events) > MAX_EVENTS:
             self.events = self.events[-MAX_EVENTS:]
 
+    def hold_turn(self, now: float) -> None:
+        self.turn_pending = True
+        if self.turn_pending_at is None:
+            self.turn_pending_at = now
+
+    def release_turn(self) -> None:
+        self.turn_pending = False
+        self.turn_pending_at = None
+
+    def expire_turn(self, now: float, limit: float = TURN_PENDING_S) -> bool:
+        """Drop a turn that never reached a reply. A new hold does not extend the clock."""
+        started = self.turn_pending_at
+        if not self.turn_pending or started is None or now - started < limit:
+            return False
+        self.release_turn()
+        return True
+
     def due(self, now: float, *, response_active: bool, item_id: str | None = None) -> dict[str, Any] | None:
         """The next item to send, or None when it must wait.
 
         A snapshot alone is not an item. Events carry the snapshot with them.
         """
+        self.expire_turn(now)
         if not self.events:
             return None
         if response_active or self.turn_pending:
