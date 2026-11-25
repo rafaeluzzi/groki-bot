@@ -505,3 +505,24 @@ async def test_a_session_error_and_stop_clear_a_stuck_turn():
     bridge._quiet.hold_turn(2)
     await bridge.stop()
     assert bridge._quiet.turn_pending is False
+
+
+def test_conversation_end_event_reaches_grok_without_the_phrase():
+    from stackchan_mcp.portal_state import clean_events
+
+    kept = clean_events(
+        [
+            {
+                "type": "conversation",
+                "action_id": "active",
+                "delta": {"result": "end_phrase", "show": "that's all"},
+            }
+        ]
+    )
+    assert kept == [
+        {
+            "type": "conversation",
+            "action_id": "active",
+            "delta": {"result": "end_phrase"},
+        }
+    ]

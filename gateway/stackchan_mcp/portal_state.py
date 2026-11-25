@@ -31,6 +31,7 @@ EVENT_TYPES = (
     "bridge_up",
     "bridge_down",
     "action_final",
+    "conversation",
 )
 TITLE_KEYS = {"show", "episode", "title", "uri", "url", "enclosureUrl", "openSpotifyUri", "openSpotifyUrl"}
 
