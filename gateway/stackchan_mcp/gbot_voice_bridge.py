@@ -712,6 +712,7 @@ class GbotVoiceBridge:
 
     async def _finish_turn(self, slot=None):
         self._schedule_grok(self._grok_progress.on_audio_ended())
+        self._release_quiet_turn()
         await self._flush_quiet()
         await self._on_turn_complete()
         # Playback has drained and tts stop has been sent. A real answer
@@ -1080,14 +1081,28 @@ class GbotVoiceBridge:
         task.add_done_callback(held.discard)
         return task
 
-    async def _flush_quiet(self) -> bool:
-        """One conversation item. Never response.create. note_sent waits until the item is accepted."""
+    def _quiet_box(self):
         esp = self._executor_options.get("esp32")
-        quiet = getattr(esp, "quiet", None) or self._quiet
-        if quiet.snapshot is None and not quiet.events:
+        return getattr(esp, "quiet", None) or self._quiet
+
+    def _release_quiet_turn(self) -> None:
+        self._quiet_box().turn_pending = False
+
+    async def _flush_quiet(self) -> bool:
+        """One conversation item. Never response.create. note_sent waits until that item id is accepted."""
+        if getattr(self, "_quiet_outstanding", False):
             return False
-        active = bool(self._response_in_progress or getattr(self, "_user_speaking", False))
-        item = quiet.due(time.monotonic(), response_active=active)
+        esp = self._executor_options.get("esp32")
+        quiet = self._quiet_box()
+        if not quiet.events:
+            return False
+        active = bool(
+            self._response_in_progress
+            or getattr(self, "_user_speaking", False)
+            or quiet.turn_pending
+        )
+        self._quiet_n = getattr(self, "_quiet_n", 0) + 1
+        item = quiet.due(time.monotonic(), response_active=active, item_id=f"quiet_{self._quiet_n}")
         if item is None:
             return False
         try:
@@ -1097,10 +1112,10 @@ class GbotVoiceBridge:
             if esp is not None:
                 esp.pending_portal_events = quiet.take_attached()
             return False
-        self._quiet_outstanding = item.get("item", {}).get("role") == "system"
+        self._quiet_outstanding = True
+        self._quiet_id = item.get("item", {}).get("id")
         self._quiet_target = quiet
-        count = len(quiet.events) or 1
-        logger.info("portal_event injected=%s n=%s", True, count)
+        logger.info("portal_event injected=%s n=%s", True, len(quiet.events))
         self._hold(self._quiet_accept_timeout())
         return True
 
@@ -1115,10 +1130,15 @@ class GbotVoiceBridge:
         if esp is not None:
             esp.pending_portal_events = quiet.take_attached()
 
-    def _accept_quiet_item(self) -> None:
+    def _accept_quiet_item(self, event: dict | None = None) -> None:
         if not getattr(self, "_quiet_outstanding", False):
             return
+        item = event.get("item") if isinstance(event, dict) else None
+        created = item.get("id") if isinstance(item, dict) else None
+        if created != getattr(self, "_quiet_id", None):
+            return
         self._quiet_outstanding = False
+        self._quiet_id = None
         quiet = getattr(self, "_quiet_target", None) or self._quiet
         quiet.note_sent()
 
@@ -1461,6 +1481,7 @@ class GbotVoiceBridge:
             self.metrics["speech_starts"] += 1
             self._user_epoch += 1
             self._user_speaking = True
+            self._quiet_box().turn_pending = True
             self._cancel_idle()
             if self._response_in_progress or (
                 self._turn_task and not self._turn_task.done()
@@ -1527,6 +1548,8 @@ class GbotVoiceBridge:
                 # Quiet starts when that playback finishes, not when the reply was queued.
                 self._turn_task = self._output.submit(lambda slot=slot: self._finish_turn(slot))
                 await asyncio.sleep(0)
+            else:
+                self._release_quiet_turn()
             await self._flush_pending()
         elif kind == "response.function_call_arguments.done":
             name = self._safe_tool_name(event.get("name"))
@@ -1551,7 +1574,7 @@ class GbotVoiceBridge:
             else:
                 self._tool_outcome(name, "undeclared")
         elif kind == "conversation.item.created":
-            self._accept_quiet_item()
+            self._accept_quiet_item(event)
         elif kind == "error":
             error = event.get("error", {})
             code = error.get("code")
@@ -1575,10 +1598,15 @@ class GbotVoiceBridge:
                 "tools",
             }
             if getattr(self, "_quiet_outstanding", False) and code in {"invalid_request_error", "invalid_value"}:
-                self._quiet_outstanding = False
                 quiet = getattr(self, "_quiet_target", None) or self._quiet
-                retry = quiet.note_rejected()
-                if retry is not None:
+                self._quiet_n = getattr(self, "_quiet_n", 0) + 1
+                retry = quiet.note_rejected(item_id=f"quiet_{self._quiet_n}")
+                if retry is None:
+                    self._quiet_outstanding = False
+                    self._quiet_id = None
+                else:
+                    self._quiet_outstanding = True
+                    self._quiet_id = retry.get("item", {}).get("id")
                     self._hold(self._send(retry))
             code = code if code in allowed_codes else "other"
             param = param if param in allowed_params else "other"

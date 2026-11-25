@@ -758,6 +758,8 @@ class ESP32Manager:
 
                 elif msg_type == "koji_context":
                     # Screen context for this ask. Stored, never forwarded.
+                    # A user turn is open until the reply finishes, so status events wait.
+                    self.quiet.turn_pending = True
                     if connection is self._connection:
                         from .koji_voice import store_koji_context
 
@@ -1249,21 +1251,23 @@ class ESP32Manager:
                     "state": action.get("state") if isinstance(action.get("state"), str) else "",
                 }
             ]
-        if isinstance(status, dict) or events or kind in {"portal_event", "action_final"}:
-            self.quiet.offer(self.portal_cache.status, events if isinstance(events, list) else [])
-            hook = self.on_portal_frame
-            if callable(hook):
-                try:
-                    result = hook()
-                    if inspect.isawaitable(result):
-                        self._hold(result)
-                except Exception:
-                    self.quiet.fail()
-                    self.pending_portal_events = self.quiet.take_attached()
-            else:
+        # A heartbeat or any other status with no events only refreshes the cache.
+        logger.info("portal_frame type=%s", kind if kind in {"portal_status", "portal_event", "action_final"} else "other")
+        if not events:
+            return
+        self.quiet.offer(self.portal_cache.status, events)
+        hook = self.on_portal_frame
+        if callable(hook):
+            try:
+                result = hook()
+                if inspect.isawaitable(result):
+                    self._hold(result)
+            except Exception:
                 self.quiet.fail()
                 self.pending_portal_events = self.quiet.take_attached()
-        logger.info("portal_frame type=%s", kind if kind in {"portal_status", "portal_event", "action_final"} else "other")
+        else:
+            self.quiet.fail()
+            self.pending_portal_events = self.quiet.take_attached()
 
     async def _resync_router_status(self) -> None:
         from .portal_read import fetch_router_status

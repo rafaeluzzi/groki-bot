@@ -102,6 +102,15 @@ async def test_flush_quiet_resends_a_rejected_system_item_as_user():
     kinds = [call.args[0]["type"] for call in bridge._send.await_args_list]
     assert roles == ["system", "user"]
     assert "response.create" not in kinds
+    user = bridge._send.await_args_list[1].args[0]
+    assert user["item"]["id"].startswith("quiet_")
+    assert user["item"]["role"] == "user"
+    assert "Hard Fork" not in json.dumps(user)
+    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": "other"}})
+    assert bridge._quiet_outstanding is True
+    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": user["item"]["id"]}})
+    assert bridge._quiet.events == []
+    assert await bridge._flush_quiet() is False
     await bridge.stop()
 
 
@@ -132,7 +141,11 @@ async def test_events_are_not_both_injected_and_attached():
     device.quiet.offer({"rev": 2}, [{"type": "playback_paused", "rev": 2}])
     assert await bridge._flush_quiet() is True
     assert device.pending_portal_events == []
-    await bridge._handle_event({"type": "conversation.item.created"})
+    sent = bridge._send.await_args_list[0].args[0]
+    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": "user_audio_1"}})
+    assert device.quiet.events
+    assert bridge._quiet_outstanding is True
+    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": sent["item"]["id"]}})
     assert device.quiet.events == []
     assert device.pending_portal_events == []
     await bridge.stop()
@@ -367,3 +380,59 @@ def test_declared_aliases_are_one_name_each():
     from stackchan_mcp.core_frames import core_tool_description
 
     assert "makes no sound" in core_tool_description("core_say")
+
+
+def test_a_snapshot_alone_is_not_an_item():
+    quiet = QuietContext()
+    quiet.offer({"rev": 4, "media": {"where": "spotify", "show": "Hard Fork"}}, [])
+    assert quiet.due(10, response_active=False) is None
+    quiet.offer({"rev": 4}, [{"type": "action_final", "action_id": "cmd-1", "state": "done"}])
+    item = quiet.due(10, response_active=False)
+    assert item["item"]["id"].startswith("quiet_")
+    assert item["item"]["role"] == "system"
+    assert "Hard Fork" not in item["item"]["id"]
+
+
+def test_heartbeat_frame_updates_the_cache_and_injects_nothing():
+    from stackchan_mcp.esp32_client import ESP32Manager
+
+    device = ESP32Manager()
+    calls = []
+    device.on_portal_frame = lambda: calls.append(1)
+    device._take_portal_frame({"type": "portal_status", "status": {"rev": 1, "epoch": "e", "media": {"show": "Hard Fork"}}})
+    assert device.quiet.events == []
+    assert calls == []
+    assert device.portal_cache.status["rev"] == 1
+    device._take_portal_frame({
+        "type": "action_final",
+        "action": {"action_id": "cmd-9", "state": "done"},
+        "portal_state": {"rev": 2, "epoch": "e"},
+    })
+    assert len(device.quiet.events) == 1
+    assert device.quiet.events[0]["type"] == "action_final"
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+async def test_no_injection_between_speech_started_and_response_done():
+    from unittest.mock import AsyncMock
+
+    from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
+
+    bridge = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        local_tools=False,
+    )
+    bridge._send = AsyncMock()
+    bridge._quiet.offer({"rev": 1}, [{"type": "action_final", "action_id": "cmd-1", "state": "done"}])
+    await bridge._handle_event({"type": "input_audio_buffer.speech_started"})
+    await bridge._handle_event({"type": "input_audio_buffer.speech_stopped"})
+    assert await bridge._flush_quiet() is False
+    assert bridge._send.await_count == 0
+    await bridge._finish_turn()
+    assert bridge._send.await_count == 1
+    assert bridge._send.await_args.args[0]["item"]["role"] == "system"
+    await bridge.stop()

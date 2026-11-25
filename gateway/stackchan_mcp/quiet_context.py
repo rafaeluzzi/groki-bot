@@ -20,7 +20,9 @@ class QuietContext:
         self._last_sent = -1_000.0
         self._pending_system = False
         self.system_rejected = False
+        self.turn_pending = False
         self.attached: list[dict[str, Any]] = []
+        self._ids = 0
 
     def offer(self, snapshot: dict[str, Any] | None, events: list[dict[str, Any]]) -> None:
         if isinstance(snapshot, dict):
@@ -31,33 +33,40 @@ class QuietContext:
         if len(self.events) > MAX_EVENTS:
             self.events = self.events[-MAX_EVENTS:]
 
-    def due(self, now: float, *, response_active: bool) -> dict[str, Any] | None:
-        """The next item to send, or None when it must wait."""
-        if self.snapshot is None and not self.events:
+    def due(self, now: float, *, response_active: bool, item_id: str | None = None) -> dict[str, Any] | None:
+        """The next item to send, or None when it must wait.
+
+        A snapshot alone is not an item. Events carry the snapshot with them.
+        """
+        if not self.events:
             return None
-        if response_active:
+        if response_active or self.turn_pending:
             return None
         if now - self._last_sent < RATE_S:
             return None
         self._last_sent = now
         self._pending_system = not self.system_rejected
-        return self._item(system=not self.system_rejected)
+        return self._item(system=not self.system_rejected, item_id=item_id or self._next_id())
 
     def note_sent(self) -> None:
         self.snapshot = None
         self.events = []
         self._pending_system = False
 
-    def note_rejected(self) -> dict[str, Any] | None:
+    def note_rejected(self, item_id: str | None = None) -> dict[str, Any] | None:
         """The server refused a system item. Retry once as a user item, else keep the events."""
         if not self._pending_system:
             self.attached = list(self.events)
             return None
         self.system_rejected = True
         self._pending_system = False
-        if self.snapshot is None and not self.events:
+        if not self.events:
             return None
-        return self._item(system=False)
+        return self._item(system=False, item_id=item_id or self._next_id())
+
+    def _next_id(self) -> str:
+        self._ids += 1
+        return f"quiet_{self._ids}"
 
     def fail(self) -> None:
         """Injection is unsupported. The next tool result carries the events."""
@@ -70,13 +79,14 @@ class QuietContext:
         self.events = []
         return held
 
-    def _item(self, *, system: bool) -> dict[str, Any]:
+    def _item(self, *, system: bool, item_id: str) -> dict[str, Any]:
         line = _line(self.snapshot, self.events)
         text = line if system else f"{QUIET_PREFIX} {line}"
         role = "system" if system else "user"
         return {
             "type": "conversation.item.create",
             "item": {
+                "id": item_id,
                 "type": "message",
                 "role": role,
                 "content": [{"type": "input_text", "text": text}],
