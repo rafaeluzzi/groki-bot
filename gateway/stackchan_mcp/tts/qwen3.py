@@ -112,4 +112,4 @@ class Qwen3Engine(TTSEngine):
         if not saw_pcm:
             raise RuntimeError("Qwen3-TTS returned empty PCM response")
 
-        logger.info("Qwen3-TTS streamed PCM for text=%r", text[:60])
+        logger.info("Qwen3-TTS streamed PCM chars=%s", len(text))

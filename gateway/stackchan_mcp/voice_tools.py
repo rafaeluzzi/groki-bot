@@ -1048,9 +1048,9 @@ class VoiceToolExecutor:
             return await self._dispatch_end_conversation()
         if name == "set_all_leds" and self._should_defer_set_all_leds():
             logger.info(
-                "Gemini Live set_all_leds deferred: wake_gate_state=%s args=%s",
+                "Gemini Live set_all_leds deferred: wake_gate_state=%s %s",
                 WakeGateState.LISTENING.value,
-                self._summarize_tool_args(args),
+                self._summarize_tool_args("set_all_leds", args),
             )
             return {"ok": True, "deferred": "listening_status_light_active"}
         if name == "express_emotion":
@@ -1199,13 +1199,20 @@ class VoiceToolExecutor:
         return {"ok": True, "led": {"r": rgb["r"], "g": rgb["g"], "b": rgb["b"]}}
 
     @staticmethod
-    def _summarize_tool_args(args: dict[str, Any]) -> str:
+    def _summarize_tool_args(name: str, args: dict[str, Any]) -> str:
+        """Keys and size only. device_command may add its fixed command name."""
         try:
-            summary = json.dumps(args, ensure_ascii=False, sort_keys=True)
+            encoded = json.dumps(args, ensure_ascii=False, sort_keys=True).encode("utf-8")
         except TypeError:
-            summary = repr(args)
-        if len(summary) > 240:
-            return summary[:237] + "..."
+            encoded = repr(args).encode("utf-8")
+        keys = ",".join(sorted(str(key) for key in args))
+        summary = f"args_keys={keys} n={len(args)} bytes={len(encoded)}"
+        if name == "device_command":
+            from .device_commands import canonical_command_name  # noqa: PLC0415
+
+            command = canonical_command_name(args.get("name"))
+            if command is not None:
+                summary += f" command={command}"
         return summary
 
     def _log_tool_result(
@@ -1220,9 +1227,9 @@ class VoiceToolExecutor:
         else:
             status = "ok" if ok else f"error={result.get('error', 'unknown')}"
         logger.info(
-            "Gemini Live tool call name=%s args=%s %s",
+            "Gemini Live tool call name=%s %s %s",
             name,
-            self._summarize_tool_args(args),
+            self._summarize_tool_args(name, args),
             status,
         )
         self._status.record_tool_call(

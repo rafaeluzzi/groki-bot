@@ -155,7 +155,8 @@ async def test_show_panel_logs_the_template_name(caplog):
             {"panel": {"kind": "webview", "template": "weather", "data": WEATHER}},
         )
     assert result == {"ok": True, "kind": "webview", "template": "weather"}
-    assert "panel shown id=" in caplog.text
+    assert "panel shown id=" not in caplog.text
+    assert "id_chars=" in caplog.text
     assert "kind=webview" in caplog.text
     assert "template=weather" in caplog.text
     assert "items=1" in caplog.text

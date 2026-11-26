@@ -25,6 +25,8 @@ class QuietContext:
         self.turn_pending_at: float | None = None
         self.attached: list[dict[str, Any]] = []
         self._ids = 0
+        self._sent_events: list[dict[str, Any]] = []
+        self._sent_snapshot: dict[str, Any] | None = None
 
     def offer(self, snapshot: dict[str, Any] | None, events: list[dict[str, Any]]) -> None:
         if isinstance(snapshot, dict):
@@ -66,21 +68,32 @@ class QuietContext:
             return None
         self._last_sent = now
         self._pending_system = not self.system_rejected
+        self._sent_events = list(self.events[-MAX_EVENTS:])
+        self._sent_snapshot = self.snapshot
         return self._item(system=not self.system_rejected, item_id=item_id or self._next_id())
 
+    def in_flight(self) -> list[dict[str, Any]]:
+        """Event objects included in the item due() last built."""
+        return list(self._sent_events)
+
     def note_sent(self) -> None:
-        self.snapshot = None
-        self.events = []
+        """Drop only the batch that was sent. A newer offer stays queued."""
+        sent_snapshot = self._sent_snapshot
+        self._drop(self._sent_events)
+        if self.snapshot is sent_snapshot:
+            self.snapshot = None
         self._pending_system = False
+        self._sent_events = []
+        self._sent_snapshot = None
 
     def note_rejected(self, item_id: str | None = None) -> dict[str, Any] | None:
         """The server refused a system item. Retry once as a user item, else keep the events."""
         if not self._pending_system:
-            self.attached = list(self.events)
+            self.attached = self._owed()
             return None
         self.system_rejected = True
         self._pending_system = False
-        if not self.events:
+        if not self._owed():
             return None
         return self._item(system=False, item_id=item_id or self._next_id())
 
@@ -90,17 +103,29 @@ class QuietContext:
 
     def fail(self) -> None:
         """Injection is unsupported. The next tool result carries the events."""
-        self.attached = list(self.events)
+        self.attached = self._owed()
         self._pending_system = False
 
     def take_attached(self) -> list[dict[str, Any]]:
         held = self.attached
         self.attached = []
-        self.events = []
+        self._drop(held)
+        if self._sent_events and all(id(event) in {id(item) for item in held} for event in self._sent_events):
+            self._sent_events = []
         return held
 
+    def _owed(self) -> list[dict[str, Any]]:
+        """The in-flight item when one was sent. Otherwise everything still queued."""
+        if self._sent_events:
+            return list(self._sent_events)
+        return list(self.events)
+
+    def _drop(self, events: list[dict[str, Any]]) -> None:
+        gone = {id(event) for event in events}
+        self.events = [event for event in self.events if id(event) not in gone]
+
     def _item(self, *, system: bool, item_id: str) -> dict[str, Any]:
-        line = _line(self.snapshot, self.events)
+        line = _line(self._sent_snapshot, self._sent_events)
         text = line if system else f"{QUIET_PREFIX} {line}"
         role = "system" if system else "user"
         return {

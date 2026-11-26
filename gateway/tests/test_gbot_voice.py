@@ -94,6 +94,273 @@ async def test_interrupt_discards_late_old_audio_and_accepts_next_turn():
 
 
 @pytest.mark.asyncio
+async def test_abort_with_no_active_response_drops_the_in_flight_reply():
+    b = bridge()
+    b._send = AsyncMock()
+    b._quiet.hold_turn(0)
+    b._quiet_outstanding = True
+    b._quiet_id = "quiet_1"
+    await b.interrupt()
+    assert b._response_in_progress is False
+    assert b._quiet.turn_pending is False
+    assert b._quiet_outstanding is False
+    assert b._quiet_id is None
+    assert b._suppress_next_response is True
+    b._send.assert_not_awaited()
+    delta = {
+        "type": "response.audio.delta",
+        "delta": base64.b64encode(b"\x00\x00" * 240).decode(),
+    }
+    await b._handle_event({"type": "response.created", "response": {"id": "late"}})
+    await b._handle_event({**delta, "response_id": "late"})
+    assert b._on_audio.await_count == 0
+    await b._handle_event({"type": "response.done", "response": {"id": "late"}})
+    await b._handle_event({"type": "response.created", "response": {"id": "ask"}})
+    await b._handle_event({**delta, "response_id": "ask"})
+    assert b._on_audio.await_count == 1
+
+
+def _pcm_delta(response_id: str) -> dict:
+    return {
+        "type": "response.audio.delta",
+        "response_id": response_id,
+        "delta": base64.b64encode(b"\x00\x00" * 240).decode(),
+    }
+
+
+def _sent(b):
+    return [
+        call.args[0]
+        for call in b._send.await_args_list
+        if call.args and isinstance(call.args[0], dict)
+    ]
+
+
+def _of_type(b, kind):
+    return [event for event in _sent(b) if event.get("type") == kind]
+
+
+async def _reply(b, response_id):
+    await b._handle_event({"type": "response.created", "response": {"id": response_id}})
+    await b._handle_event(_pcm_delta(response_id))
+
+
+@pytest.mark.asyncio
+async def test_abort_then_the_next_user_turn_plays():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.abort_turn()
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    assert b._suppress_next_response is True
+    await b._handle_event({"type": "input_audio_buffer.cleared"})
+    await b.send_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    assert b._suppress_next_response is False
+    await _reply(b, "ask")
+    assert b._on_audio.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_then_uplink_audio_lets_the_next_ask_play():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.abort_turn()
+    await b.send_keepalive_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.cleared"})
+    await b.send_audio(b"\x00\x00")
+    assert b._suppress_next_response is True
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    assert b._suppress_next_response is False
+    await _reply(b, "ask")
+    assert b._on_audio.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_late_reply_before_the_next_turn_stays_dropped():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.abort_turn()
+    await _reply(b, "late")
+    assert b._on_audio.await_count == 0
+    assert len(_of_type(b, "response.cancel")) == 1
+    await b._handle_event({"type": "input_audio_buffer.cleared"})
+    await b.send_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "ask")
+    assert b._on_audio.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_commit_after_abort_drops_the_story():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.send_audio(b"\x00\x00")
+    await b.abort_turn()
+    assert len(_of_type(b, "input_audio_buffer.clear")) == 1
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "story")
+    assert b._on_audio.await_count == 0
+    assert len(_of_type(b, "response.cancel")) == 1
+    assert "story" in b._suppressed
+    await b._handle_event({"type": "input_audio_buffer.cleared", "event_id": "evt_clear"})
+    await b.send_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "ask")
+    assert b._on_audio.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_stale_buffer_story_before_the_new_commit_is_dropped():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.send_audio(b"\x00\x00")
+    await b.abort_turn()
+    await b._handle_event({"type": "input_audio_buffer.cleared"})
+    await b.send_audio(b"\x00\x00")
+    await _reply(b, "story")
+    assert b._on_audio.await_count == 0
+    assert len(_of_type(b, "response.cancel")) == 1
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "ask")
+    assert b._on_audio.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_uplink_right_after_abort_does_not_release_the_story():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.send_audio(b"\x00\x00")
+    await b.abort_turn()
+    await b.send_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    assert b._suppress_next_response is True
+    await _reply(b, "story")
+    assert b._on_audio.await_count == 0
+    assert len(_of_type(b, "response.cancel")) == 1
+    await b._handle_event({"type": "input_audio_buffer.cleared"})
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "ask")
+    assert b._on_audio.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_missing_clear_ack_releases_after_two_seconds(caplog):
+    import logging
+
+    b = bridge()
+    b._send = AsyncMock()
+    await b.send_audio(b"\x00\x00")
+    await b.abort_turn()
+    pending = b._abort_clear_task
+    pending.cancel()
+    await asyncio.gather(pending, return_exceptions=True)
+    assert b._abort_barrier is True
+    await b.send_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "story")
+    assert b._on_audio.await_count == 0
+    assert len(_of_type(b, "response.cancel")) == 1
+    b._abort_clear_wait_s = 0
+    with caplog.at_level(logging.INFO):
+        await b._abort_clear_timeout()
+    assert caplog.text.count("abort clear_ack=missing") == 1
+    assert "abort clear_ack=yes" not in caplog.text
+    await b.send_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "ask")
+    assert b._on_audio.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_keepalive_after_abort_does_not_release_the_story():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.abort_turn()
+    await b._handle_event({"type": "input_audio_buffer.cleared"})
+    await b.send_keepalive_audio(b"\x00\x00")
+    await b._handle_event({"type": "input_audio_buffer.committed"})
+    await _reply(b, "story")
+    assert b._on_audio.await_count == 0
+    assert len(_of_type(b, "response.cancel")) == 1
+
+
+@pytest.mark.asyncio
+async def test_suppressed_story_does_not_run_tools():
+    b = bridge()
+    b._send = AsyncMock()
+    b._local_tools["show_panel"] = "show_panel"
+    await b.abort_turn()
+    await _reply(b, "story")
+    await b._handle_event(
+        {
+            "type": "response.function_call_arguments.done",
+            "name": "show_panel",
+            "call_id": "call_1",
+            "response_id": "story",
+            "arguments": "{}",
+        }
+    )
+    assert b._tools == set()
+    kinds = [event.get("type") for event in _sent(b)]
+    assert "function_call_output" not in kinds
+    assert "response.create" not in kinds
+    assert b._on_audio.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_barge_in_does_not_clear_the_input_buffer():
+    b = bridge()
+    b._send = AsyncMock()
+    await b._handle_event({"type": "response.created", "response": {"id": "live"}})
+    await b._handle_event({"type": "input_audio_buffer.speech_started"})
+    b._on_interrupt.assert_awaited()
+    assert _of_type(b, "input_audio_buffer.clear") == []
+
+
+@pytest.mark.asyncio
+async def test_interrupt_logs_quiet_reason_interrupt(caplog):
+    import logging
+
+    b = bridge()
+    b._send = AsyncMock()
+    b._quiet.offer({"rev": 1}, [{"type": "reflex", "rev": 1}])
+    assert await b._flush_quiet() is True
+    with caplog.at_level(logging.INFO):
+        await b.interrupt()
+    assert "portal_event accepted=false reason=interrupt" in caplog.text
+    assert "reason=timeout" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_abort_with_no_tts_still_sends_a_stop_ack():
+    class Codec:
+        def reset_encode_buffer(self):
+            pass
+
+    class Bridge:
+        running = True
+
+        def __init__(self):
+            self._connected_event = asyncio.Event()
+            self._connected_event.set()
+            self.calls = 0
+
+        async def interrupt(self):
+            self.calls += 1
+
+    proxy = GbotVoiceProxy(codec_factory=Codec)
+    proxy._bridge = Bridge()
+    proxy._codec = Codec()
+    proxy._send_to_device = AsyncMock()
+    proxy._ready_event.set()
+    proxy._tts_active = False
+    assert await proxy.send_device_json({"type": "abort"}) is True
+    assert proxy._bridge.calls == 1
+    proxy._send_to_device.assert_awaited_once_with('{"type": "tts", "state": "stop"}')
+
+
+@pytest.mark.asyncio
 async def test_speech_started_cancels_drain_without_blocking_receiver():
     b = bridge()
     b._send = AsyncMock()

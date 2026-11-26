@@ -166,9 +166,9 @@ function render(st) {
   }
   document.getElementById("tbl-tools").innerHTML = tools;
 
-  let trs = "<tr><th>时间</th><th>内容</th></tr>";
+  let trs = "<tr><th>时间</th><th>chars</th></tr>";
   for (const t of st.recent.transcripts) {
-    trs += "<tr><td>" + fmtTs(t.at) + "</td><td>" + esc(t.text) + "</td></tr>";
+    trs += "<tr><td>" + fmtTs(t.at) + "</td><td>" + esc(String(t.chars ?? "")) + "</td></tr>";
   }
   document.getElementById("tbl-transcripts").innerHTML = trs;
 }

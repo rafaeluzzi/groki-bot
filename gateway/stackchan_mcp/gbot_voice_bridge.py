@@ -196,6 +196,11 @@ class GbotVoiceBridge:
         self._active_response = None
         self._response_in_progress = False
         self._drop_until_response = False
+        self._suppress_next_response = False
+        self._abort_barrier = False
+        self._uplink_since_abort = False
+        self._abort_clear_task: asyncio.Task | None = None
+        self._abort_clear_wait_s = 2.0
         self._resampler = Pcm16To24()
         self._stopped = False
         self.running = False
@@ -229,6 +234,14 @@ class GbotVoiceBridge:
         self._grok_progress = GrokProgress()
         self._quiet = QuietContext()
         self._quiet_system_rejected = False
+        self._quiet_id = None
+        self._quiet_outstanding = False
+        self._quiet_target = None
+        self._quiet_n = 0
+        self._quiet_role = None
+        self._quiet_unknown_id = None
+        self._quiet_unknown_events = None
+        self._item_added_seen = False
         self._skill_logged = False
         esp = self._executor_options.get("esp32")
         if esp is not None:
@@ -1093,7 +1106,7 @@ class GbotVoiceBridge:
 
     async def _flush_quiet(self) -> bool:
         """One conversation item. Never response.create. note_sent waits until that item id is accepted."""
-        if getattr(self, "_quiet_outstanding", False):
+        if self._quiet_outstanding:
             return False
         esp = self._executor_options.get("esp32")
         quiet = self._quiet_box()
@@ -1101,10 +1114,10 @@ class GbotVoiceBridge:
             return False
         active = bool(
             self._response_in_progress
-            or getattr(self, "_user_speaking", False)
+            or self._user_speaking
             or quiet.turn_pending
         )
-        self._quiet_n = getattr(self, "_quiet_n", 0) + 1
+        self._quiet_n += 1
         item = quiet.due(time.monotonic(), response_active=active, item_id=f"quiet_{self._quiet_n}")
         if item is None:
             return False
@@ -1117,37 +1130,102 @@ class GbotVoiceBridge:
             return False
         self._quiet_outstanding = True
         self._quiet_id = item.get("item", {}).get("id")
+        self._quiet_role = item.get("item", {}).get("role")
         self._quiet_target = quiet
+        self._quiet_unknown_id = None
+        self._quiet_unknown_events = None
         logger.info("portal_event injected=%s n=%s", True, len(quiet.events))
         self._hold(self._quiet_accept_timeout(self._quiet_id))
         return True
 
     async def _quiet_accept_timeout(self, item_id: str, delay: float = 2.0) -> None:
         await asyncio.sleep(delay)
-        if not getattr(self, "_quiet_outstanding", False):
+        if not self._quiet_outstanding:
             return
-        if getattr(self, "_quiet_id", None) != item_id:
+        if self._quiet_id != item_id:
             return
+        self._quiet_delivered_unknown("timeout")
+
+    def _quiet_delivered_unknown(self, reason: str) -> None:
+        """The create was sent and no error arrived. Do not inject this batch again.
+
+        Remember it so a later ack can drop it if something attached the same list.
+        Events offered after due() stay queued.
+        """
         self._quiet_outstanding = False
+        remembered = self._quiet_id
         self._quiet_id = None
-        quiet = getattr(self, "_quiet_target", None) or self._quiet
-        quiet.fail()
+        quiet = self._quiet_target or self._quiet
+        self._quiet_unknown_id = remembered
+        self._quiet_unknown_events = quiet.in_flight()
+        quiet.note_sent()
+        logger.info("portal_event accepted=false reason=%s", reason)
+
+    def _note_matched_item_added(self, event: dict, item_id: object) -> None:
+        """Shape of the first item.added that is our note. The user's audio is not that."""
+        if self._item_added_seen or event.get("type") != "conversation.item.added":
+            return
+        self._item_added_seen = True
+        keys = ",".join(sorted(str(key) for key in event))
+        known = {self._quiet_id, self._quiet_unknown_id}
+        client = isinstance(item_id, str) and (item_id in known or item_id.startswith("quiet_"))
+        logger.info("item_added keys=%s id_shape=%s", keys, "client" if client else "server")
+
+    def _quiet_content_match(self, item: object) -> bool:
+        from .quiet_context import QUIET_PREFIX
+
+        if not isinstance(item, dict) or item.get("type") != "message":
+            return False
+        role = self._quiet_role
+        if not isinstance(role, str) or item.get("role") != role:
+            return False
+        content = item.get("content")
+        if not isinstance(content, list) or not content or not isinstance(content[0], dict):
+            return False
+        first = content[0]
+        if first.get("type") != "input_text" or not isinstance(first.get("text"), str):
+            return False
+        text = first["text"]
+        if role == "user":
+            return text.startswith(QUIET_PREFIX) or text.startswith("Portal status updated.")
+        return text.startswith("Portal status updated.")
+
+    def _clear_unknown_pending(self) -> None:
+        batch = self._quiet_unknown_events or []
         esp = self._executor_options.get("esp32")
-        if esp is not None:
-            esp.pending_portal_events = quiet.take_attached()
-        logger.info("portal_event accepted=false reason=timeout")
+        pending = getattr(esp, "pending_portal_events", None) if esp is not None else None
+        if isinstance(pending, list) and batch and pending == batch:
+            esp.pending_portal_events = []
+        self._quiet_unknown_id = None
+        self._quiet_unknown_events = None
 
     def _accept_quiet_item(self, event: dict | None = None) -> None:
-        if not getattr(self, "_quiet_outstanding", False):
-            return
         item = event.get("item") if isinstance(event, dict) else None
-        created = item.get("id") if isinstance(item, dict) else None
-        if created != getattr(self, "_quiet_id", None):
-            return
-        self._quiet_outstanding = False
-        self._quiet_id = None
-        quiet = getattr(self, "_quiet_target", None) or self._quiet
-        quiet.note_sent()
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if self._quiet_outstanding:
+            if item_id is not None and item_id == self._quiet_id:
+                match = "id"
+            elif self._quiet_content_match(item):
+                match = "content"
+            else:
+                match = None
+            if match is not None:
+                if isinstance(event, dict):
+                    self._note_matched_item_added(event, item_id)
+                self._quiet_outstanding = False
+                self._quiet_id = None
+                self._quiet_unknown_id = None
+                self._quiet_unknown_events = None
+                quiet = self._quiet_target or self._quiet
+                quiet.note_sent()
+                logger.info("portal_event accepted=true match=%s", match)
+                return
+        unknown = self._quiet_unknown_id
+        if unknown and item_id == unknown:
+            if isinstance(event, dict):
+                self._note_matched_item_added(event, item_id)
+            self._clear_unknown_pending()
+            logger.info("portal_event accepted=true match=id")
 
     async def inject_context_quiet(self, text: str) -> bool:
         """Test and fallback entry. The production path is _flush_quiet."""
@@ -1235,6 +1313,7 @@ class GbotVoiceBridge:
         return result
 
     async def start(self):
+        self._item_added_seen = False
         self._release_quiet_turn()
         stage = "account_requests"
         self.metrics["startup_stage"] = stage
@@ -1390,6 +1469,8 @@ class GbotVoiceBridge:
         await self._ws.send_json(event)
 
     async def send_audio(self, pcm):
+        if self._suppress_next_response or self._abort_barrier:
+            self._uplink_since_abort = True
         self._cancel_idle()
         await self._send_pcm(pcm)
 
@@ -1434,6 +1515,11 @@ class GbotVoiceBridge:
             self._turn_task and not self._turn_task.done()
         )
         self._drop_until_response = True
+        if not active:
+            self._suppress_next_response = True
+        self._quiet_box().release_turn()
+        if self._quiet_outstanding:
+            self._quiet_delivered_unknown("interrupt")
         if self._active_response:
             self._suppressed.add(self._active_response)
             slot = self._desktop_live.pop(self._active_response, None)
@@ -1444,10 +1530,46 @@ class GbotVoiceBridge:
         await self._on_interrupt()
         if active:
             self.metrics["interruptions"] += 1
-        if self._response_in_progress:
-            self._response_in_progress = False
-            self._response_requested = False
+        was_responding = self._response_in_progress
+        self._response_in_progress = False
+        self._response_requested = False
+        if was_responding:
             await self._send({"type": "response.cancel"})
+
+    async def abort_turn(self) -> None:
+        """Portal abort. Not a VAD barge-in: drop the clip xAI is still holding."""
+        await self.interrupt()
+        self._uplink_since_abort = False
+        self._abort_barrier = True
+        previous = self._abort_clear_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._abort_clear_task = asyncio.create_task(self._abort_clear_timeout())
+        try:
+            await self._send({"type": "input_audio_buffer.clear"})
+        except Exception:
+            logger.info("abort clear send ok=false")
+
+    async def _abort_clear_timeout(self) -> None:
+        try:
+            await asyncio.sleep(self._abort_clear_wait_s)
+        except asyncio.CancelledError:
+            return
+        await self._release_abort_barrier("missing")
+
+    async def _release_abort_barrier(self, ack: str) -> None:
+        if not self._abort_barrier:
+            return
+        self._abort_barrier = False
+        task = self._abort_clear_task
+        self._abort_clear_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        logger.info("abort clear_ack=%s", ack)
 
     async def _handle_event(self, event):
         kind = event.get("type")
@@ -1481,8 +1603,21 @@ class GbotVoiceBridge:
             logger.info("Grok voice response state=created trigger=%s", trigger)
             self._schedule_grok(self._grok_progress.on_response_created())
             self.response_started_at[self._active_response] = time.monotonic()
-            self._drop_until_response = False
+            if self._suppress_next_response:
+                self._suppress_next_response = False
+                if self._active_response:
+                    self._suppressed.add(self._active_response)
+                self._drop_until_response = True
+                self._response_in_progress = False
+                self._response_progress_at = None
+                await self._send({"type": "response.cancel"})
+            else:
+                self._drop_until_response = False
+        elif kind == "input_audio_buffer.cleared":
+            await self._release_abort_barrier("yes")
         elif kind == "input_audio_buffer.speech_started":
+            if self._abort_barrier:
+                return
             self._grok_progress.on_speech_started()
             self._maybe_warm()
             self._response_progress_at = None
@@ -1496,6 +1631,12 @@ class GbotVoiceBridge:
             ):
                 await self.interrupt()
         elif kind in {"input_audio_buffer.speech_stopped", "input_audio_buffer.committed"}:
+            if kind == "input_audio_buffer.committed":
+                if self._abort_barrier:
+                    return
+                if self._uplink_since_abort:
+                    self._suppress_next_response = False
+                    self._uplink_since_abort = False
             if kind == "input_audio_buffer.speech_stopped" or kind == "input_audio_buffer.committed":
                 from .koji_voice import context_seq
 
@@ -1574,7 +1715,10 @@ class GbotVoiceBridge:
                 self._desktop_epoch,
             )
             raw_name = event.get("name")
-            if isinstance(raw_name, str) and (
+            response_id = event.get("response_id") or self._active_response
+            if response_id in self._suppressed:
+                self._tool_outcome(name, "suppressed")
+            elif isinstance(raw_name, str) and (
                 raw_name in self._local_tools or raw_name in self._remote_tools
             ):
                 task = asyncio.create_task(self._tool(event))
@@ -1582,7 +1726,7 @@ class GbotVoiceBridge:
                 task.add_done_callback(self._tools.discard)
             else:
                 self._tool_outcome(name, "undeclared")
-        elif kind == "conversation.item.created":
+        elif kind in {"conversation.item.added", "conversation.item.created"}:
             self._accept_quiet_item(event)
         elif kind == "error":
             error = event.get("error", {})
@@ -1606,16 +1750,21 @@ class GbotVoiceBridge:
                 "model",
                 "tools",
             }
-            if getattr(self, "_quiet_outstanding", False) and code in {"invalid_request_error", "invalid_value"}:
-                quiet = getattr(self, "_quiet_target", None) or self._quiet
-                self._quiet_n = getattr(self, "_quiet_n", 0) + 1
+            if self._quiet_outstanding and code in {"invalid_request_error", "invalid_value"}:
+                quiet = self._quiet_target or self._quiet
+                self._quiet_n += 1
                 retry = quiet.note_rejected(item_id=f"quiet_{self._quiet_n}")
                 if retry is None:
                     self._quiet_outstanding = False
                     self._quiet_id = None
+                    held = quiet.take_attached()
+                    esp = self._executor_options.get("esp32")
+                    if esp is not None and held:
+                        esp.pending_portal_events = held
                 else:
                     self._quiet_outstanding = True
                     self._quiet_id = retry.get("item", {}).get("id")
+                    self._quiet_role = retry.get("item", {}).get("role")
                     self._hold(self._send(retry))
                     self._hold(self._quiet_accept_timeout(self._quiet_id))
             if code in {"server_error", "authentication_error", "session_expired"}:

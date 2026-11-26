@@ -314,7 +314,7 @@ class UsbTransport:
         try:
             data = json.loads(payload)
         except Exception:
-            logger.warning("USB transport bad JSON: %.120s", payload)
+            logger.warning("USB transport bad JSON: bytes=%s", len(payload.encode("utf-8")))
             return
         rid = data.get("id")
         if rid is None:

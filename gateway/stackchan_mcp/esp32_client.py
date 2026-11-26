@@ -596,7 +596,10 @@ class ESP32Manager:
                 try:
                     data = json.loads(message)
                 except json.JSONDecodeError:
-                    logger.warning("Invalid JSON from ESP32: %s", str(message)[:100])
+                    logger.warning(
+                        "Invalid JSON from ESP32: bytes=%s",
+                        len(str(message).encode("utf-8")),
+                    )
                     continue
 
                 msg_type = data.get("type", "")
