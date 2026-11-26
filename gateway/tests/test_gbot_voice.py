@@ -120,6 +120,56 @@ async def test_abort_with_no_active_response_drops_the_in_flight_reply():
     assert b._on_audio.await_count == 1
 
 
+def _pcm_delta(response_id: str) -> dict:
+    return {
+        "type": "response.audio.delta",
+        "response_id": response_id,
+        "delta": base64.b64encode(b"\x00\x00" * 240).decode(),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "kind",
+    ["input_audio_buffer.speech_started", "input_audio_buffer.committed"],
+)
+async def test_abort_then_the_next_user_turn_plays(kind):
+    b = bridge()
+    b._send = AsyncMock()
+    await b.interrupt()
+    assert b._suppress_next_response is True
+    await b._handle_event({"type": kind})
+    assert b._suppress_next_response is False
+    await b._handle_event({"type": "response.created", "response": {"id": "ask"}})
+    await b._handle_event(_pcm_delta("ask"))
+    assert b._on_audio.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_then_uplink_audio_lets_the_next_ask_play():
+    b = bridge()
+    b._send = AsyncMock()
+    b._send_pcm = AsyncMock()
+    await b.interrupt()
+    await b.send_keepalive_audio(b"\x00\x00")
+    assert b._suppress_next_response is True
+    await b.send_audio(b"\x00\x00")
+    assert b._suppress_next_response is False
+    await b._handle_event({"type": "response.created", "response": {"id": "ask"}})
+    await b._handle_event(_pcm_delta("ask"))
+    assert b._on_audio.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_late_reply_before_the_next_turn_stays_dropped():
+    b = bridge()
+    b._send = AsyncMock()
+    await b.interrupt()
+    await b._handle_event({"type": "response.created", "response": {"id": "late"}})
+    await b._handle_event(_pcm_delta("late"))
+    assert b._on_audio.await_count == 0
+
+
 @pytest.mark.asyncio
 async def test_abort_with_no_tts_still_sends_a_stop_ack():
     class Codec:

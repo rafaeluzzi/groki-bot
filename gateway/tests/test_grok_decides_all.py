@@ -694,3 +694,89 @@ async def test_error_for_the_outstanding_item_retries_then_attaches_once():
     again = attach_portal(device, {"ok": True})
     assert "portal_events" not in again
     await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_user_audio_item_added_does_not_kill_the_session(caplog):
+    import logging
+
+    bridge = _bridge()
+    user_audio = {
+        "type": "conversation.item.added",
+        "item": {"id": "item_abc", "type": "message", "role": "user"},
+    }
+    with caplog.at_level(logging.INFO):
+        await bridge._handle_event(user_audio)
+    await bridge._handle_event({"type": "session.updated"})
+    assert bridge._connected_event.is_set()
+    assert "id_shape=" not in caplog.text
+    bridge._item_added_seen = True
+    bridge._local = __import__("unittest").mock.AsyncMock(side_effect=RuntimeError("stop"))
+    with pytest.raises(RuntimeError, match="details redacted"):
+        await bridge.start()
+    assert bridge._item_added_seen is False
+    await bridge._handle_event(user_audio)
+    bridge._connected_event.clear()
+    await bridge._handle_event({"type": "session.updated"})
+    assert bridge._connected_event.is_set()
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_interrupt_during_the_note_wait_sends_the_batch_once():
+    bridge = _bridge()
+    bridge._quiet.offer({"rev": 1}, [{"type": "reflex", "rev": 1}])
+    assert await bridge._flush_quiet() is True
+    item_id = bridge._quiet_id
+    await bridge.interrupt()
+    bridge._quiet._last_sent = -1_000.0
+    assert await bridge._flush_quiet() is False
+    creates = [
+        call.args[0]
+        for call in bridge._send.await_args_list
+        if isinstance(call.args[0], dict) and call.args[0].get("type") == "conversation.item.create"
+    ]
+    assert len(creates) == 1
+    await bridge._handle_event(
+        {"type": "conversation.item.added", "item": {"id": item_id, "type": "message", "role": "system"}}
+    )
+    creates = [
+        call.args[0]
+        for call in bridge._send.await_args_list
+        if isinstance(call.args[0], dict) and call.args[0].get("type") == "conversation.item.create"
+    ]
+    assert len(creates) == 1
+    assert bridge._quiet_outstanding is False
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("how", ["ack", "timeout", "interrupt"])
+async def test_events_offered_during_the_wait_stay_queued(how):
+    import json
+
+    bridge = _bridge()
+    older = {"type": "reflex", "rev": 1}
+    newer = {"type": "reflex", "rev": 2}
+    bridge._quiet.offer({"rev": 1}, [older])
+    assert await bridge._flush_quiet() is True
+    bridge._quiet.offer({"rev": 2}, [newer])
+    if how == "ack":
+        await bridge._handle_event(
+            {
+                "type": "conversation.item.added",
+                "item": {"id": bridge._quiet_id, "type": "message", "role": "system"},
+            }
+        )
+    elif how == "timeout":
+        await bridge._quiet_accept_timeout(bridge._quiet_id, delay=0)
+    else:
+        await bridge.interrupt()
+    assert older not in bridge._quiet.events
+    assert bridge._quiet.events == [newer]
+    bridge._quiet._last_sent = -1_000.0
+    assert await bridge._flush_quiet() is True
+    text = bridge._send.await_args_list[-1].args[0]["item"]["content"][0]["text"]
+    body = json.loads(text.split("Portal status updated. ", 1)[1])
+    assert body["portal_events"] == [newer]
+    await bridge.stop()

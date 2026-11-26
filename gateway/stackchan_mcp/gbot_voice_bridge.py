@@ -230,6 +230,10 @@ class GbotVoiceBridge:
         self._grok_progress = GrokProgress()
         self._quiet = QuietContext()
         self._quiet_system_rejected = False
+        self._quiet_id = None
+        self._quiet_outstanding = False
+        self._quiet_target = None
+        self._quiet_n = 0
         self._quiet_role = None
         self._quiet_unknown_id = None
         self._quiet_unknown_events = None
@@ -1098,7 +1102,7 @@ class GbotVoiceBridge:
 
     async def _flush_quiet(self) -> bool:
         """One conversation item. Never response.create. note_sent waits until that item id is accepted."""
-        if getattr(self, "_quiet_outstanding", False):
+        if self._quiet_outstanding:
             return False
         esp = self._executor_options.get("esp32")
         quiet = self._quiet_box()
@@ -1106,10 +1110,10 @@ class GbotVoiceBridge:
             return False
         active = bool(
             self._response_in_progress
-            or getattr(self, "_user_speaking", False)
+            or self._user_speaking
             or quiet.turn_pending
         )
-        self._quiet_n = getattr(self, "_quiet_n", 0) + 1
+        self._quiet_n += 1
         item = quiet.due(time.monotonic(), response_active=active, item_id=f"quiet_{self._quiet_n}")
         if item is None:
             return False
@@ -1132,28 +1136,33 @@ class GbotVoiceBridge:
 
     async def _quiet_accept_timeout(self, item_id: str, delay: float = 2.0) -> None:
         await asyncio.sleep(delay)
-        if not getattr(self, "_quiet_outstanding", False):
+        if not self._quiet_outstanding:
             return
-        if getattr(self, "_quiet_id", None) != item_id:
+        if self._quiet_id != item_id:
             return
+        self._quiet_delivered_unknown()
+
+    def _quiet_delivered_unknown(self) -> None:
+        """The create was sent and no error arrived. Do not inject this batch again.
+
+        Remember it so a later ack can drop it if something attached the same list.
+        Events offered after due() stay queued.
+        """
         self._quiet_outstanding = False
         remembered = self._quiet_id
         self._quiet_id = None
-        quiet = getattr(self, "_quiet_target", None) or self._quiet
-        # No error and no ack. The create was sent, so this batch is not injected again
-        # and is not attached. A later ack for the same id drops it if it was attached.
+        quiet = self._quiet_target or self._quiet
         self._quiet_unknown_id = remembered
-        self._quiet_unknown_events = list(quiet.events)
+        self._quiet_unknown_events = quiet.in_flight()
         quiet.note_sent()
         logger.info("portal_event accepted=false reason=timeout")
 
-    def _note_first_item_added(self, event: dict) -> None:
-        if self._item_added_seen:
+    def _note_matched_item_added(self, event: dict, item_id: object) -> None:
+        """Shape of the first item.added that is our note. The user's audio is not that."""
+        if self._item_added_seen or event.get("type") != "conversation.item.added":
             return
         self._item_added_seen = True
         keys = ",".join(sorted(str(key) for key in event))
-        item = event.get("item") if isinstance(event.get("item"), dict) else None
-        item_id = item.get("id") if isinstance(item, dict) else None
         known = {self._quiet_id, self._quiet_unknown_id}
         client = isinstance(item_id, str) and (item_id in known or item_id.startswith("quiet_"))
         logger.info("item_added keys=%s id_shape=%s", keys, "client" if client else "server")
@@ -1163,7 +1172,7 @@ class GbotVoiceBridge:
 
         if not isinstance(item, dict) or item.get("type") != "message":
             return False
-        role = getattr(self, "_quiet_role", None)
+        role = self._quiet_role
         if not isinstance(role, str) or item.get("role") != role:
             return False
         content = item.get("content")
@@ -1189,24 +1198,28 @@ class GbotVoiceBridge:
     def _accept_quiet_item(self, event: dict | None = None) -> None:
         item = event.get("item") if isinstance(event, dict) else None
         item_id = item.get("id") if isinstance(item, dict) else None
-        if getattr(self, "_quiet_outstanding", False):
-            if item_id is not None and item_id == getattr(self, "_quiet_id", None):
+        if self._quiet_outstanding:
+            if item_id is not None and item_id == self._quiet_id:
                 match = "id"
             elif self._quiet_content_match(item):
                 match = "content"
             else:
                 match = None
             if match is not None:
+                if isinstance(event, dict):
+                    self._note_matched_item_added(event, item_id)
                 self._quiet_outstanding = False
                 self._quiet_id = None
                 self._quiet_unknown_id = None
                 self._quiet_unknown_events = None
-                quiet = getattr(self, "_quiet_target", None) or self._quiet
+                quiet = self._quiet_target or self._quiet
                 quiet.note_sent()
                 logger.info("portal_event accepted=true match=%s", match)
                 return
-        unknown = getattr(self, "_quiet_unknown_id", None)
+        unknown = self._quiet_unknown_id
         if unknown and item_id == unknown:
+            if isinstance(event, dict):
+                self._note_matched_item_added(event, item_id)
             self._clear_unknown_pending()
             logger.info("portal_event accepted=true match=id")
 
@@ -1452,6 +1465,7 @@ class GbotVoiceBridge:
         await self._ws.send_json(event)
 
     async def send_audio(self, pcm):
+        self._suppress_next_response = False
         self._cancel_idle()
         await self._send_pcm(pcm)
 
@@ -1499,9 +1513,8 @@ class GbotVoiceBridge:
         if not active:
             self._suppress_next_response = True
         self._quiet_box().release_turn()
-        if getattr(self, "_quiet_outstanding", False):
-            self._quiet_outstanding = False
-            self._quiet_id = None
+        if self._quiet_outstanding:
+            self._quiet_delivered_unknown()
         if self._active_response:
             self._suppressed.add(self._active_response)
             slot = self._desktop_live.pop(self._active_response, None)
@@ -1558,6 +1571,7 @@ class GbotVoiceBridge:
             else:
                 self._drop_until_response = False
         elif kind == "input_audio_buffer.speech_started":
+            self._suppress_next_response = False
             self._grok_progress.on_speech_started()
             self._maybe_warm()
             self._response_progress_at = None
@@ -1571,6 +1585,8 @@ class GbotVoiceBridge:
             ):
                 await self.interrupt()
         elif kind in {"input_audio_buffer.speech_stopped", "input_audio_buffer.committed"}:
+            if kind == "input_audio_buffer.committed":
+                self._suppress_next_response = False
             if kind == "input_audio_buffer.speech_stopped" or kind == "input_audio_buffer.committed":
                 from .koji_voice import context_seq
 
@@ -1658,8 +1674,6 @@ class GbotVoiceBridge:
             else:
                 self._tool_outcome(name, "undeclared")
         elif kind in {"conversation.item.added", "conversation.item.created"}:
-            if kind == "conversation.item.added" and isinstance(event, dict):
-                self._note_first_item_added(event)
             self._accept_quiet_item(event)
         elif kind == "error":
             error = event.get("error", {})
@@ -1683,9 +1697,9 @@ class GbotVoiceBridge:
                 "model",
                 "tools",
             }
-            if getattr(self, "_quiet_outstanding", False) and code in {"invalid_request_error", "invalid_value"}:
-                quiet = getattr(self, "_quiet_target", None) or self._quiet
-                self._quiet_n = getattr(self, "_quiet_n", 0) + 1
+            if self._quiet_outstanding and code in {"invalid_request_error", "invalid_value"}:
+                quiet = self._quiet_target or self._quiet
+                self._quiet_n += 1
                 retry = quiet.note_rejected(item_id=f"quiet_{self._quiet_n}")
                 if retry is None:
                     self._quiet_outstanding = False
