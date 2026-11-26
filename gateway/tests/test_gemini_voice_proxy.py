@@ -962,6 +962,43 @@ async def test_abort_when_no_tts_active_still_acks(monkeypatch, info):
     assert sent == ['{"type": "tts", "state": "stop"}']
 
 
+@pytest.mark.asyncio
+async def test_abort_calls_abort_turn_when_the_bridge_has_one(monkeypatch, info):
+    from unittest.mock import AsyncMock
+
+    proxy, _, sent = _make_proxy(monkeypatch=monkeypatch)
+
+    async def send(msg):
+        sent.append(msg)
+
+    class Bridge:
+        running = True
+
+        def __init__(self):
+            self._connected_event = asyncio.Event()
+            self._connected_event.set()
+            self.aborts = 0
+            self.interrupts = 0
+
+        async def abort_turn(self):
+            self.aborts += 1
+
+        async def interrupt(self):
+            self.interrupts += 1
+
+    await proxy.start(info, {"type": "hello"}, send)
+    proxy._bridge = Bridge()
+    proxy._codec = proxy._codec
+    proxy._send_to_device = AsyncMock()
+    proxy._ready_event.set()
+    proxy._tts_active = False
+    sent.clear()
+    assert await proxy.send_device_json({"type": "abort"}) is True
+    assert proxy._bridge.aborts == 1
+    assert proxy._bridge.interrupts == 0
+    proxy._send_to_device.assert_awaited_once_with('{"type": "tts", "state": "stop"}')
+
+
 # --- gemini → device ---------------------------------------------------------
 
 

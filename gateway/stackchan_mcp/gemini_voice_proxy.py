@@ -496,11 +496,15 @@ class GeminiVoiceProxy:
             return False
         msg_type = message.get("type", "")
         if msg_type == "abort":
-            interrupt = getattr(self._bridge, "interrupt", None)
-            if interrupt is not None:
-                await interrupt()
+            abort_turn = getattr(self._bridge, "abort_turn", None)
+            if abort_turn is not None:
+                await abort_turn()
             else:
-                await self._abort_in_flight_tts()
+                interrupt = getattr(self._bridge, "interrupt", None)
+                if interrupt is not None:
+                    await interrupt()
+                else:
+                    await self._abort_in_flight_tts()
             await self._ack_abort()
         elif msg_type == "listen":
             state = message.get("state", "")

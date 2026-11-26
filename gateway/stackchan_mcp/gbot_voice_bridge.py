@@ -197,6 +197,10 @@ class GbotVoiceBridge:
         self._response_in_progress = False
         self._drop_until_response = False
         self._suppress_next_response = False
+        self._abort_barrier = False
+        self._uplink_since_abort = False
+        self._abort_clear_task: asyncio.Task | None = None
+        self._abort_clear_wait_s = 2.0
         self._resampler = Pcm16To24()
         self._stopped = False
         self.running = False
@@ -1140,9 +1144,9 @@ class GbotVoiceBridge:
             return
         if self._quiet_id != item_id:
             return
-        self._quiet_delivered_unknown()
+        self._quiet_delivered_unknown("timeout")
 
-    def _quiet_delivered_unknown(self) -> None:
+    def _quiet_delivered_unknown(self, reason: str) -> None:
         """The create was sent and no error arrived. Do not inject this batch again.
 
         Remember it so a later ack can drop it if something attached the same list.
@@ -1155,7 +1159,7 @@ class GbotVoiceBridge:
         self._quiet_unknown_id = remembered
         self._quiet_unknown_events = quiet.in_flight()
         quiet.note_sent()
-        logger.info("portal_event accepted=false reason=timeout")
+        logger.info("portal_event accepted=false reason=%s", reason)
 
     def _note_matched_item_added(self, event: dict, item_id: object) -> None:
         """Shape of the first item.added that is our note. The user's audio is not that."""
@@ -1465,7 +1469,8 @@ class GbotVoiceBridge:
         await self._ws.send_json(event)
 
     async def send_audio(self, pcm):
-        self._suppress_next_response = False
+        if self._suppress_next_response or self._abort_barrier:
+            self._uplink_since_abort = True
         self._cancel_idle()
         await self._send_pcm(pcm)
 
@@ -1514,7 +1519,7 @@ class GbotVoiceBridge:
             self._suppress_next_response = True
         self._quiet_box().release_turn()
         if self._quiet_outstanding:
-            self._quiet_delivered_unknown()
+            self._quiet_delivered_unknown("interrupt")
         if self._active_response:
             self._suppressed.add(self._active_response)
             slot = self._desktop_live.pop(self._active_response, None)
@@ -1530,6 +1535,41 @@ class GbotVoiceBridge:
         self._response_requested = False
         if was_responding:
             await self._send({"type": "response.cancel"})
+
+    async def abort_turn(self) -> None:
+        """Portal abort. Not a VAD barge-in: drop the clip xAI is still holding."""
+        await self.interrupt()
+        self._uplink_since_abort = False
+        self._abort_barrier = True
+        previous = self._abort_clear_task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._abort_clear_task = asyncio.create_task(self._abort_clear_timeout())
+        try:
+            await self._send({"type": "input_audio_buffer.clear"})
+        except Exception:
+            logger.info("abort clear send ok=false")
+
+    async def _abort_clear_timeout(self) -> None:
+        try:
+            await asyncio.sleep(self._abort_clear_wait_s)
+        except asyncio.CancelledError:
+            return
+        await self._release_abort_barrier("missing")
+
+    async def _release_abort_barrier(self, ack: str) -> None:
+        if not self._abort_barrier:
+            return
+        self._abort_barrier = False
+        task = self._abort_clear_task
+        self._abort_clear_task = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        logger.info("abort clear_ack=%s", ack)
 
     async def _handle_event(self, event):
         kind = event.get("type")
@@ -1568,10 +1608,16 @@ class GbotVoiceBridge:
                 if self._active_response:
                     self._suppressed.add(self._active_response)
                 self._drop_until_response = True
+                self._response_in_progress = False
+                self._response_progress_at = None
+                await self._send({"type": "response.cancel"})
             else:
                 self._drop_until_response = False
+        elif kind == "input_audio_buffer.cleared":
+            await self._release_abort_barrier("yes")
         elif kind == "input_audio_buffer.speech_started":
-            self._suppress_next_response = False
+            if self._abort_barrier:
+                return
             self._grok_progress.on_speech_started()
             self._maybe_warm()
             self._response_progress_at = None
@@ -1586,7 +1632,11 @@ class GbotVoiceBridge:
                 await self.interrupt()
         elif kind in {"input_audio_buffer.speech_stopped", "input_audio_buffer.committed"}:
             if kind == "input_audio_buffer.committed":
-                self._suppress_next_response = False
+                if self._abort_barrier:
+                    return
+                if self._uplink_since_abort:
+                    self._suppress_next_response = False
+                    self._uplink_since_abort = False
             if kind == "input_audio_buffer.speech_stopped" or kind == "input_audio_buffer.committed":
                 from .koji_voice import context_seq
 
@@ -1665,7 +1715,10 @@ class GbotVoiceBridge:
                 self._desktop_epoch,
             )
             raw_name = event.get("name")
-            if isinstance(raw_name, str) and (
+            response_id = event.get("response_id") or self._active_response
+            if response_id in self._suppressed:
+                self._tool_outcome(name, "suppressed")
+            elif isinstance(raw_name, str) and (
                 raw_name in self._local_tools or raw_name in self._remote_tools
             ):
                 task = asyncio.create_task(self._tool(event))

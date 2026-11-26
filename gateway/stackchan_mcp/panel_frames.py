@@ -827,8 +827,8 @@ def panel_frame_extension(esp32: Any) -> Any:
             document = frame["panel"]
             ident, kind, template, items, images, size = measure_panel(document)
             logger.info(
-                "panel shown id=%s kind=%s template=%s items=%s images=%s bytes=%s",
-                ident,
+                "panel shown id_chars=%s kind=%s template=%s items=%s images=%s bytes=%s",
+                len(ident),
                 kind,
                 template,
                 items,

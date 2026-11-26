@@ -240,6 +240,7 @@ async def test_show_panel_logs_a_list_with_an_image_and_still_sends_a_broken_one
     assert "artUrl" not in rows["Beta"]
     ident, kind, template, items, images, size = measure_panel(device.frames[0]["panel"])
     assert (kind, template, items, images) == ("list", "-", 2, 1)
-    assert f"panel shown id={ident} kind=list template=- items=2 images=1 bytes={size}" in caplog.text
+    assert "panel shown id=" not in caplog.text
+    assert f"panel shown id_chars={len(ident)} kind=list template=- items=2 images=1 bytes={size}" in caplog.text
     assert closed == {"ok": True, "dismiss": True}
     assert f"panel outcome id={ident} result=dismissed-tool" in caplog.text
