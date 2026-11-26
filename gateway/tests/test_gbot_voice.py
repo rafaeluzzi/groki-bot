@@ -94,6 +94,61 @@ async def test_interrupt_discards_late_old_audio_and_accepts_next_turn():
 
 
 @pytest.mark.asyncio
+async def test_abort_with_no_active_response_drops_the_in_flight_reply():
+    b = bridge()
+    b._send = AsyncMock()
+    b._quiet.hold_turn(0)
+    b._quiet_outstanding = True
+    b._quiet_id = "quiet_1"
+    await b.interrupt()
+    assert b._response_in_progress is False
+    assert b._quiet.turn_pending is False
+    assert b._quiet_outstanding is False
+    assert b._quiet_id is None
+    assert b._suppress_next_response is True
+    b._send.assert_not_awaited()
+    delta = {
+        "type": "response.audio.delta",
+        "delta": base64.b64encode(b"\x00\x00" * 240).decode(),
+    }
+    await b._handle_event({"type": "response.created", "response": {"id": "late"}})
+    await b._handle_event({**delta, "response_id": "late"})
+    assert b._on_audio.await_count == 0
+    await b._handle_event({"type": "response.done", "response": {"id": "late"}})
+    await b._handle_event({"type": "response.created", "response": {"id": "ask"}})
+    await b._handle_event({**delta, "response_id": "ask"})
+    assert b._on_audio.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_abort_with_no_tts_still_sends_a_stop_ack():
+    class Codec:
+        def reset_encode_buffer(self):
+            pass
+
+    class Bridge:
+        running = True
+
+        def __init__(self):
+            self._connected_event = asyncio.Event()
+            self._connected_event.set()
+            self.calls = 0
+
+        async def interrupt(self):
+            self.calls += 1
+
+    proxy = GbotVoiceProxy(codec_factory=Codec)
+    proxy._bridge = Bridge()
+    proxy._codec = Codec()
+    proxy._send_to_device = AsyncMock()
+    proxy._ready_event.set()
+    proxy._tts_active = False
+    assert await proxy.send_device_json({"type": "abort"}) is True
+    assert proxy._bridge.calls == 1
+    proxy._send_to_device.assert_awaited_once_with('{"type": "tts", "state": "stop"}')
+
+
+@pytest.mark.asyncio
 async def test_speech_started_cancels_drain_without_blocking_receiver():
     b = bridge()
     b._send = AsyncMock()

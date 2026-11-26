@@ -349,7 +349,9 @@ def test_recent_transcripts_keep_latest_10_and_skip_empty():
         st.record_transcript(f"回应 {i}")
     entries = st.snapshot()["recent"]["transcripts"]
     assert len(entries) == RECENT_LIMIT
-    assert entries[0]["text"] == f"回应 {RECENT_LIMIT + 1}"
+    assert entries[0]["chars"] == len(f"回应 {RECENT_LIMIT + 1}")
+    assert "text" not in entries[0]
+    assert "回应" not in json.dumps(entries)
 
 
 def test_snapshot_is_json_serializable_with_required_fields():

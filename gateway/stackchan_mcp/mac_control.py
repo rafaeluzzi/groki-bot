@@ -297,7 +297,7 @@ class MacController:
                 open_argv = ["open", "-a", "Google Chrome", url]
             else:
                 open_argv = ["open", url]
-        logger.info("web_search engine=%s query=%s", engine, query[:80])
+        logger.info("web_search engine=%s chars=%s", engine, len(query))
         rc, _, stderr = await self._run_cmd(*open_argv)
         if rc != 0:
             return {"ok": False, "error": stderr or "open failed"}

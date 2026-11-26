@@ -106,9 +106,9 @@ async def test_flush_quiet_resends_a_rejected_system_item_as_user():
     assert user["item"]["id"].startswith("quiet_")
     assert user["item"]["role"] == "user"
     assert "Hard Fork" not in json.dumps(user)
-    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": "other"}})
+    await bridge._handle_event({"type": "conversation.item.added", "item": {"id": "other"}})
     assert bridge._quiet_outstanding is True
-    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": user["item"]["id"]}})
+    await bridge._handle_event({"type": "conversation.item.added", "item": {"id": user["item"]["id"]}})
     assert bridge._quiet.events == []
     assert await bridge._flush_quiet() is False
     await bridge.stop()
@@ -142,10 +142,10 @@ async def test_events_are_not_both_injected_and_attached():
     assert await bridge._flush_quiet() is True
     assert device.pending_portal_events == []
     sent = bridge._send.await_args_list[0].args[0]
-    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": "user_audio_1"}})
+    await bridge._handle_event({"type": "conversation.item.added", "item": {"id": "user_audio_1"}})
     assert device.quiet.events
     assert bridge._quiet_outstanding is True
-    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": sent["item"]["id"]}})
+    await bridge._handle_event({"type": "conversation.item.added", "item": {"id": sent["item"]["id"]}})
     assert device.quiet.events == []
     assert device.pending_portal_events == []
     await bridge.stop()
@@ -478,7 +478,7 @@ async def test_accept_timeout_ignores_a_replaced_item_id():
     await bridge._quiet_accept_timeout(system_id, delay=0)
     assert bridge._quiet_outstanding is True
     assert bridge._quiet.events
-    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": retry_id}})
+    await bridge._handle_event({"type": "conversation.item.added", "item": {"id": retry_id}})
     assert bridge._quiet.events == []
     await bridge.stop()
 
@@ -526,3 +526,171 @@ def test_conversation_end_event_reaches_grok_without_the_phrase():
             "delta": {"result": "end_phrase"},
         }
     ]
+
+
+def _bridge(device=None):
+    from unittest.mock import AsyncMock
+
+    from stackchan_mcp.gbot_voice_bridge import GbotVoiceBridge
+
+    bridge = GbotVoiceBridge(
+        on_audio=AsyncMock(),
+        on_turn_complete=AsyncMock(),
+        on_interrupt=AsyncMock(),
+        on_session_dead=AsyncMock(),
+        esp32=device,
+        local_tools=False,
+    )
+    bridge._send = AsyncMock()
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_item_added_accepts_by_id_and_logs_the_shape(caplog):
+    import logging
+
+    bridge = _bridge()
+    bridge._quiet.offer({"rev": 1}, [{"type": "reflex", "what": "ducked"}])
+    assert await bridge._flush_quiet() is True
+    sent = bridge._send.await_args_list[0].args[0]["item"]
+    with caplog.at_level(logging.INFO):
+        await bridge._handle_event(
+            {
+                "type": "conversation.item.added",
+                "event_id": "evt_1",
+                "previous_item_id": None,
+                "item": {"id": sent["id"], "type": "message", "role": "system"},
+            }
+        )
+    assert bridge._quiet.events == []
+    assert bridge._quiet_outstanding is False
+    assert "portal_event accepted=true match=id" in caplog.text
+    assert "item_added keys=" in caplog.text
+    assert "id_shape=client" in caplog.text
+    assert "ducked" not in caplog.text
+    bridge._quiet._last_sent = -1_000.0
+    bridge._quiet.offer({"rev": 2}, [{"type": "reflex", "what": "alias"}])
+    assert await bridge._flush_quiet() is True
+    alias = bridge._send.await_args_list[-1].args[0]["item"]
+    await bridge._handle_event({"type": "conversation.item.created", "item": {"id": alias["id"]}})
+    assert bridge._quiet.events == []
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_item_added_accepts_by_content_when_the_id_differs(caplog):
+    import logging
+
+    bridge = _bridge()
+    bridge._quiet.offer({"rev": 1}, [{"type": "reflex", "what": "UniqueShowZZZ"}])
+    assert await bridge._flush_quiet() is True
+    sent = bridge._send.await_args_list[0].args[0]["item"]
+    text = sent["content"][0]["text"]
+    with caplog.at_level(logging.INFO):
+        await bridge._handle_event(
+            {
+                "type": "conversation.item.added",
+                "item": {
+                    "id": "item_server_9",
+                    "type": "message",
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": text}],
+                },
+            }
+        )
+    assert bridge._quiet.events == []
+    assert "portal_event accepted=true match=content" in caplog.text
+    assert "id_shape=server" in caplog.text
+    assert "UniqueShowZZZ" not in caplog.text
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_unrelated_item_added_does_not_accept():
+    bridge = _bridge()
+    bridge._quiet.offer({"rev": 1}, [{"type": "reflex", "what": "ducked"}])
+    assert await bridge._flush_quiet() is True
+    await bridge._handle_event(
+        {
+            "type": "conversation.item.added",
+            "item": {
+                "id": "audio_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_audio", "audio": "x"}],
+            },
+        }
+    )
+    await bridge._handle_event(
+        {
+            "type": "conversation.item.added",
+            "item": {
+                "id": "asst_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Portal status updated. hello"}],
+            },
+        }
+    )
+    assert bridge._quiet_outstanding is True
+    assert bridge._quiet.events
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_late_ack_after_timeout_is_not_on_the_next_tool_result():
+    from stackchan_mcp.portal_state import attach_portal
+
+    class Device:
+        one_voice = True
+        pending_portal_events = []
+
+    device = Device()
+    bridge = _bridge(device)
+    device.quiet = bridge._quiet
+    bridge._quiet.offer({"rev": 4}, [{"type": "playback_paused", "rev": 4}])
+    assert await bridge._flush_quiet() is True
+    item_id = bridge._quiet_id
+    batch = list(bridge._quiet.events)
+    await bridge._quiet_accept_timeout(item_id, delay=0)
+    assert device.pending_portal_events == []
+    assert bridge._quiet.events == []
+    device.pending_portal_events = list(batch)
+    await bridge._handle_event({"type": "conversation.item.added", "item": {"id": item_id}})
+    assert device.pending_portal_events == []
+    delivered = attach_portal(device, {"ok": True})
+    assert "portal_events" not in delivered
+    await bridge.stop()
+
+
+@pytest.mark.asyncio
+async def test_error_for_the_outstanding_item_retries_then_attaches_once():
+    from stackchan_mcp.portal_state import attach_portal
+
+    class Device:
+        one_voice = True
+        pending_portal_events = []
+
+    device = Device()
+    bridge = _bridge(device)
+    device.quiet = bridge._quiet
+    bridge._quiet.offer({"rev": 1}, [{"type": "action_final", "action_id": "cmd-9"}])
+    assert await bridge._flush_quiet() is True
+    await bridge._handle_event(
+        {"type": "error", "error": {"code": "invalid_request_error", "param": "item"}}
+    )
+    await asyncio.sleep(0)
+    assert device.pending_portal_events == []
+    roles = [call.args[0]["item"]["role"] for call in bridge._send.await_args_list]
+    assert roles == ["system", "user"]
+    await bridge._handle_event(
+        {"type": "error", "error": {"code": "invalid_request_error", "param": "item"}}
+    )
+    await asyncio.sleep(0)
+    assert [call.args[0]["type"] for call in bridge._send.await_args_list].count("conversation.item.create") == 2
+    assert device.pending_portal_events == [{"type": "action_final", "action_id": "cmd-9"}]
+    once = attach_portal(device, {"ok": True})
+    assert once["portal_events"] == [{"type": "action_final", "action_id": "cmd-9"}]
+    again = attach_portal(device, {"ok": True})
+    assert "portal_events" not in again
+    await bridge.stop()

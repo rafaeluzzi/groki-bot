@@ -501,6 +501,7 @@ class GeminiVoiceProxy:
                 await interrupt()
             else:
                 await self._abort_in_flight_tts()
+            await self._ack_abort()
         elif msg_type == "listen":
             state = message.get("state", "")
             if state == "stop":
@@ -806,7 +807,7 @@ class GeminiVoiceProxy:
         the words via native PCM.
         """
         if text:
-            logger.info("gemini transcript: %s", text)
+            logger.info("gemini transcript: chars=%s", len(text))
             self._status.record_transcript(text)
 
     def _on_tts_task_done(self, task: asyncio.Task[None]) -> None:
@@ -1302,6 +1303,15 @@ class GeminiVoiceProxy:
             self._signal_speaking_avatar("idle")
             self._signal_speaking_leds(*self._post_tts_led_rgb())
             self._clear_turn_emotion_face()
+
+    async def _ack_abort(self) -> None:
+        """A downstream frame so a stall clock stops even when nothing was speaking."""
+        if self._send_to_device is None:
+            return
+        try:
+            await self._send_to_device(json.dumps({"type": "tts", "state": "stop"}))
+        except Exception:
+            logger.debug("abort ack dropped")
 
     async def _abort_in_flight_tts(self) -> None:
         """Drop in-flight TTS and tell the device to leave Speaking state.

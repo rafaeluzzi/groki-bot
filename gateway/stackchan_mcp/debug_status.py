@@ -301,7 +301,7 @@ class DebugStatus:
     def record_transcript(self, text: str) -> None:
         if not text:
             return
-        self.recent_transcripts.append({"text": text, "at": self.clock()})
+        self.recent_transcripts.append({"chars": len(text), "at": self.clock()})
 
     # ---- snapshot ----
 

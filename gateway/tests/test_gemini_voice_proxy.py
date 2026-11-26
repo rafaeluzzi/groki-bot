@@ -949,8 +949,8 @@ async def test_abort_resets_encode_buffer_and_sends_tts_stop(monkeypatch, info):
 
 
 @pytest.mark.asyncio
-async def test_abort_when_no_tts_active_does_not_send_stop(monkeypatch, info):
-    """Don't emit a spurious tts.stop when nothing was playing."""
+async def test_abort_when_no_tts_active_still_acks(monkeypatch, info):
+    """An abort with nothing playing still sends one tts stop, so a stall clock clears."""
     proxy, _, sent = _make_proxy(monkeypatch=monkeypatch)
 
     async def send(msg): sent.append(msg)
@@ -959,7 +959,7 @@ async def test_abort_when_no_tts_active_does_not_send_stop(monkeypatch, info):
     proxy._tts_active = False
     sent.clear()
     await proxy.send_device_json({"type": "abort"})
-    assert sent == []
+    assert sent == ['{"type": "tts", "state": "stop"}']
 
 
 # --- gemini → device ---------------------------------------------------------

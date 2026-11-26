@@ -319,7 +319,7 @@ class CloudProxy:
         try:
             message = json.loads(raw)
         except json.JSONDecodeError:
-            logger.warning("Invalid JSON from xiaozhi cloud: %s", raw[:100])
+            logger.warning("Invalid JSON from xiaozhi cloud: bytes=%s", len(raw.encode("utf-8")))
             return
 
         msg_type = message.get("type")
